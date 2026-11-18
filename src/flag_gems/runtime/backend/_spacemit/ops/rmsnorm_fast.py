@@ -205,11 +205,30 @@ _ROUTES_F32 = {
     512: (32, 256),
     2048: (16, 256),
     4096: (8, 512),
+    # wave33 probe334: official benchmark N=8192 has no route, so every row
+    # count ran the generic kernel. K8/T512 f32: 64 rows 0.330, 256 rows
+    # 0.989, 1024 rows 4.090 ms (K4 3-11% slower). Same pair for bf16.
+    8192: (8, 512),
+    # wave33 probe337: campaign shape 4096x1024 (N=1024) had no route either.
+    # K32/T256 f32 3.339 ms @4096 rows, 0.851 @1024 rows (K16 5% slower).
+    1024: (32, 256),
+    # wave33 probe340: official benchmark shapes (1,16384) and (64,16384).
+    # K8/T512 f32 0.521 ms @64 rows, 1.901 @256 rows (K4 7-10% slower).
+    16384: (8, 512),
 }
 _ROUTES_F16 = {
     512: (16, 256),
     2048: (4, 512),
     4096: (4, 512),
+    # wave33 probe332 (16-bit path): K8/T512 wins at 1/64/256/1024 rows
+    # (0.094 / 0.263 / 0.767 / 2.864 ms f16; bf16 within 1%) and at 16384
+    # columns (64 rows 0.397 ms) - T1024 and K4/T2 all slower.
+    8192: (8, 512),
+    # wave33 probe337: N=1024 K16/T256 2.885 ms @4096 rows, 0.830 @1024 rows
+    # (K8 24% slower, K4/T512 another 41%).
+    1024: (16, 256),
+    # wave33 probe340: N=16384 K8/T512 0.407 ms @64 rows, 1.234 @256 rows.
+    16384: (8, 512),
 }
 
 

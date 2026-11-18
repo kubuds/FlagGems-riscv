@@ -49,7 +49,7 @@ def _forward_fast(x, normalized_shape, weight, eps):
         return None
     if x.dtype != weight.dtype:
         return None
-    if x.dtype not in (torch.float32, torch.float16):
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return None
     if not x.is_contiguous() or not weight.is_contiguous():
         return None
@@ -61,7 +61,7 @@ def _forward_fast(x, normalized_shape, weight, eps):
     inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
     with torch_device_fn.device(x.device):
         if not rms_fast_launch(
-            x, weight, y, inv_rms, M, N, eps, f16=(x.dtype == torch.float16)
+            x, weight, y, inv_rms, M, N, eps, f16=(x.dtype != torch.float32)
         ):
             return None
     return y, inv_rms

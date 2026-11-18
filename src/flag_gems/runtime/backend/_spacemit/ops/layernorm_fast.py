@@ -91,9 +91,13 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
         n = _prod(normalized_shape)
     except (TypeError, ValueError):
         return False
-    if n <= 0 or n > _LN_MAX_N or numel % n:
+    if n <= 0 or numel % n:
         return False
-    if input.dtype != torch.float32 and (n % 128 or n % _ln16_ab(n)):
+    # wave33: the 16-bit carrier is no longer capped at _LN_MAX_N - the
+    # aligned kernel covers any N up to 65536 (official bench (16,8,128,128)
+    # is N=16384) and the masked variant covers the rest.
+    nmax = _LN_MAX_N if input.dtype == torch.float32 else _LN16_MAX_N
+    if n > nmax:
         return False
     if input.dim() < 1:
         return False
@@ -265,6 +269,66 @@ def _ln_fwd_kernel_16(
             tl.store(Y + base + c + idx, y.to(Y.dtype.element_ty))
 
 
+@triton.jit
+def _ln_fwd_kernel_16m(
+    X,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    N,
+    eps,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    AB: tl.constexpr,
+    HAS_W: tl.constexpr,
+    HAS_B: tl.constexpr,
+):
+    """wave33: masked 16-bit carrier for N that BN/AB do not divide.
+
+    Same streaming two-loop structure as _ln_fwd_kernel_16, but every load and
+    store carries a mask, so the 16-bit path now covers any N (official test
+    shapes (16,16,4098), (100,40499), (1,40999)). Only used when the aligned
+    kernel cannot be: the masked form is a few percent slower.
+    """
+    p = tl.program_id(0)
+    cols = tl.arange(0, BN)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = row.to(tl.int64) * N
+        acc1 = tl.zeros([BN], dtype=tl.float32)
+        acc2 = tl.zeros([BN], dtype=tl.float32)
+        for off in range(0, N, BN):
+            mm = off + cols < N
+            v = tl.load(X + base + off + cols, mask=mm, other=0.0).to(tl.float32)
+            acc1 += v
+            acc2 += v * v
+        s1 = tl.sum(acc1, axis=0)
+        s2 = tl.sum(acc2, axis=0)
+        mu = s1 / N
+        var = s2 / N - mu * mu
+        rstd = 1.0 / tl.sqrt(var + eps)
+        tl.store(Mean + row, mu.to(Mean.dtype.element_ty))
+        tl.store(Rstd + row, rstd.to(Rstd.dtype.element_ty))
+        idx = tl.arange(0, AB)
+        for c in range(0, N, AB):
+            mm2 = c + idx < N
+            x = tl.load(X + base + c + idx, mask=mm2, other=0.0).to(tl.float32)
+            y = (x - mu) * rstd
+            if HAS_W and HAS_B:
+                w = tl.load(W + c + idx, mask=mm2, other=0.0).to(tl.float32)
+                b = tl.load(B + c + idx, mask=mm2, other=0.0).to(tl.float32)
+                y = y * w + b
+            elif HAS_W:
+                w = tl.load(W + c + idx, mask=mm2, other=0.0).to(tl.float32)
+                y = y * w
+            elif HAS_B:
+                b = tl.load(B + c + idx, mask=mm2, other=0.0).to(tl.float32)
+                y = y + b
+            tl.store(Y + base + c + idx, y.to(Y.dtype.element_ty), mask=mm2)
+
+
 _LN_K_SMALL = 32  # N <= 1024 (wave13 probe109 P3: 512^2 0.404 -> 0.343)
 _LN_K_LARGE = 16  # N > 1024 (wave13 probe112 P1: 2048^2 2.86 -> 2.50,
 # 512x2048 0.79 -> 0.71 at K16)
@@ -296,11 +360,15 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     b_arg = bias if bias is not None else x2d
     if inp.dtype != torch.float32:
         k16 = _pick_k16(m, n)
+        bn16 = min(_LN16_BN, triton.next_power_of_2(n))
+        ab16 = _ln16_ab(n)
+        aligned = (n % bn16 == 0) and (n % ab16 == 0)
+        kern16 = _ln_fwd_kernel_16 if aligned else _ln_fwd_kernel_16m
         # wave31 probe314: the serialized 1-D launcher costs the 16-bit carrier
         # almost half its time - nesting takes 2048^2 5.53 -> 2.81, 512x4096
         # 2.47 -> 1.05, 4096x1024 6.74 -> 4.12, 8192x512 9.14 -> 7.00 ms.
         with nested_dispatch(m * n):
-            _ln_fwd_kernel_16[(m // k16,)](
+            kern16[(m // k16,)](
                 x2d,
                 y2d,
                 w_arg,
@@ -310,8 +378,8 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
                 n,
                 eps,
                 K=k16,
-                BN=min(_LN16_BN, triton.next_power_of_2(n)),
-                AB=_ln16_ab(n),
+                BN=bn16,
+                AB=ab16,
                 HAS_W=(weight is not None),
                 HAS_B=(bias is not None),
             )

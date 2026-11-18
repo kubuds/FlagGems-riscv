@@ -54,8 +54,21 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from ._dispatch import nested_dispatch
 
-_DX_ROUTES = {512: (4, 256), 2048: (4, 256), 4096: (2, 512)}
-_DW_BN = {512: 512, 2048: 512, 4096: 1024}
+_DX_ROUTES = {
+    512: (4, 256),
+    2048: (4, 256),
+    4096: (2, 512),
+    # wave33 probe333: dx is flat over K at N=8192 (K4/T512 1.134/3.391/12.06 ms
+    # at 64/256/1024 rows, K8 within 3%); the dw column block matters much more
+    # at 1024 rows (BN 512/1024/2048 = 12.45/11.06/9.92 ms), so BN=2048.
+    8192: (4, 512),
+    # wave33 probe337: N=1024 K4/T256 8.635 ms @4096 rows, 2.435 @1024 rows
+    # (K8 ties, K2/T512 45% slower).
+    1024: (4, 256),
+    # wave33 probe340: N=16384 K2/T512 1.763 ms @64 rows, 5.331 @256 rows.
+    16384: (2, 512),
+}
+_DW_BN = {512: 512, 1024: 1024, 2048: 512, 4096: 1024, 8192: 2048, 16384: 2048}
 _DW_RB = 64
 
 
@@ -66,7 +79,10 @@ def rmsb_fast_enabled() -> bool:
 def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     if x.numel() == 0 or dy.numel() != x.numel():
         return False
-    if x.dtype not in (torch.float32, torch.float16):
+    # wave33: bf16 admitted - the kernels load through .to(tl.float32) and store
+    # with .to(DX.dtype.element_ty), so only the gate was keeping the whole
+    # bf16 family on the generic kernels (25.8 -> 3.9 ms fwd at 2048^2).
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
     if dy.dtype != x.dtype or weight.dtype != x.dtype:
         return False
