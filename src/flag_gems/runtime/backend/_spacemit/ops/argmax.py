@@ -138,12 +138,20 @@ def argmax_kernel_row_s1(
     N,
     NB: tl.constexpr,
     BN: tl.constexpr,
+    EVEN: tl.constexpr,
 ):
     pid_c = tl.program_id(0)
     pid_m = tl.program_id(1)
     rows = pid_m * NB + tl.arange(0, NB)
     cols = pid_c * BN + tl.arange(0, BN)
-    x = tl.load(inp + rows[:, None] * N + cols[None, :])
+    ptrs = inp + rows[:, None] * N + cols[None, :]
+    if EVEN:
+        x = tl.load(ptrs)
+    else:
+        # Non-divisible N: mask the (last) partial chunk with the dtype
+        # sentinel so it never wins the max.
+        min_value = get_dtype_min(inp.type.element_ty)
+        x = tl.load(ptrs, mask=cols[None, :] < N, other=min_value)
     max_val, max_idx = tl.max(x, axis=1, return_indices=True)
     # Degenerate rows (all elements == dtype sentinel) are never replaced in
     # the index reduction, which yields its init value (-1). Clamp to the
@@ -161,20 +169,28 @@ def argmax_kernel_row_s2(
     mid_index,
     out,
     M,
-    C: tl.constexpr,
+    C,
+    C_P2: tl.constexpr,
     BLOCK_M2: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_M2 + tl.arange(0, BLOCK_M2)
     rmask = rows < M
-    c = tl.arange(0, C)
+    c = tl.arange(0, C_P2)
+    cmask = c < C
     min_value = get_dtype_min(mid_value.type.element_ty)
     mv = tl.load(
-        mid_value + c[:, None] * M + rows[None, :], mask=rmask[None, :], other=min_value
+        mid_value + c[:, None] * M + rows[None, :],
+        mask=cmask[:, None] & rmask[None, :],
+        other=min_value,
     )
     m = tl.max(mv, axis=0)
     eq = mv == m[None, :]
-    big = tl.full((C, BLOCK_M2), 2147483647, dtype=tl.int32)
-    cbr = tl.broadcast_to(c[:, None], (C, BLOCK_M2))
+    # Padded chunk rows (c >= C) hold the sentinel; the true max is attained
+    # by a real chunk, so eq can only match padded rows when m == sentinel,
+    # in which case chunk 0 (a real chunk) also matches and min-select is
+    # unaffected.
+    big = tl.full((C_P2, BLOCK_M2), 2147483647, dtype=tl.int32)
+    cbr = tl.broadcast_to(c[:, None], (C_P2, BLOCK_M2))
     sel = tl.min(tl.where(eq, cbr, big), axis=0)
     idx = tl.load(mid_index + sel * M + rows, mask=rmask)
     tl.store(out + rows, idx.to(tl.int64), mask=rmask)
@@ -195,13 +211,14 @@ _ROW_CFG_BY_N = {
 
 
 def _choose_row_cfg(M, N):
-    """Return (NB, BN) for the two-stage row kernel, or None to use the
-    single-stage kernel."""
+    """Return (NB, BN, EVEN) for the two-stage row kernel, or None to use the
+    single-stage kernel. Non-divisible N uses a masked tail chunk (EVEN=False)."""
     if N < 128 or M < 16:
         return None
     cfg = _ROW_CFG_BY_N.get(N)
     if cfg is not None:
         nb, bn = cfg
+        even = True
     else:
         if N % 512 == 0:
             bn = 512
@@ -210,8 +227,11 @@ def _choose_row_cfg(M, N):
         elif N % 128 == 0:
             bn = 128
         else:
-            return None
-        nb = 16 if (N // bn) >= 4 else 64
+            # masked-tail path: cap the chunk at 512; the last chunk is partial
+            bn = 512 if N > 512 else triton.next_power_of_2(N)
+        even = (N % bn) == 0
+        c = triton.cdiv(N, bn)
+        nb = 16 if c >= 4 else 64
     # NB must divide M; shrink (never grow) otherwise
     while nb > 4 and M % nb != 0:
         nb //= 2
@@ -219,7 +239,7 @@ def _choose_row_cfg(M, N):
         return None
     if M * N < 65536:
         return None
-    return nb, bn
+    return nb, bn, even
 
 
 def _argmax_flat(inp):
@@ -308,15 +328,15 @@ def argmax(inp, dim=None, keepdim=False, *, dtype=None):
         if K == 1:
             cfg = _choose_row_cfg(M, N)
             if cfg is not None:
-                nb, bn = cfg
-                c = N // bn
+                nb, bn, even = cfg
+                c = triton.cdiv(N, bn)
                 mid_value = torch.empty(
                     (c, M), dtype=inp.dtype, device=inp.device
                 )
                 mid_index = torch.empty((c, M), dtype=torch.int32, device=inp.device)
                 with torch_device_fn.device(inp.device):
                     argmax_kernel_row_s1[(c, M // nb)](
-                        inp, mid_value, mid_index, M, N, NB=nb, BN=bn
+                        inp, mid_value, mid_index, M, N, NB=nb, BN=bn, EVEN=even
                     )
                     blk2 = 256
                     argmax_kernel_row_s2[(triton.cdiv(M, blk2),)](
@@ -324,7 +344,8 @@ def argmax(inp, dim=None, keepdim=False, *, dtype=None):
                         mid_index,
                         out_index.reshape(-1),
                         M,
-                        C=c,
+                        c,
+                        C_P2=triton.next_power_of_2(c),
                         BLOCK_M2=blk2,
                     )
                 return out_index
