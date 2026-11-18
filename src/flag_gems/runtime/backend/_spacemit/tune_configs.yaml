@@ -74,11 +74,9 @@ bmm:
     num_stages: 2
 argmax:
 - META:
-    BLOCK_M: 8
-- META:
-    BLOCK_M: 16
-- META:
-    BLOCK_M: 32
+    BLOCK_M: 128
+    BLOCK_N: 512
+  num_warps: 8
 argmin:
 - META:
     BLOCK_M: 8
@@ -100,6 +98,30 @@ mm_spacemit:
 - META:
     BLOCK_SIZE_M: 128
     BLOCK_SIZE_N: 64
+    EVEN_K: 1
+    SPLIT_M: 0
+    SPLIT_N: 0
+    SPLIT_K: 0
+    SUB_BLK_M: 16
+    SUB_BLK_N: 16
+    MICRO_M: 8
+    MICRO_K: 32
+    MICRO_N: 32
+- META:
+    BLOCK_SIZE_M: 256
+    BLOCK_SIZE_N: 64
+    EVEN_K: 1
+    SPLIT_M: 0
+    SPLIT_N: 0
+    SPLIT_K: 0
+    SUB_BLK_M: 16
+    SUB_BLK_N: 16
+    MICRO_M: 8
+    MICRO_K: 32
+    MICRO_N: 32
+- META:
+    BLOCK_SIZE_M: 256
+    BLOCK_SIZE_N: 128
     EVEN_K: 1
     SPLIT_M: 0
     SPLIT_N: 0
