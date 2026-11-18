@@ -2909,7 +2909,18 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
         if sh * sw > 4:
             return False
         return oc * cg * kh * kw * 4 >= (1 << 18)
-    mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_MAXM", "32") or 32)
+    # wave93: the grouped band ran to 32 pixels; 33..64 pays on 3x3 (1.13-1.64x
+    # across cg 64..256, ocg 32..128) and on 5x5/7x7 only while the per-group K
+    # block stays narrow (cg <= 32: 1.06-1.21x).  A wide 5x5 is the loss - g8
+    # c512 5x5 s2 17->7 3.75 -> 4.32 (0.87x), g16 c1024 5.94 -> 6.83 (0.87x),
+    # g8 c1024 8.28 -> 9.69 (0.86x), cg 128/256 at 49px flat to 1.01x - so the
+    # band stops at the shape class it was measured on.  1x1 stays out: the
+    # pointwise GEMMs own it.
+    mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_MAXM", "0") or 0)
+    if mx <= 0:
+        mx = 32
+        if m > 32 and (kh, kw) != (1, 1) and (kh * kw <= 9 or cg <= 32):
+            mx = 64
     if not (2 <= m <= mx):
         return False
     if sh * sw > 4:
