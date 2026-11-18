@@ -43,6 +43,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
+
 
 def sum_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_SUM_FAST", "1") != "0"
@@ -175,7 +177,13 @@ def sum_dim_mmk_launch(x, out_flat, M, N) -> bool:
         k = 4
         if M % k:
             return False
-        _sum_dim_mmk_chunked[(M // k,)](x, out_flat, N, k, 8192, 4)
+        # wave12: the chunked-32768 route wins under nested dispatch
+        # (probe104 same-session 1.17x; mirrors the mean 32768 route).
+        if os.environ.get("FLAGGEMS_SPACEMIT_SUM_NEST", "1") != "0":
+            with nested_dispatch(M * N):
+                _sum_dim_mmk_chunked[(M // k,)](x, out_flat, N, k, 8192, 4)
+        else:
+            _sum_dim_mmk_chunked[(M // k,)](x, out_flat, N, k, 8192, 4)
         return True
     return False
 

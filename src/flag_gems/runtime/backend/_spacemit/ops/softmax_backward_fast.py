@@ -36,6 +36,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
+
 _SB_MIN_N = 1 << 16
 _SB_MAX_BLOCK = 1 << 13
 # wave5 (campaign 1014pm): K rows per program. Runtime-n form only - the
@@ -175,7 +177,17 @@ def sb_fast(grad_output, output, dim, input_dtype, grad_input=None):
     dx = grad_input if grad_input is not None else torch.empty_like(y, dtype=input_dtype)
     k = _SB_ROWS_K
     if k > 1 and rows % k == 0 and os.environ.get("FLAGGEMS_SPACEMIT_SB_ROWS", "1") != "0":
-        _sb_rows_kernel[(rows // k,)](g, y, dx, ncols, BLOCK=block, NOMASK=nomask, K=k)
+        # wave12: wide grids win under nested dispatch (probe104/105:
+        # ncols>=2048 -> 1.09-1.56x; ncols<=1024 loses 0.65-0.84).
+        if ncols >= 2048 and os.environ.get("FLAGGEMS_SPACEMIT_SB_NEST", "1") != "0":
+            with nested_dispatch(g.numel()):
+                _sb_rows_kernel[(rows // k,)](
+                    g, y, dx, ncols, BLOCK=block, NOMASK=nomask, K=k
+                )
+        else:
+            _sb_rows_kernel[(rows // k,)](
+                g, y, dx, ncols, BLOCK=block, NOMASK=nomask, K=k
+            )
     else:
         _sb_row_kernel[(rows,)](g, y, dx, ncols, BLOCK=block, NOMASK=nomask)
     return dx

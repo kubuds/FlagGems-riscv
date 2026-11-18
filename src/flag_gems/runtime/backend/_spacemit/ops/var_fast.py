@@ -59,6 +59,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
+from ._dispatch import nested_dispatch
 
 # N -> (K, SB, s1_chunk_width, s1_chunks); probe67 A sweep (f32 form).
 _ROUTES = {
@@ -72,6 +73,9 @@ _ROUTES = {
 # wave10: f16 pass-1 loop width (W2). 256 wins the probe93 scan for the
 # covered widths; 32768 gets 2048 (not swept; exactness verified probe93).
 _F16_W2 = {512: 256, 1024: 256, 2048: 256, 4096: 512, 32768: 2048}
+
+# wave12: routes whose mmk launch runs under nested_dispatch (N=512 loses).
+_NEST_ROUTES = (1024, 2048, 4096, 32768)
 
 # wave10 flat path: stage-1 squared-deviation chunk widths, and the midn cap
 # beyond which the flat path declines (host fsum over more than ~8192
@@ -164,12 +168,29 @@ def var_dim_mmk_launch(
     if k is None:
         return False
     f16 = x.dtype == torch.float16
-    _var_mmk[(M // k,)](
-        x, var_out, mean_out, N, float(corr),
-        K=k, W=w1, SB=sb, NS1=ns1,
-        OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
-        LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
+    # wave12: nest gate — every probed route except N=512 wins (probe104/105:
+    # 1.16-1.69x; N=512 loses 0.55-0.62). f16 stays plain (untested form).
+    nest = (
+        not f16
+        and k >= 2
+        and N in _NEST_ROUTES
+        and os.environ.get("FLAGGEMS_SPACEMIT_VAR_NEST", "1") != "0"
     )
+    if nest:
+        with nested_dispatch(M * N):
+            _var_mmk[(M // k,)](
+                x, var_out, mean_out, N, float(corr),
+                K=k, W=w1, SB=sb, NS1=ns1,
+                OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
+                LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
+            )
+    else:
+        _var_mmk[(M // k,)](
+            x, var_out, mean_out, N, float(corr),
+            K=k, W=w1, SB=sb, NS1=ns1,
+            OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
+            LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
+        )
     return True
 
 

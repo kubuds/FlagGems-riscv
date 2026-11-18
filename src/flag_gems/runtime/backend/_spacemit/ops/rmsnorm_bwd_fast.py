@@ -52,6 +52,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
+from ._dispatch import nested_dispatch
 
 _DX_ROUTES = {512: (4, 256), 2048: (4, 256), 4096: (2, 512)}
 _DW_BN = {512: 512, 2048: 512, 4096: 1024}
@@ -174,7 +175,18 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
     nomask_dx = (n % tile) == 0
     grid = (m // k,) if k > 1 else (m,)
     with torch_device_fn.device(x.device):
-        _rmsb_dx[grid](x, dy, weight, inv, dx, n, k, tile, nomask_dx)
+        # wave12: dx wins under nested dispatch for N=2048 at large M
+        # (probe105: 4096/8192 rows -> 1.41x; M<=2048 neutral; other N lose).
+        if (
+            k >= 4
+            and n == 2048
+            and m >= 4096
+            and os.environ.get("FLAGGEMS_SPACEMIT_RMSB_NEST", "1") != "0"
+        ):
+            with nested_dispatch(m * n):
+                _rmsb_dx[grid](x, dy, weight, inv, dx, n, k, tile, nomask_dx)
+        else:
+            _rmsb_dx[grid](x, dy, weight, inv, dx, n, k, tile, nomask_dx)
         bn = _DW_BN[n]
         prb = triton.cdiv(m, _DW_RB)
         pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)

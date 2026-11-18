@@ -41,6 +41,9 @@ import os
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
+
+
 @triton.jit
 def mean_dim_kernel_mmk512(X, Out, N):
     p = tl.program_id(0)
@@ -235,5 +238,11 @@ def mean_mmk_launch(x, out, M, N) -> bool:
     k = _MMK_K[N]
     if M % k:
         return False
-    kern[(M // k,)](x, out, N)
+    # wave12: only the N=32768 chunked route wins under nested dispatch
+    # (probe104/105: 1.19/1.22x); all other routes lose 0.65-0.85.
+    if N == 32768 and os.environ.get("FLAGGEMS_SPACEMIT_MEAN_NEST", "1") != "0":
+        with nested_dispatch(M * N):
+            kern[(M // k,)](x, out, N)
+    else:
+        kern[(M // k,)](x, out, N)
     return True
