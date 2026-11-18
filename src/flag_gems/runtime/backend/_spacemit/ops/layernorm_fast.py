@@ -28,6 +28,14 @@ reduce (52 ms); padded BLOCK>N sum (no better rate, probe40); 2D multiline
 (f3, 16.9 ms); register-resident single-pass (f1, 14.98 ms); app2d (7.5 ms).
 Fused totals vs official baseline: 2048^2 15.47->~5.1-5.7 (2.7-3.0x);
 512x2048 4.21->~1.31-1.44 (2.9-3.2x); 512^2 3.07->~0.53-0.56 (5.5-5.8x).
+
+wave11 (campaign 1016night): multirow K + nested dispatch. K rows/program via
+tl.static_range(K) (K=16 when N<=1024 else 8, divisibility fallback chain
+K->K/2->...->1) launched under nested_dispatch(M*N) when K>=4. Same-session f32
+min-of-9 (probe98/99b): 512^2 0.684 -> 0.343/0.383 (K16/K8 nest; torch 0.310);
+2048^2 5.075 -> 2.76-2.92 (K8 nest; torch 4.74 -> 1.7x); 512x2048 1.467 ->
+0.737-0.750 (K8 nest; torch 1.52 -> 2.0x). Backward dx gains the same pattern
+(12.0 -> 4.85 @2048^2 K8 nest).
 Kill switches: FLAGGEMS_SPACEMIT_LN_FAST=0, or NESTED=0 (two-pass A/B).
 """
 
@@ -36,6 +44,8 @@ import os
 import torch
 import triton
 import triton.language as tl
+
+from ._dispatch import nested_dispatch
 
 _LN_MIN_N = 1 << 15
 _LN_MAX_N = 8192
@@ -96,6 +106,7 @@ def _ln_fwd_kernel(
     Rstd,
     N,
     eps,
+    K: tl.constexpr,
     SB1: tl.constexpr,
     NOM1: tl.constexpr,
     SB2: tl.constexpr,
@@ -105,61 +116,78 @@ def _ln_fwd_kernel(
     HAS_W: tl.constexpr,
     HAS_B: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    base = row * N
-    offs1 = tl.arange(0, SB1)
-    if NOM1:
-        x0 = tl.load(X + base + offs1).to(tl.float32)
-    else:
-        x0 = tl.load(X + base + offs1, mask=offs1 < N, other=0.0).to(tl.float32)
-    s1 = tl.sum(x0, axis=0)
-    acc2 = tl.zeros((SB2,), dtype=tl.float32)
-    for c in range(0, N, SB2):
-        offs = c + tl.arange(0, SB2)
-        if NOM2:
-            x = tl.load(X + base + offs).to(tl.float32)
+    p = tl.program_id(0)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = row * N
+        offs1 = tl.arange(0, SB1)
+        if NOM1:
+            x0 = tl.load(X + base + offs1).to(tl.float32)
         else:
-            x = tl.load(X + base + offs, mask=offs < N, other=0.0).to(tl.float32)
-        acc2 += x * x
-    s2 = tl.sum(acc2, axis=0)
-    m = s1 / N
-    var = s2 / N - m * m
-    rstd = 1.0 / tl.sqrt(var + eps)
-    tl.store(Mean + row, m.to(Mean.dtype.element_ty))
-    tl.store(Rstd + row, rstd.to(Rstd.dtype.element_ty))
-    for c in range(0, N, AB):
-        offs = c + tl.arange(0, AB)
-        if NOMA:
-            x = tl.load(X + base + offs).to(tl.float32)
-            if HAS_W and HAS_B:
-                w = tl.load(W + offs).to(tl.float32)
-                b = tl.load(B + offs).to(tl.float32)
-                y = (x - m) * rstd * w + b
-            elif HAS_W:
-                w = tl.load(W + offs).to(tl.float32)
-                y = (x - m) * rstd * w
-            elif HAS_B:
-                b = tl.load(B + offs).to(tl.float32)
-                y = (x - m) * rstd + b
+            x0 = tl.load(
+                X + base + offs1, mask=offs1 < N, other=0.0
+            ).to(tl.float32)
+        s1 = tl.sum(x0, axis=0)
+        acc2 = tl.zeros((SB2,), dtype=tl.float32)
+        for c in range(0, N, SB2):
+            offs = c + tl.arange(0, SB2)
+            if NOM2:
+                x = tl.load(X + base + offs).to(tl.float32)
             else:
-                y = (x - m) * rstd
-            tl.store(Y + base + offs, y.to(Y.dtype.element_ty))
-        else:
-            mm = offs < N
-            x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
-            if HAS_W and HAS_B:
-                w = tl.load(W + offs, mask=mm, other=1.0).to(tl.float32)
-                b = tl.load(B + offs, mask=mm, other=0.0).to(tl.float32)
-                y = (x - m) * rstd * w + b
-            elif HAS_W:
-                w = tl.load(W + offs, mask=mm, other=1.0).to(tl.float32)
-                y = (x - m) * rstd * w
-            elif HAS_B:
-                b = tl.load(B + offs, mask=mm, other=0.0).to(tl.float32)
-                y = (x - m) * rstd + b
+                x = tl.load(X + base + offs, mask=offs < N, other=0.0).to(
+                    tl.float32
+                )
+            acc2 += x * x
+        s2 = tl.sum(acc2, axis=0)
+        m = s1 / N
+        var = s2 / N - m * m
+        rstd = 1.0 / tl.sqrt(var + eps)
+        tl.store(Mean + row, m.to(Mean.dtype.element_ty))
+        tl.store(Rstd + row, rstd.to(Rstd.dtype.element_ty))
+        for c in range(0, N, AB):
+            offs = c + tl.arange(0, AB)
+            if NOMA:
+                x = tl.load(X + base + offs).to(tl.float32)
+                if HAS_W and HAS_B:
+                    w = tl.load(W + offs).to(tl.float32)
+                    b = tl.load(B + offs).to(tl.float32)
+                    y = (x - m) * rstd * w + b
+                elif HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    y = (x - m) * rstd * w
+                elif HAS_B:
+                    b = tl.load(B + offs).to(tl.float32)
+                    y = (x - m) * rstd + b
+                else:
+                    y = (x - m) * rstd
+                tl.store(Y + base + offs, y.to(Y.dtype.element_ty))
             else:
-                y = (x - m) * rstd
-            tl.store(Y + base + offs, y.to(Y.dtype.element_ty), mask=mm)
+                mm = offs < N
+                x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W and HAS_B:
+                    w = tl.load(W + offs, mask=mm, other=1.0).to(tl.float32)
+                    b = tl.load(B + offs, mask=mm, other=0.0).to(tl.float32)
+                    y = (x - m) * rstd * w + b
+                elif HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=1.0).to(tl.float32)
+                    y = (x - m) * rstd * w
+                elif HAS_B:
+                    b = tl.load(B + offs, mask=mm, other=0.0).to(tl.float32)
+                    y = (x - m) * rstd + b
+                else:
+                    y = (x - m) * rstd
+                tl.store(Y + base + offs, y.to(Y.dtype.element_ty), mask=mm)
+
+
+_LN_K_SMALL = 16  # N <= 1024
+_LN_K_LARGE = 8  # N > 1024
+
+
+def _pick_k(m: int, n: int) -> int:
+    k = _LN_K_SMALL if n <= 1024 else _LN_K_LARGE
+    while k > 1 and m % k:
+        k //= 2
+    return k
 
 
 def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
@@ -177,24 +205,34 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     ab = _AB if n >= _AB else triton.next_power_of_2(n)
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
-    _ln_fwd_kernel[(m,)](
-        x2d,
-        y2d,
-        w_arg,
-        b_arg,
-        mean,
-        rstd,
-        n,
-        eps,
-        SB1=sb1,
-        NOM1=(n == sb1),
-        SB2=sb2,
-        NOM2=(n % sb2 == 0),
-        AB=ab,
-        NOMA=(n % ab == 0),
-        HAS_W=(weight is not None),
-        HAS_B=(bias is not None),
-    )
+    k = _pick_k(m, n)
+
+    def _launch():
+        _ln_fwd_kernel[(m // k,)](
+            x2d,
+            y2d,
+            w_arg,
+            b_arg,
+            mean,
+            rstd,
+            n,
+            eps,
+            K=k,
+            SB1=sb1,
+            NOM1=(n == sb1),
+            SB2=sb2,
+            NOM2=(n % sb2 == 0),
+            AB=ab,
+            NOMA=(n % ab == 0),
+            HAS_W=(weight is not None),
+            HAS_B=(bias is not None),
+        )
+
+    if k >= 4:
+        with nested_dispatch(m * n):
+            _launch()
+    else:
+        _launch()
     stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
         1
     ] * len(normalized_shape)
@@ -213,6 +251,13 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
 _DX_BLOCK = 512
 _DWDB_ROWS = 64
 _DWDB_CB = 2048
+
+
+def _pick_dx_k(m: int) -> int:
+    k = 8
+    while k > 1 and m % k:
+        k //= 2
+    return k
 
 
 def lnb_fast_enabled() -> bool:
@@ -283,83 +328,88 @@ def _ln_bwd_dx_kernel(
     Rstd,
     dX,
     N,
+    K: tl.constexpr,
     BLOCK: tl.constexpr,
     NOMASK: tl.constexpr,
     HAS_W: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    base = row * N
-    m = tl.load(Mean + row).to(tl.float32)
-    rs = tl.load(Rstd + row).to(tl.float32)
-    acc2 = tl.zeros((BLOCK,), dtype=tl.float32)
-    for c in range(0, N, BLOCK):
-        offs = c + tl.arange(0, BLOCK)
-        if NOMASK:
-            g = tl.load(G + base + offs).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs).to(tl.float32)
-                acc2 += g * w
+    p = tl.program_id(0)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = row * N
+        m = tl.load(Mean + row).to(tl.float32)
+        rs = tl.load(Rstd + row).to(tl.float32)
+        acc2 = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    acc2 += g * w
+                else:
+                    acc2 += g
             else:
-                acc2 += g
-        else:
-            mm = offs < N
-            g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
-                acc2 += g * w
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    acc2 += g * w
+                else:
+                    acc2 += g
+        dx2 = tl.sum(acc2, axis=0)
+        acc3 = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                x = tl.load(X + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                acc3 += dwh * xh
             else:
-                acc2 += g
-    dx2 = tl.sum(acc2, axis=0)
-    acc3 = tl.zeros((BLOCK,), dtype=tl.float32)
-    for c in range(0, N, BLOCK):
-        offs = c + tl.arange(0, BLOCK)
-        if NOMASK:
-            g = tl.load(G + base + offs).to(tl.float32)
-            x = tl.load(X + base + offs).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs).to(tl.float32)
-                dwh = g * w
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                acc3 += dwh * xh
+        dx3 = tl.sum(acc3, axis=0)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                x = tl.load(X + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                dx = rs * (dwh - (dx2 + xh * dx3) / N)
+                tl.store(dX + base + offs, dx.to(dX.dtype.element_ty))
             else:
-                dwh = g
-            xh = (x - m) * rs
-            acc3 += dwh * xh
-        else:
-            mm = offs < N
-            g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
-            x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
-                dwh = g * w
-            else:
-                dwh = g
-            xh = (x - m) * rs
-            acc3 += dwh * xh
-    dx3 = tl.sum(acc3, axis=0)
-    for c in range(0, N, BLOCK):
-        offs = c + tl.arange(0, BLOCK)
-        if NOMASK:
-            g = tl.load(G + base + offs).to(tl.float32)
-            x = tl.load(X + base + offs).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs).to(tl.float32)
-                dwh = g * w
-            else:
-                dwh = g
-            xh = (x - m) * rs
-            dx = rs * (dwh - (dx2 + xh * dx3) / N)
-            tl.store(dX + base + offs, dx.to(dX.dtype.element_ty))
-        else:
-            mm = offs < N
-            g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
-            x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
-            if HAS_W:
-                w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
-                dwh = g * w
-            else:
-                dwh = g
-            xh = (x - m) * rs
-            dx = rs * (dwh - (dx2 + xh * dx3) / N)
-            tl.store(dX + base + offs, dx.to(dX.dtype.element_ty), mask=mm)
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                dx = rs * (dwh - (dx2 + xh * dx3) / N)
+                tl.store(
+                    dX + base + offs, dx.to(dX.dtype.element_ty), mask=mm
+                )
 
 
 @triton.jit
@@ -463,18 +513,28 @@ def ln_bwd_fast(
     in_grad = None
     if output_mask[0]:
         in_grad = torch.empty_like(x)
-        _ln_bwd_dx_kernel[(m,)](
-            g2,
-            x2d,
-            w if has_w else x2d,
-            mean,
-            rstd,
-            in_grad.view(m, n),
-            n,
-            BLOCK=_DX_BLOCK,
-            NOMASK=(n % _DX_BLOCK == 0),
-            HAS_W=has_w,
-        )
+        k = _pick_dx_k(m)
+
+        def _launch_dx():
+            _ln_bwd_dx_kernel[(m // k,)](
+                g2,
+                x2d,
+                w if has_w else x2d,
+                mean,
+                rstd,
+                in_grad.view(m, n),
+                n,
+                K=k,
+                BLOCK=_DX_BLOCK,
+                NOMASK=(n % _DX_BLOCK == 0),
+                HAS_W=has_w,
+            )
+
+        if k >= 4:
+            with nested_dispatch(m * n):
+                _launch_dx()
+        else:
+            _launch_dx()
     dW = None
     dB = None
     if output_mask[1] or output_mask[2]:

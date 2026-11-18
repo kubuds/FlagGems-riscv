@@ -12,22 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wave6 (campaign 1015am): rms_norm forward direct kernels (f32).
+"""wave6 (campaign 1015am): rms_norm forward direct kernels.
 
 Structure ported from the layernorm_fast playbook (wave4): per-row
 loop-carried mul-chain acc for sum(x^2) (elementwise feeding tl.sum would kill
 the reduction) + a separate apply loop. Narrow-column rows additionally get
 K rows/program (wave5 launch-amortization lesson).
 
-Same-session f32 numbers (probe59/60; legacy route = single-row tl.sum(x*x)):
-    (512,512)   2.03 -> 0.59 ms  (K=8, TILE=256)   vs torch 0.88x
-    (8192,512)  31.4 -> 8.05 ms  (K=8, TILE=256)   vs torch 1.11x
-    (2048,2048) 25.0 -> 5.31 ms  (row, TILE=512)   vs torch 3.68x
-    (512,4096)  12.4 -> 2.38 ms  (row, TILE=1024)  vs torch 1.89x
-Accuracy vs f32 reference: maxabs 1.9e-6 @2048^2 (better than legacy).
+wave11 (campaign 1016night): nest + per-shape K/TILE picks + f16 coverage.
+- f32 routes now launch under nested_dispatch(M*N) for K>=4. Same-session
+  min-of-9 (probe100/102): 512^2 0.579 -> 0.380 (K16 nest; torch 0.815);
+  2048^2 5.19 -> 3.32 (K4 T256 nest); 512x4096 3.29 -> 1.28 (K4 T512 nest);
+  8192x512 8.06 -> 4.31 (K16 nest, probe100).
+- f16 forward now covered by _rms_row16/_rms_mmk16: loads cast to f32 INSIDE
+  the loop-carried acc chain (wave10 lesson: an f16 cast feeding tl.sum is the
+  feeding cliff), y stored back as x.dtype, inv in f32. Same-session f16
+  numbers: 512^2 0.418 / 8192x512 4.25-5.14 / 2048^2 2.89 / 512x4096 1.04 ms
+  (nest picks; legacy f16 path was 4.45-50.9 ms).
+Accuracy vs f32 reference: maxabs 1.9e-6 (f32); f16 within ~2 ulp of oracle.
 
-Backward is untouched (legacy kernels). Non-f32 / non-contiguous / N not in
-the route table fall back to the generic forward.
+Backward is untouched (legacy kernels). Non-covered dtype / non-contiguous /
+N not in the route table fall back to the generic forward.
 
 Kill switch: FLAGGEMS_SPACEMIT_RMS_FAST=0.
 """
@@ -36,6 +41,8 @@ import os
 
 import triton
 import triton.language as tl
+
+from ._dispatch import nested_dispatch
 
 
 def rms_fast_enabled() -> bool:
@@ -63,6 +70,28 @@ def _rms_row(X, W, Y, INV, N, eps, TILE: tl.constexpr):
 
 
 @triton.jit
+def _rms_row16(X, W, Y, INV, N, eps, TILE: tl.constexpr):
+    row = tl.program_id(0)
+    base = X + row * N
+    acc = tl.zeros((TILE,), dtype=tl.float32)
+    num = tl.cdiv(N, TILE)
+    for c in range(0, num):
+        offs = c * TILE + tl.arange(0, TILE)
+        xv = tl.load(base + offs, mask=offs < N, other=0.0).to(tl.float32)
+        acc += xv * xv
+    rr = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / N + eps)
+    tl.store(INV + row, rr)
+    for c in range(0, num):
+        offs = c * TILE + tl.arange(0, TILE)
+        m = offs < N
+        xv = tl.load(base + offs, mask=m, other=0.0).to(tl.float32)
+        wv = tl.load(W + offs, mask=m, other=0.0).to(tl.float32)
+        tl.store(
+            Y + row * N + offs, (xv * rr * wv).to(Y.dtype.element_ty), mask=m
+        )
+
+
+@triton.jit
 def _rms_mmk(X, W, Y, INV, N, eps, K: tl.constexpr, TILE: tl.constexpr):
     p = tl.program_id(0)
     num = tl.cdiv(N, TILE)
@@ -84,30 +113,71 @@ def _rms_mmk(X, W, Y, INV, N, eps, K: tl.constexpr, TILE: tl.constexpr):
             tl.store(Y + row * N + offs, xv * rr * wv, mask=m)
 
 
-# N -> ("mmk", K, TILE) or ("row", TILE); only verified shapes are wired.
-_ROUTES = {
-    512: ("mmk", 8, 256),
-    2048: ("row", 512),
-    4096: ("row", 1024),
+@triton.jit
+def _rms_mmk16(X, W, Y, INV, N, eps, K: tl.constexpr, TILE: tl.constexpr):
+    p = tl.program_id(0)
+    num = tl.cdiv(N, TILE)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = X + row * N
+        acc = tl.zeros((TILE,), dtype=tl.float32)
+        for c in range(0, num):
+            offs = c * TILE + tl.arange(0, TILE)
+            xv = tl.load(base + offs, mask=offs < N, other=0.0).to(tl.float32)
+            acc += xv * xv
+        rr = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / N + eps)
+        tl.store(INV + row, rr)
+        for c in range(0, num):
+            offs = c * TILE + tl.arange(0, TILE)
+            m = offs < N
+            xv = tl.load(base + offs, mask=m, other=0.0).to(tl.float32)
+            wv = tl.load(W + offs, mask=m, other=0.0).to(tl.float32)
+            tl.store(
+                Y + row * N + offs, (xv * rr * wv).to(Y.dtype.element_ty), mask=m
+            )
+
+
+# N -> (K, TILE) mmk fast path; only verified shapes are wired.
+# wave11 picks (probe100/102, min-of-9 same-session):
+#   f32: 512 -> K16 T256 nest (0.380); 2048 -> K4 T256 nest (3.32);
+#        4096 -> K4 T512 nest (1.28)
+#   f16: 512 -> K16 T256 nest (4.25 @8192x512); 2048 -> K4 T512 nest (2.89);
+#        4096 -> K4 T512 nest (1.04)
+_ROUTES_F32 = {
+    512: (16, 256),
+    2048: (4, 256),
+    4096: (4, 512),
+}
+_ROUTES_F16 = {
+    512: (16, 256),
+    2048: (4, 512),
+    4096: (4, 512),
 }
 
 
-def rms_fast_launch(x, w, y, inv, M, N, eps) -> bool:
+def _pick_k(m: int, k0: int) -> int:
+    k = k0
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
+
+def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
-    ent = _ROUTES.get(N)
+    routes = _ROUTES_F16 if f16 else _ROUTES_F32
+    ent = routes.get(N)
     if ent is None:
         return False
-    if ent[0] == "mmk":
-        k, tile = ent[1], ent[2]
-        if M % k == 0:
-            _rms_mmk[(M // k,)](x, w, y, inv, N, eps, k, tile)
-            return True
-        # conservative fallback chain for non-divisible M
-        if M % 4 == 0:
-            _rms_mmk[(M // 4,)](x, w, y, inv, N, eps, 4, 256)
-            return True
-        _rms_row[(M,)](x, w, y, inv, N, eps, 256)
+    k0, tile = ent
+    k = _pick_k(M, k0)
+    if k > 1:
+        kern = _rms_mmk16 if f16 else _rms_mmk
+        if k >= 4:
+            with nested_dispatch(M * N):
+                kern[(M // k,)](x, w, y, inv, N, eps, k, tile)
+        else:
+            kern[(M // k,)](x, w, y, inv, N, eps, k, tile)
         return True
-    tile = ent[1]
-    _rms_row[(M,)](x, w, y, inv, N, eps, tile)
+    row = _rms_row16 if f16 else _rms_row
+    row[(M,)](x, w, y, inv, N, eps, tile)
     return True

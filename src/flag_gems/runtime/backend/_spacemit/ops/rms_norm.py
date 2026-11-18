@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 def _forward_fast(x, normalized_shape, weight, eps):
     if not rms_fast_enabled():
         return None
-    if x.dtype != torch.float32 or weight.dtype != torch.float32:
+    if weight is None:
+        return None
+    if x.dtype != weight.dtype:
+        return None
+    if x.dtype not in (torch.float32, torch.float16):
         return None
     if not x.is_contiguous() or not weight.is_contiguous():
         return None
@@ -56,7 +60,9 @@ def _forward_fast(x, normalized_shape, weight, eps):
     y = torch.empty_like(x)
     inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
     with torch_device_fn.device(x.device):
-        if not rms_fast_launch(x, weight, y, inv_rms, M, N, eps):
+        if not rms_fast_launch(
+            x, weight, y, inv_rms, M, N, eps, f16=(x.dtype == torch.float16)
+        ):
             return None
     return y, inv_rms
 
