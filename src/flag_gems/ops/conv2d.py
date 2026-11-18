@@ -470,15 +470,20 @@ class Conv2d(torch.autograd.Function):
                             fast_oh, fast_ow, kh, kw,
                             stride_height, stride_width)
                     )
-                    # wave75: grouped x dilation is the last conv class with
-                    # no fast route: dil_tap requires groups == 1 and
-                    # conv_fast_applies rejects any dilation, so it fell to the
-                    # vendor im2col (30.3-72.2 ms at 3x3/5x5 d2).  The phase
-                    # kernel handles both the group axis and the dilation, and
-                    # at stride 1 its plane build collapses to the frame copy.
+                    # wave75: grouped x dilation had no fast route: dil_tap
+                    # requires groups == 1 and conv_fast_applies rejects any
+                    # dilation, so it fell to the vendor im2col (30.3-72.2 ms
+                    # at 3x3/5x5 d2).  The phase kernel handles both the group
+                    # axis and the dilation, and at stride 1 its plane build
+                    # collapses to the frame copy.
+                    # wave76: the same predicate now also covers grouped
+                    # stride-1 non-dilated conv, which used to sit on the
+                    # group kernel: phase is 2.2-3.6x faster there (g8 c256
+                    # 28 12.028 -> 4.523, g4 c512 56 148.751 -> 52.959) and
+                    # 1.7-13.6x over the vendor.  The predicate keeps CG/OCG
+                    # >= 8 and the MAC floor, so thin groups stay behind.
                     dil_phase_g = (
-                        (dilation_height != 1 or dilation_width != 1)
-                        and groups > 1
+                        groups > 1
                         and conv_phase_g_applies(
                             input.shape[0], input.shape[1], weight.shape[0],
                             fast_oh, fast_ow, kh, kw,

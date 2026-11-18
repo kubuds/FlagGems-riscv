@@ -1681,7 +1681,12 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
     # covers 5x5/7x7 too (the A block is bm*C*4 bytes per tap either way)
     return ((kh, kw) in _TAP_KERNELS and 3 <= c <= 2048
             and (cp <= 512 or wide)
-            and 32 <= oc <= 2048 and oh * ow >= 16
+            and 32 <= oc <= 4096
+            # wave76: same sub-16-pixel window as the tap gate (stride > 1
+            # single-group: c512 3x3 s2 at 3x3 output 8.573/54.212,
+            # c128 5x5 s2 2.184/8.651, c256 3x3 s2 3.016/12.417)
+            and (oh * ow >= 16
+                 or n * oc * oh * ow * kh * kw * c >= (1 << 20))
             and (sh * sw <= 4
                  or (sh == sw == 3 and kh == kw))   # asym s3 loses
             and n * oc * oh * ow * kh * kw * c >= (1 << 20)
@@ -1705,7 +1710,15 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
     return ((kh, kw) in _TAP_KERNELS and 8 <= cg <= 2048
             and 8 <= ocg <= 2048
             and triton.next_power_of_2(cg) <= 2048
-            and oh * ow >= 16
+            # wave76: the 16-pixel floor was tuned on stride > 1, where the
+            # phase build is real work.  At stride 1 a grouped dilated layer
+            # skips it (the frame IS the plane), so 2x2..4x4 outputs win: g16
+            # c1024 5x5 d2 at 3x3 output 4.543 vs 38.171 official (8.40x),
+            # g8 c1024 3x3 d2 3.227 vs 26.416 (8.19x), g4 c2048 3x3 d2 18.828
+            # vs 229.574 (12.19x).  Stride > 1 keeps the old floor.
+            and (oh * ow >= 16
+                 or (sh == sw == 1
+                     and n * oc * oh * ow * kh * kw * cg >= (1 << 20)))
             and (sh * sw <= 4 or (sh == sw == 3 and kh == kw))
             and n * oc * oh * ow * kh * kw * cg >= (1 << 20)
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHG", "1") != "0")
@@ -1726,7 +1739,17 @@ def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
     if dil_h != dil_w:
         return False
     cp = triton.next_power_of_2(c)
-    if not (3 <= c <= 2048 and 32 <= oc <= 2048 and oh * ow >= 16):
+    # wave76: two windows opened.  OC: 2048 was a tuning round number, not a
+    # limit - 3072/4096 rows win 6.6-15.6x official (3x3 c1024->3072 14x14
+    # 321.6/5014.0, 3x3 s2 28->14 862.6/5718.1, 5x5 14x14 998.3/11176.3,
+    # 3x3 c1024->4096 7x7 192.8/2496.5; the 9C patch matrix is 0.96x of it).
+    # Output area: a dilated layer with a 2x2..4x4 output used to fall to the
+    # vendor im2col (hundreds of ms); the MAC floor keeps the change away from
+    # micro layers - c1024 3x3 d2 3x3 output 47.394/445.083, c512 5x5 d2
+    # 21.877/381.682, c1024 5x5 d2 1x1 135.295/2068.967.
+    if not (3 <= c <= 2048 and 32 <= oc <= 4096
+            and (oh * ow >= 16
+                 or n * oc * oh * ow * kh * kw * c >= (1 << 20))):
         return False
     if not (cp <= 512
             or (cp <= 1024 and kh * kw <= 49)
@@ -1817,8 +1840,14 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # program_id(2) and both packed bases are channel-major already, so one
     # launch serves every group (g8 c256 28x28 s2 was 5.09 ms on the 32-lane
     # group kernel against 5.85 official - the worst grouped cell measured).
-    if (groups > 1 and (SH > 1 or SW > 1 or dil_h != 1 or dil_w != 1)
-            and conv_phase_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW, groups)):
+    # wave76: the group kernel is the slow route at every size measured, not
+    # just at stride > 1: the phase kernel is 2.2-3.6x faster on grouped
+    # stride-1 3x3/5x5 (g8 c256 28 12.028 -> 4.523, g4 c512 56 148.751 ->
+    # 52.959, g8 5x5 c256 28 29.210 -> 8.042), and the frame IS the plane at
+    # stride 1, so there is nothing extra to build.  The predicate carries the
+    # lane/MAC floors, so thin groups still stay on the group kernel.
+    if groups > 1 and conv_phase_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW,
+                                           groups):
         return _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w,
                                  KH, KW, SH, SW, groups,
                                  dil_h=dil_h, dil_w=dil_w, out_dtype=_out_dtype)
