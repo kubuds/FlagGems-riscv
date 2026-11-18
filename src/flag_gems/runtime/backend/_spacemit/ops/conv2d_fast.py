@@ -60,6 +60,29 @@ def conv_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_CONV_FAST", "1") != "0"
 
 
+def _oc_pad(oc):
+    """wave80: padded output-channel row count for the tap/phase A block.
+
+    The A operand is one descriptor of [OCP, C] per tap and the dot is
+    BLOCK_M x C @ C x BLOCK_N, so the compute (and the A read) scales with the
+    padded row count, not with the real OC.  The 32-row floor was a tuning
+    heuristic from the wide-OC days; for OC < 32 it spends 2-16x the dot work
+    of the useful rows (OC=2 at 3x3 56x56 measured 1.6 GFLOPS against 12.2 for
+    OC=16, both at 4.7 ms - the time is the padded dot).  Pad thin blocks to
+    the next power of two at an 8-row floor instead.  FLAGGEMS_SPACEMIT_CONV_OCP
+    forces a fixed floor (32 restores the old rule) for A/B.
+    """
+    floor = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_OCP", "0"))
+    exact = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_OCP_EXACT", "0"))
+    if exact > 0:
+        return max(8, exact)
+    if floor <= 0:
+        floor = 8
+    if oc >= 32:
+        return ((oc + 31) // 32) * 32
+    return min(32, max(floor, triton.next_power_of_2(max(1, oc))))
+
+
 def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     if x.dim() != 4 or w.dim() != 4:
         return False
@@ -971,7 +994,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     N, C, H, W = input.shape
     OC = weight.shape[0]
     CP = max(32, triton.next_power_of_2(C))
-    OCP = ((OC + 31) // 32) * 32
+    OCP = _oc_pad(OC)
     x = input.contiguous()
     IH, IW = H + 2 * pad_h, W + 2 * pad_w
     roff = ((KH - 1) * dil_h) // SH
@@ -986,6 +1009,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # PWW-OW columns of every row are computed and thrown away at the crop
     MY = OH * PWW
     bm, bn = _tap_tiles(OC, MY, CP)
+    bm = min(bm, OCP)      # wave80: thin OC pads to 8/16 rows, not 32
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -1128,7 +1152,7 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     CG = C // groups
     OCG = OC // groups
     CP = max(32, triton.next_power_of_2(CG))
-    OCP = ((OCG + 31) // 32) * 32
+    OCP = _oc_pad(OCG)
     x = input.contiguous()
     IH, IW = H + 2 * pad_h, W + 2 * pad_w
     roff = ((KH - 1) * dil_h) // SH
@@ -1820,7 +1844,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
         raise NotImplementedError("shifted-tap conv needs a square dilation")
     DIL = int(dil_h)
     CP = max(32, triton.next_power_of_2(C))
-    OCP = ((OC + 31) // 32) * 32
+    OCP = _oc_pad(OC)
     x = input.contiguous()
     IH, IW = H + 2 * pad_h, W + 2 * pad_w
     SROW = IH * IW
@@ -1833,9 +1857,23 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     # (1.53x), 5x5 d1 123.0 -> 79.2 (1.55x).  bm is clamped to the padded row
     # count - a descriptor taller than OCP reads past the packed weight buffer
     # (the wave74 landmine).
+    mn = 64
     if MY <= 16 and CP <= 1024:
-        bm = min(64, max(32, ((OC + 31) // 32) * 32))
+        bm = min(64, max(32, OCP))
         bn = 32
+        # wave80: the micro tile is (MICRO_M, MICRO_N) = (8, 64) by default, so
+        # a 32-wide block under a 64-wide micro tile computes 64 columns for at
+        # most 16 real ones.  MICRO_N 32 matches the block: c1024 3x3 d2 1x1
+        # output 27.99 -> 19.07, 5x5 d2 78.52 -> 53.84, c512 5x5 d2 20.48 ->
+        # 14.45, 5x5 d1 76.34 -> 51.50 (1.42-1.48x).  BN 16 aborts spine-opt
+        # (the BN >= 32 landmine) and BN 16 under MICRO_N 32 does not help.
+        mn = 32
+        bn = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_TINY_BN", "0")) or bn
+    mn = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_TINY_MN", "0")) or mn
+    # wave80: the A block is a descriptor of OCP rows; BLOCK_M must not be
+    # taller than that (wave74 landmine) and for a thin block it is the whole
+    # waste - bm 32 on OC=2 runs a 16x-padded dot.
+    bm = min(bm, OCP)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -1875,7 +1913,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
                 at, flat, bias if bias is not None else at, yext, OCP,
                 OC if bias is not None else 0, CP, SROW, MYP,
                 IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
-                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                MICRO_M=8, MICRO_N=mn, MICRO_K=32, HAS_BIAS=(bias is not None),
                 KDIW=DIL * IW, DK=DIL)
 
         _launch()
@@ -2042,8 +2080,18 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
     mincg = int(os.environ.get("FLAGGEMS_SPACEMIT_PHG_MINCG", "0"))
     if mincg <= 0:
         mincg = 24 if (kh == 1 and kw == 1) else 8
+    # wave80: the OCG floor was 8 because a 32-row A block made a thin group
+    # pure padding.  The block now pads to 8 rows (_oc_pad), so OCG 2..7 costs
+    # only the lane floor - the group floor itself is unchanged.
+    minocg = int(os.environ.get("FLAGGEMS_SPACEMIT_PHG_MINOCG", "0"))
+    if minocg <= 0:
+        # wave80: measured OCG 2/4/6 at 1.65-2.73x the group kernel once the A
+        # block pads to 8 rows (g8 c512 28 oc32 6.30 vs 13.51, g32 c1024 14
+        # oc64 4.96 vs 13.56, g4 c512 5x5 28 oc16 13.89 vs 27.58).  The 1x1
+        # class keeps its old floor: it belongs to the pointwise GEMMs above.
+        minocg = 8 if (kh == 1 and kw == 1) else 2
     return ((kh, kw) in _TAP_KERNELS and mincg <= cg <= 2048
-            and 8 <= ocg <= 2048
+            and minocg <= ocg <= 2048
             and triton.next_power_of_2(cg) <= 2048
             and (kh != 1 or kw != 1 or (sh == 1 and sw == 1))
             # wave76: the 16-pixel floor was tuned on stride > 1, where the
