@@ -39,6 +39,7 @@
 # because a scalar negative offset in the load pointer makes PtrAnalysis give
 # up and the kernel goes scalar.
 import os
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -271,6 +272,69 @@ def _conv1x1_smt2_kernel(A1, A2, B, Bias, Y, M, N, K1: tl.constexpr,
                               offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
                               block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
     tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
+def _conv_tap_smt_kernel(A, Bx, Bias, Y, OC, C: tl.constexpr, SROW, MY, IW,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """wave67: KxK stride-1 as KH*KW whole-K smt dots on shifted bases.
+
+    The tap kernel splits C into 32-lane dots and walks the input nine times
+    with a Triton-level K loop; the patch-matrix route pays a 9C gather.  This
+    kernel does neither: every tap is one smt.dot whose K is the whole channel
+    count, and the tap's base is just Bx + kh*IW + kw, so no buffer is built
+    and the row stride stays the padded input width.
+
+    The readback must NOT add pad_w: output pixel (oh, ow) lives at
+    m = oh*IW + ow, and the tap offset already carries the padding
+    (oh+kh)*IW + (ow+kw) = m + kh*IW + kw.  Wave66 read back at
+    [:, :, pad:pad+OW] and concluded the descriptor mishandled small base
+    offsets; the kernel was exact all along (probe1403/1404).
+
+    Base offsets of 1, 4, 8, 16, 28 and 32 elements and row strides 256/260/900
+    all measure bit-exact (probe1400), so neither the base shift nor the
+    non-aligned stride is a constraint here.  KH == KW == 5 is the same kernel
+    with 25 dots: 8.05 ms against the tap kernel's 32.87 at (1,128,28,28)
+    oc128, exact, but 153 s of compile keeps it opt-in.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    ap = tl.make_block_ptr(base=A, shape=[OC, C], strides=[C, 1],
+                           offsets=[pid_m * BLOCK_M, 0],
+                           block_shape=[BLOCK_M, C], order=[1, 0])
+    bp = tl.make_block_ptr(base=Bx, shape=[C, SROW], strides=[SROW, 1],
+                           offsets=[0, pid_n * BLOCK_N],
+                           block_shape=[C, BLOCK_N], order=[1, 0])
+    aa = smt.view(smt.descriptor_load(ap, (0, 0)), (0, 0), (BLOCK_M, C),
+                  (MICRO_M, MICRO_K))
+    bb = smt.view(smt.descriptor_load(bp, (0, 0)), (0, 0), (C, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(aa, bb), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    for t in tl.static_range(1, KH * KW):
+        kh = t // KW
+        kw = t % KW
+        at = tl.make_block_ptr(base=A + t * OC * C, shape=[OC, C], strides=[C, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, C], order=[1, 0])
+        bt = tl.make_block_ptr(base=Bx + kh * IW + kw, shape=[C, SROW],
+                               strides=[SROW, 1], offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[C, BLOCK_N], order=[1, 0])
+        a2 = smt.view(smt.descriptor_load(at, (0, 0)), (0, 0), (BLOCK_M, C),
+                      (MICRO_M, MICRO_K))
+        b2 = smt.view(smt.descriptor_load(bt, (0, 0)), (0, 0), (C, BLOCK_N),
+                      (MICRO_K, MICRO_N))
+        acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < OC, other=0.0)[:, None]
+    cp = tl.make_block_ptr(base=Y, shape=[OC, MY], strides=[MY, 1],
+                           offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                           block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(cp, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -906,6 +970,107 @@ def _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w, out_dtype=None):
     return y
 
 
+# wave67: the tap-major weight copy and the padded flat image, both reused
+# across calls.  The weight copy is KH*KW*OC*C floats; at (1,512,7,7) it is
+# 9.4 MB, which is 1-2 ms if rebuilt every forward, so it is cached (see
+# _tap_weights for what a safe key looks like).
+_TAP_W = {}
+_TAP_BUF = {}
+
+
+def _tap_weights(weight):
+    # identity, not data_ptr: a freed weight's address is handed straight back
+    # to the next allocation, and both are _version 0, so an address-keyed
+    # cache silently returns the previous layer's matrix (probe1412 pad=0 read
+    # rel 1.37 that way).  A dead weakref is a miss, which is the point.
+    key = (weight.data_ptr(), tuple(weight.shape))
+    ent = _TAP_W.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    OC, C, KH, KW = weight.shape
+    at = weight.permute(2, 3, 0, 1).reshape(KH * KW, OC, C).contiguous()
+    if len(_TAP_W) >= 4:
+        _TAP_W.pop(next(iter(_TAP_W)))
+    _TAP_W[key] = (weakref.ref(weight), weight._version, at)
+    return at
+
+
+def _tap_flat_buf(c, ih, iw, tail, dtype, device):
+    # IH and IW are both in the key, not just IH*IW: two shapes can share the
+    # element count with different widths, and then the border written by the
+    # first would survive into the second
+    srow = ih * iw
+    key = (c, ih, iw, dtype, str(device))
+    buf = _TAP_BUF.get(key)
+    if buf is None:
+        if len(_TAP_BUF) >= 4:
+            _TAP_BUF.pop(next(iter(_TAP_BUF)))
+        # the tail absorbs the last tile's out-of-range reads beyond C*SROW; it
+        # is written once at allocation because the real span is rewritten on
+        # every call
+        buf = torch.zeros(c * srow + tail, dtype=dtype, device=device)
+        _TAP_BUF[key] = buf
+    return buf
+
+
+def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
+                    out_dtype=None):
+    """wave67: KxK stride-1 conv as KH*KW whole-K smt dots, no patch matrix.
+
+    Measured against the live routes in one process (probe1406, f32, exact
+    against unfold in every cell):
+        (1,128,28,28) oc128  2.99 ms  vs im2col 10.71 (3.58x) vs tap 12.13
+        (1,256,14,14) oc256  3.06     vs 10.75 (3.52x)            14.74
+        (1,128,56,56) oc128 11.92     vs 40.06 (3.36x)            38.50
+        (1,64,56,56)  oc64   4.96     vs 12.15 (2.45x)            12.18
+        (1,512,7,7)   oc512  9.26     vs 18.85 (2.04x)            30.41
+    That is 48-87 GFLOPS, against the tap kernel's 19.9 GFLOPS roof.
+
+    Costs: the padded image is copied into a flat f32 buffer (C*IH*IW floats,
+    1.7 MB at 56x56 C=128) and the result is cropped out of an IW-strided
+    (OC, OH*IW) buffer, because m keeps the input row stride.  Both are cheap
+    against the dot.  Compile is the real price: nine dots take ~54 s on the
+    first call for a given C, then every other shape with that C reuses it.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    x = input.contiguous()
+    IH, IW = H + 2 * pad_h, W + 2 * pad_w
+    SROW = IH * IW
+    MY = OH * IW
+    bm, bn = 32, 64
+    MYP = ((MY + bn - 1) // bn) * bn
+    at = _tap_weights(weight)
+    dt = out_dtype or input.dtype
+    y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
+    grid = (triton.cdiv(OC, bm), triton.cdiv(MYP, bn))
+    for n in range(N):
+        # the padded frame IS the flat (C, IH*IW) operand, so the border is
+        # written once (zeros) and every call only copies the interior into it:
+        # no F.pad tensor, no second copy.  At 28x28 that removed the 0.7 ms
+        # that F.pad cost on top of the 2.99 ms kernel.
+        flat = _tap_flat_buf(C, IH, IW, 2 * IW + 96, x.dtype, x.device)
+        img = flat[:C * SROW].view(C, IH, IW)
+        if pad_h or pad_w:
+            img[:, pad_h:pad_h + H, pad_w:pad_w + W].copy_(x[n])
+        else:
+            img.copy_(x[n])
+        if OW == IW and MYP == MY and dt == torch.float32:
+            # no padding columns and no tail tile: the GEMM result already has
+            # the caller's layout, so the store lands in y directly
+            yext = y[n].view(OC, MY)
+        else:
+            yext = torch.empty((OC, MYP), dtype=torch.float32,
+                               device=input.device)
+        _conv_tap_smt_kernel[grid](
+            at, flat, bias if bias is not None else at, yext, OC, C, SROW, MYP,
+            IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
+            MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None))
+        if yext.data_ptr() != y[n].data_ptr():
+            y[n].copy_(yext[:, :MY].view(OC, OH, IW)[:, :, :OW])
+    return y
+
+
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
                       BLOCK_OW=None, BLOCK_C=None):
     N, _, H, W = input.shape
@@ -1046,6 +1211,25 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             return y.to(input.dtype)
         return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
                                  out_dtype=_out_dtype)
+    # wave67: 3x3 stride-1 runs as nine whole-K smt dots on shifted bases -
+    # no patch matrix, no K loop, no 32-lane split.  2.0-4.8x against the best
+    # existing route on every shape measured, and exact (err 0.0) on all five:
+    # see _conv_tap_shift.  C must be a power of two because the dot's K is
+    # the whole channel count; OC must be a multiple of 32 because the A block
+    # is loaded through a descriptor, which cannot mask rows.
+    # FLAGGEMS_SPACEMIT_CONV_TAP9=0 pins the old route for A/B.
+    # 5x5 rides the same kernel (25 dots instead of 9): 8.05 ms against the tap
+    # kernel's 32.87 at (1,128,28,28) oc128, exact, 79.4 GFLOPS - but the first
+    # call pays 153 s of compile, so it stays opt-in.
+    if (groups == 1 and KH == KW and KH in (3, 5) and SH == 1 and SW == 1
+            and C >= 32 and (C & (C - 1)) == 0 and C <= 512
+            and OC >= 32 and OC % 32 == 0 and OC <= 512
+            and OH * OW >= 16
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
+            and (KH == 3 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25",
+                                           "0") == "1")):
+        return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
+                               out_dtype=_out_dtype)
     # wave66: 3x3 stride-1 goes through a 9C patch matrix wherever M is small
     # and OC is not.  The tap kernel's nine passes over a 32-lane-split input
     # collapse there: (1,256,14,14) 15.4 vs 8.5 (1.80x), (1,128,28,28) 12.2 vs
