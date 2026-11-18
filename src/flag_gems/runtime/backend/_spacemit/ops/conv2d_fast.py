@@ -2406,7 +2406,56 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
 
 _MP_BUF = {}
 _MP_W = {}
+_MP_BUFG = {}
+_MP_WG = {}
+_CW = {}
 _MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+
+_CW_MAX_ENTRIES = 16
+_CW_MAX_BYTES = 384 << 20
+
+
+def _carrier_weight(weight):
+    """wave89: cached f32 carrier weight for a half-precision conv call.
+
+    conv2d_direct's half-precision branch converts the whole weight with
+    weight.float() on every call, and that cast is slow on this board: measured
+    interleaved (wave89 probe), 18.9 MB of f16 -> f32 takes 24.3 ms (0.78 GB/s),
+    75.5 MB takes 72.3 ms (1.04 GB/s).  Against the f32 cell of the same shape
+    that is 48% of a 52.0 ms call at N8 c1024 3x3 s2 and 30% of a 250.2 ms call
+    at N4 c2048.  A convolution's weight tensor is the same object across calls,
+    so the conversion is paid once per layer, not once per call.
+
+    Keyed by identity + _version, never by data_ptr alone: a freed weight's
+    address is handed to the next allocation at _version 0.  Sixteen entries and
+    a 384 MB budget (oldest first) so a whole half-precision model can stay
+    resident instead of a 4-entry LRU thrashing layer to layer.
+
+    Measured live (wave89 bench, interleaved arms, min of 3, ms before -> after):
+    N8 c1024 3x3 s2 4->2 f16 44.62 -> 26.16 (1.71x), N1 c2048 3x3 s2 14->7 f16
+    169.32 -> 80.74 (2.10x), N4 c2048 3x3 s2 6->3 f16 247.52 -> 174.18 (1.42x),
+    N8 c512 5x5 s1 5->5 f16 186.41 -> 141.98 (1.31x), bf16 N8 c1024 33.07 ->
+    25.13 (1.32x), N1 c512 5x5 s1 28->28 f16 230.15 -> 191.96 (1.20x); cells
+    whose weight is small stay flat (N4 c256 3x3 s1 56 f16 1.00x, c64 1.04x)
+    because the cast was never their cost.  Numerics are unchanged bit for bit
+    (bf16 2.34e-03 and f16 3.11e-04 read the same with the cache off).
+    """
+    key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_CW", "1") == "0":
+        return weight.float()
+    ent = _CW.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    w32 = weight.float()
+    nb = w32.numel() * 4
+    while _CW:
+        tot = sum(e[2].numel() * 4 for e in _CW.values())
+        if len(_CW) < _CW_MAX_ENTRIES and tot + nb <= _CW_MAX_BYTES:
+            break
+        _CW.pop(next(iter(_CW)))
+    _CW[key] = (weakref.ref(weight), weight._version, w32)
+    return w32
 
 
 def _mp_weights(weight, k):
@@ -2461,6 +2510,67 @@ def _mp_patch(K, mpad, dtype, device):
         buf = torch.zeros((K, mpad), dtype=dtype, device=device)
         _MP_BUF[key] = buf
     return buf
+
+
+_MP_BUFG_CACHE_MAX = 1 << 26   # 64 MB: a bigger grouped patch is not cached
+
+
+def _mp_patch_g(groups, kp, mpad, device):
+    """wave89: cached zero-padded grouped patch [groups, Kp, mpad] (f32).
+
+    _conv_mp_gemm_g allocated (and zeroed) this block on every call, which is
+    pure fixed cost at small column counts.  The zero rows (Kp-Kg) and the zero
+    tail columns (NCOL..mpad) stay zero: every call rewrites all of
+    [:, :Kg, :NCOL] and the kernel never reads past NCOL.
+
+    Measured live (wave89, interleaved, ms): g16 c256 3x3 s2 5->2 2.43 -> 2.03
+    (1.20x), g16 c256 3x3 s2 10->5 7.42 -> 6.77 (1.09x); N8 g8 c512 3x3 s2 6->2
+    f16 10.39 -> 8.89 (1.17x).  Cells whose patch is already small against the
+    GEMM do not move (N32 g4 c1024 0.99x, N2 g2 c2048 1.01x), so the buffer is
+    only cached up to 64 MB and a bigger one is allocated as before.
+    """
+    nbytes = groups * kp * mpad * 4
+    if nbytes > _MP_BUFG_CACHE_MAX or os.environ.get(
+            "FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") == "0":
+        return torch.zeros((groups, kp, mpad), dtype=torch.float32,
+                           device=device)
+    key = (groups, kp, mpad, str(device))
+    buf = _MP_BUFG.get(key)
+    if buf is None:
+        if len(_MP_BUFG) > 2:
+            _MP_BUFG.clear()
+        buf = torch.zeros((groups, kp, mpad), dtype=torch.float32,
+                          device=device)
+        _MP_BUFG[key] = buf
+    return buf
+
+
+def _mp_weights_g(weight, groups, kp):
+    """wave89: cached [groups, OCG, kp] f32 grouped weight.
+
+    Same weakref + _version key as _mp_weights: the grouped route used to build
+    this block (a copy of the whole weight plus zeros) on every call whenever
+    Kg % 128 != 0, and it never cached it.  f16 weights convert on the way in.
+    """
+    key = (weight.data_ptr(), tuple(weight.shape), weight.dtype, kp, groups)
+    ent = None
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") != "0":
+        ent = _MP_WG.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    OC = weight.shape[0]
+    OCG = OC // groups
+    kg = weight.numel() // OC
+    w2 = weight.reshape(groups, OCG, kg)
+    if w2.dtype != torch.float32:
+        w2 = w2.float()
+    z = torch.zeros((groups, OCG, kp), dtype=torch.float32,
+                    device=weight.device)
+    z[:, :, :kg].copy_(w2)
+    if len(_MP_WG) >= 4:
+        _MP_WG.pop(next(iter(_MP_WG)))
+    _MP_WG[key] = (weakref.ref(weight), weight._version, z)
+    return z
 
 
 _MP_TILES = (128, 32, 128)
@@ -2710,17 +2820,16 @@ def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                   else 32 if OCG % 32 == 0 else 0)
     if mp_boc:
         mpad = _mp_mpad(NCOL)
-        p32 = torch.zeros((groups, Kp, mpad), dtype=torch.float32,
-                          device=x.device)
-        p32[:, :Kg, :NCOL] = cols.view(groups, Kg, NCOL)
+        # wave89: cached patch and cached padded weight - both used to be
+        # zero-filled fresh on every call.
+        p32 = _mp_patch_g(groups, Kp, mpad, x.device)
+        p32[:, :Kg, :NCOL].copy_(cols.view(groups, Kg, NCOL))
         if Kp == Kg:
             wp = weight.reshape(OC, Kg)
             if not wp.is_contiguous():
                 wp = wp.contiguous()
         else:
-            wp = torch.zeros((groups, OCG, Kp), dtype=torch.float32,
-                             device=x.device)
-            wp[:, :, :Kg] = weight.reshape(groups, OCG, Kg)
+            wp = _mp_weights_g(weight, groups, Kp)
         args = (wp, p32, bias if bias is not None else wp, y, Kp, NCOL, OCG)
         kw = dict(BM=mp_boc, BN=32, BK=mp_bk, MPAD=mpad,
                   HAS_BIAS=(bias is not None))
@@ -2947,13 +3056,21 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                 and conv_1px_applies(N, C, OC, OH, OW, KH, KW, groups)):
             return _conv_1px_gemv(input, weight, bias, pad_h, pad_w, KH, KW,
                                   dil_h, dil_w, out_dtype=input.dtype)
+        # wave89: a half-precision f16 unfold straight into the f32 patch was
+        # measured as a loss (N/W 0.77-1.00x on the im2col band, e.g. N8 c1024
+        # 3x3 s2 4->2 26.1 -> 26.6 ms, N16 c96 2.05 -> 2.65): the strided
+        # f16->f32 copy_ into [K, mpad] costs more than the carrier's one
+        # contiguous input.float(), so the carrier stays and only the weight
+        # cast is cached (_carrier_weight below).
         # wave65 carrier: half precision never enters the f32 kernels.  For
         # bf16 this is the only working route in the wheel (the vendor conv
         # aborts in spine-opt), and for the f16 stem it is 25x faster than the
         # vendor path.  Only the two boundaries convert: input 0.8 MB and
         # output 0.8 MB at (1,64,56,56), weight a few KB.
         if os.environ.get("FLAGGEMS_SPACEMIT_CONV_CARRIER", "1") != "0":
-            y = conv2d_direct(input.float(), weight.float(),
+            w32 = (_carrier_weight(weight) if weight.dtype == input.dtype
+                   else weight.float())
+            y = conv2d_direct(input.float(), w32,
                               bias.float() if bias is not None else None,
                               pad_h, pad_w, OH, OW, SH, SW, groups,
                               BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
