@@ -30,13 +30,31 @@ from .prod_fast import (
 )
 
 
+_FAST_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
 def _fast_ok(inp) -> bool:
     return (
         prod_fast_enabled()
         and inp.is_contiguous()
         and inp.numel() > 0
-        and inp.dtype == torch.float32
+        and inp.dtype in _FAST_DTYPES
     )
+
+
+def _acc_dtype(inp, dtype):
+    """wave29: 16-bit inputs reduce through an f32 carrier, cast in torch.
+
+    `dtype` is the requested output dtype (torch.prod's dtype kwarg), so the
+    cast target is that, not inp.dtype.
+    """
+    if inp.dtype == torch.float32:
+        return dtype
+    return torch.float32
+
+
+def _cast(out, dtype):
+    return out if out.dtype == dtype else out.to(dtype)
 
 
 def prod(inp, dim=None, keepdim=False, *, dtype=None):
@@ -54,14 +72,14 @@ def prod(inp, dim=None, keepdim=False, *, dtype=None):
                 out_shape[d] = 1
             else:
                 del out_shape[d]
-            out = torch.empty(out_shape, dtype=dtype, device=inp.device)
+            out = torch.empty(out_shape, dtype=_acc_dtype(inp, dtype), device=inp.device)
             if K == 1 and N > 1 and prod_rows_launch(inp, out, M, N):
-                return out
+                return _cast(out, dtype)
         return _generic_prod_dim(inp, dim, keepdim, dtype=dtype)
     if _fast_ok(inp):
-        out = torch.empty([], dtype=dtype, device=inp.device)
+        out = torch.empty([], dtype=_acc_dtype(inp, dtype), device=inp.device)
         if prod_flat_launch(inp, out, inp.numel()):
-            return out
+            return _cast(out, dtype)
     return _generic_prod(inp, dtype=dtype)
 
 

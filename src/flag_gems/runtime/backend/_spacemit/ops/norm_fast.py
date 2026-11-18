@@ -406,7 +406,9 @@ def _row_block(N):
 def norm_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _l2_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
+    rows = _ROWS if x.dtype == torch.float32 else 8
+    k = rows if M % rows == 0 else 1
+    _l2_rows[(triton.cdiv(M, k),)](x, out, M, N, K=k, BLOCK_N=_row_block(N))
     return True
 
 

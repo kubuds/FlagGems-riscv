@@ -30,9 +30,10 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
 from .fastmath import recip_fast
 
-_POW_ROWS_K = 8
+_POW_ROWS_K = 16
 _POW_BLOCK = 2048
 _POW_FLAT_CHUNK = 1 << 16
 _POW_FLAT_BLOCK = 2048
@@ -140,10 +141,16 @@ def _row_block(N):
 def lp_rows_launch(x, out, M, N, P, NEG) -> bool:
     if M <= 0 or N <= 0 or not lp_fast_enabled():
         return False
-    k = _POW_ROWS_K if M % _POW_ROWS_K == 0 else 1
+    k = _POW_ROWS_K
+    while k > 1 and M % k:
+        k //= 2
     bn = _row_block(N)
-    _lp_rows[(triton.cdiv(M, k),)](x, out, M, N, K=k, BLOCK_N=bn, P=P, NEG=NEG,
-                                   RF=_recip_flag())
+    # wave29: nested dispatch + 16 rows/program (probe293: ord=4 2048^2
+    # 3.15 -> 1.46, 8192x512 5.16 -> 3.38 ms; K8 under nesting leaves 1.5x
+    # on the table, K16 without nesting is a wash).
+    with nested_dispatch(M * N):
+        _lp_rows[(M // k,)](x, out, M, N, K=k, BLOCK_N=bn, P=P, NEG=NEG,
+                            RF=_recip_flag())
     return True
 
 

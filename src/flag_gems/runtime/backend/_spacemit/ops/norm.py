@@ -23,23 +23,34 @@ from flag_gems.ops.norm import norm as _generic_norm
 from .norm_fast import norm_fast_enabled, norm_flat_launch, norm_rows_launch
 
 
+_FAST_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
 def _fast_ok(x) -> bool:
     return (
         norm_fast_enabled()
         and isinstance(x, torch.Tensor)
         and x.is_contiguous()
         and x.numel() > 0
-        and x.dtype == torch.float32
+        and x.dtype in _FAST_DTYPES
     )
+
+
+def _acc_dtype(x):
+    return x.dtype if x.dtype == torch.float32 else torch.float32
+
+
+def _cast(out, x):
+    return out if out.dtype == x.dtype else out.to(x.dtype)
 
 
 def norm(x, p=2, dim=None, keepdim=False):
     if p == 2 and _fast_ok(x):
         if dim is None:
             # torch.norm(x, 2) returns a 0-dim tensor
-            out = torch.empty([], dtype=x.dtype, device=x.device)
+            out = torch.empty([], dtype=_acc_dtype(x), device=x.device)
             if norm_flat_launch(x, out, x.numel()):
-                return out
+                return _cast(out, x)
         else:
             # aten::norm.ScalarOpt_dim takes dim as int[1]
             dims = list(dim) if isinstance(dim, (list, tuple)) else [dim]
@@ -50,8 +61,9 @@ def norm(x, p=2, dim=None, keepdim=False):
                 M = x.numel() // N if N else 0
                 shape = list(x.shape)
                 shape[nd - 1] = 1
-                out = torch.empty(shape, dtype=x.dtype, device=x.device)
+                out = torch.empty(shape, dtype=_acc_dtype(x), device=x.device)
                 if norm_rows_launch(x, out.view(-1), M, N):
+                    out = _cast(out, x)
                     return out if keepdim else out.squeeze(nd - 1)
     return _generic_norm(x, p=p, dim=dim, keepdim=keepdim)
 

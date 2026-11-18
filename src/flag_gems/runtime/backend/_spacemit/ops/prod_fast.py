@@ -93,11 +93,17 @@ def _prod_rows_loop(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
 
 
 @triton.jit
-def _prod_rows_nm(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+def _prod_rows_nm(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr,
+                  TO32: tl.constexpr):
     """No-mask row kernel (wave18): requires N % BLOCK_N == 0, M % K == 0.
 
     probe160: dropping the per-iteration row/column masks is worth 20-27% on
     the row-heavy shapes (8192x512 6.17 -> 4.85 ms, 4096x1024 4.05 -> 3.03).
+
+    wave29: 16-bit inputs must be widened explicitly (TO32) - without the cast
+    the multiply rounds to the input dtype each step and a 2048-long f16 row
+    lands 15% off the f32 reference (probe289).  The f32 instantiation keeps
+    the original body so its codegen is unchanged.
     """
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
@@ -106,7 +112,10 @@ def _prod_rows_nm(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
         base = r.to(tl.int64) * N
         acc = tl.full([BLOCK_N], value=1.0, dtype=tl.float32)
         for off in range(0, N, BLOCK_N):
-            acc = acc * tl.load(X + base + off + cols)
+            v = tl.load(X + base + off + cols)
+            if TO32:
+                v = v.to(tl.float32)
+            acc = acc * v
         tl.store(Out + r, tl.reduce(acc, axis=0, combine_fn=_mul).to(Out.dtype.element_ty))
 
 
@@ -173,15 +182,22 @@ def _pick_nm_rows(m: int) -> int:
 
 def prod_rows_launch(x, out, M, N) -> bool:
     """True if the (M rows x N cols) row product was launched."""
+    import torch
+
     if M <= 0 or N < _MIN_N:
         return False
     block = min(_LOOP_BLOCK, triton.next_power_of_2(N))
+    if x.dtype != torch.float32 and block < 128 and N % 128 == 0:
+        # 16-bit loads below 128 lanes fall into a scalar path (wave27 log_softmax
+        # cliff; probe289 prod: 2048^2 B64 12.2 ms vs B128 2.7).
+        block = 128
     if N % block == 0:
         # wave28: nested dispatch + 64 rows/program: 512^2 0.341 -> 0.221,
         # 2048^2 2.039 -> 1.179, 8192x512 4.530 -> 2.330 ms (probe285).
         k = _pick_nm_rows(M)
         with nested_dispatch(M * N):
-            _prod_rows_nm[(M // k,)](x, out, M, N, K=k, BLOCK_N=block)
+            _prod_rows_nm[(M // k,)](x, out, M, N, K=k, BLOCK_N=block,
+                                     TO32=(x.dtype != torch.float32))
         return True
     # The masked fallback stays on the default launcher: nesting it segfaults
     # spine-opt at 1001x1000 (wave28 probe, reproducible), and tail shapes are
@@ -195,9 +211,14 @@ def prod_rows_launch(x, out, M, N) -> bool:
 def prod_flat_launch(x, out, numel) -> bool:
     if numel < _MIN_N:
         return False
+    import torch
+
+    block = _FLAT_BLOCK
+    if x.dtype != torch.float32:
+        block = 128  # 16-bit loads below 128 lanes scalarize (probe289)
     nblk = triton.cdiv(numel, _FLAT_CHUNK)
     mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
-    _prod_flat_stage1[(nblk,)](x, mid, numel, CHUNK=_FLAT_CHUNK, BLOCK=_FLAT_BLOCK)
+    _prod_flat_stage1[(nblk,)](x, mid, numel, CHUNK=_FLAT_CHUNK, BLOCK=block)
     _prod_flat_stage2[(1,)](mid, out, nblk, BLOCK=max(32, triton.next_power_of_2(min(nblk, 1024))))
     return True
 

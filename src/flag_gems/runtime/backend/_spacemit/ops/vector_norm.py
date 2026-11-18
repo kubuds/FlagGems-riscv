@@ -108,15 +108,32 @@ def _mode(ord):
     return None
 
 
+_FAST_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
 def _fast_ok(x, dtype) -> bool:
     return (
         norm_fast_enabled()
         and isinstance(x, torch.Tensor)
         and x.is_contiguous()
         and x.numel() > 0
-        and x.dtype == torch.float32
+        and x.dtype in _FAST_DTYPES
         and (dtype is None or dtype == x.dtype)
     )
+
+
+def _acc_dtype(x):
+    """wave29: 16-bit inputs reduce through an f32 carrier and cast in torch.
+
+    The kernels store with `.to(Out.dtype.element_ty)`; storing f16 straight
+    out of a reduce path is the wave17 spine-opt abort, so 16-bit inputs get
+    an f32 out buffer and a free torch cast (probe288).
+    """
+    return x.dtype if x.dtype == torch.float32 else torch.float32
+
+
+def _cast(out, x):
+    return out if out.dtype == x.dtype else out.to(x.dtype)
 
 
 def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
@@ -125,12 +142,13 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
         pow_spec = _POW.get(mode)
         nd = x.ndim
         if not dim or (isinstance(dim, (list, tuple)) and len(dim) == nd):
-            out = torch.empty([], dtype=x.dtype, device=x.device)
+            out = torch.empty([], dtype=_acc_dtype(x), device=x.device)
             if pow_spec is not None:
                 ok = lp_flat_launch(x, out, x.numel(), *pow_spec)
             else:
                 ok = _FLAT_LAUNCH[mode](x, out, x.numel())
             if ok:
+                out = _cast(out, x)
                 return out.reshape([1] * nd) if keepdim else out
         else:
             dims = list(dim) if isinstance(dim, (list, tuple)) else [dim]
@@ -139,11 +157,12 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
                 M = x.numel() // N if N else 0
                 shape = list(x.shape)
                 shape[nd - 1] = 1
-                out = torch.empty(shape, dtype=x.dtype, device=x.device)
+                out = torch.empty(shape, dtype=_acc_dtype(x), device=x.device)
                 if pow_spec is not None:
                     ok = lp_rows_launch(x, out.view(-1), M, N, *pow_spec)
                 else:
                     ok = _ROW_LAUNCH[mode](x, out.view(-1), M, N)
                 if ok:
+                    out = _cast(out, x)
                     return out if keepdim else out.squeeze(nd - 1)
     return _generic_vector_norm(x, ord=ord, dim=dim, keepdim=keepdim, dtype=dtype)
