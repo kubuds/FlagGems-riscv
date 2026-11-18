@@ -550,9 +550,19 @@ def _pick_k(m: int, n: int) -> int:
 #   (4096,8)      1.25 -> 0.347 (3.6x)               f16 2.61 -> 0.385 (6.8x)
 #   (2048,16)     0.87 -> 0.332 (2.6x)               f16 1.45 -> 0.348 (4.2x)
 #   (2048,32)     0.98 -> 0.417 (2.4x)               f16 1.44 -> 0.443 (3.3x)
-# 64 columns already belongs to the routed kernel (0.55 against 1.02 at
-# (1024,64)) and the tile loses there, so the gate is power-of-two N <= 32.
-_LN_FWD_TILE_MAX_N = 32
+# 64 columns was left to the routed kernel on wave39's evidence (0.55 against
+# 1.02 at (1024,64)) - but that was measured before the tile got its own BM
+# rule and the nested launch.  wave41 probe438, op level, gate 32 -> 64:
+#   f16 (1024,64) 0.814 -> 0.501 (1.63x), (2048,64) 1.354 -> 0.715 (1.89x),
+#       (4096,64) 2.202 -> 1.167 (1.89x)
+#   f32 (1024,64) 0.525 -> 0.498 (1.05x), (2048,64) 0.759 -> 0.691 (1.10x),
+#       (4096,64) 1.161 -> 1.084 (1.07x)
+# The 16-bit side is the one that mattered: it had to mask (AB=128 > 64) and
+# was 3-14% slower than the generic kernels there (wave40), and the tile now
+# beats the generic path outright.  BM=128 is the knee at 64 columns for both
+# dtypes (BM256 1.7-1.9x worse, BM512 1.5-2.9x worse), which is what the
+# existing _fwd_tile_bm already picks from 256 rows up.
+_LN_FWD_TILE_MAX_N = 64
 
 
 def _fwd_tile_bm(m: int, bn: int) -> int:

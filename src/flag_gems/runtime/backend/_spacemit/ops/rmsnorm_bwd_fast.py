@@ -156,22 +156,27 @@ def _rmsb_tile_bm(m: int, bn: int) -> int:
 
 
 def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
-    # f32 only, for two different reasons now.
-    # (1) wave40 probe429: the garbage dw that wave39 saw on a cold process was
-    # a launch-ordering bug, not accuracy - with a nested forward in front of
-    # it, a *plain* combine launch is not ordered against the tile's nested
-    # group, so it read pw before the tile's stores landed: (2048,32) f16 came
-    # back dw 4.5e2 against |dw| 105 as tile-nested/combine-plain, while both
-    # same-dispatcher arrangements (nested/nested, plain/plain) were exact on
-    # all four reps.  torch_device_fn.synchronize() is `pass` on this driver,
-    # which is why wave39's sync never helped.  rmsb_fast now keeps both
-    # launches in one nested block (worth 6.5% at (2048,32) f16: 0.737 ->
-    # 0.785 ms) and the direct-call battery is exact for f32/f16/bf16.
-    # (2) probe433 still measures dw 6.107e3 on the *autograd* path for f16
-    # (2048,32) with RMSB_FAST=1 against 2.9e-2 with RMSB_FAST=0, dx correct in
-    # both, and instrumenting RmsNorm.backward and rmsb_fast shows neither is
-    # entered - so that number comes from a path this gate does not control and
-    # f16 stays out until it is explained.
+    # f32 only.  Wave40 left two open items and wave41 closed both, without
+    # opening the gate:
+    # (1) wave40's 6.107e3 was a probe artefact, not a third backward path.
+    #     probe435: the op that runs is registered from the duplicate module
+    #     `_spacemit.ops.rms_norm`, so wave40's instrumentation (full-path
+    #     copies only) never saw its calls; its four kill-switch cells all read
+    #     dw 2.9e-2 because N=32 has no row route and fell back to the generic
+    #     backward either way.
+    # (2) with the gate open, 16-bit is exact when the tile is called directly
+    #     (probe440: max dw err 5.6e-2 on |dw| ~130 at (2048,32)) and exact in
+    #     four plain/nested reps with fresh data (probe443), but the FIRST
+    #     autograd backward of a process returns garbage dw (probe436/441/444/
+    #     446: f16 2.2-2.4e3, bf16 62, f32 exact; dx exact in every case).
+    #     It is not the forward route (fast off still 1.8e2), not compile
+    #     order (JITFunction.warmup on both kernels does not help, probe442),
+    #     and not stale buffers (fresh data per rep still wrong).  Second and
+    #     later backwards are exact, which is what a first-execution timing
+    #     window around the tile-then-combine pair looks like - and this driver
+    #     has no callable barrier (synchronize() is `pass`), so the 16-bit gate
+    #     stays closed until the launcher offers one or the combine can be made
+    #     independent of pw.
     return (
         f32
         and n <= _RMSB_TILE_MAX_N
