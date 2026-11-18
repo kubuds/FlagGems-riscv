@@ -212,6 +212,10 @@ from .sum import sum, sum_dim, sum_dim_out, sum_out
 # generic kernels. See rmsnorm_fast.py.
 from .rms_norm import rms_norm
 
+# var/std/var_mean fast paths + aten.var.dim positional-signature fix
+# (campaign 1015pm, wave7). See var.py.
+from .var import std, var, var_correction, var_dim, var_mean
+
 __all__ = [
     "_conv_depthwise2d",
     "addmm",
@@ -335,6 +339,11 @@ __all__ = [
     "sum_dim",
     "sum_dim_out",
     "sum_out",
+    "std",
+    "var",
+    "var_correction",
+    "var_dim",
+    "var_mean",
     "rms_norm",
     "sqrt",
     "sqrt_",
