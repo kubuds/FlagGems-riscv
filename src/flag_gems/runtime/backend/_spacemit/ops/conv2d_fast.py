@@ -2405,7 +2405,37 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
 
 
 _MP_BUF = {}
-_MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048)
+_MP_W = {}
+_MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _mp_weights(weight, k):
+    """wave88: K-padded [OC, k] f32 weight for the descriptor im2col GEMM.
+
+    The descriptor path needs K a multiple of its BK block; padding the weight
+    (and the patch, with zero rows) lets a layer whose C*KH*KW is not a multiple
+    of 128 keep the fast route instead of falling back to the per-item streaming
+    kernels.  Cached by identity + _version like the tap-major copy: a freed
+    weight's address is handed back to the next allocation at _version 0, so an
+    address-only key would return the previous layer's rows.
+    """
+    key = (weight.data_ptr(), tuple(weight.shape), weight.dtype, k)
+    ent = _MP_W.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    oc = weight.shape[0]
+    kt = 1
+    for d in weight.shape[1:]:
+        kt *= d
+    w2 = weight.reshape(oc, kt)
+    if w2.dtype != torch.float32:
+        w2 = w2.float()
+    z = torch.zeros((oc, k), dtype=torch.float32, device=weight.device)
+    z[:, :kt].copy_(w2)
+    if len(_MP_W) >= 4:
+        _MP_W.pop(next(iter(_MP_W)))
+    _MP_W[key] = (weakref.ref(weight), weight._version, z)
+    return z
 
 
 def _mp_mpad(ncol):
@@ -2592,27 +2622,34 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # on f16 aborts spine-opt outright.
     mp_boc = 0
     mp_bk = _mp_smt_bk(K)
+    # wave88: K is padded up to one BK block instead of declining the route.
+    # The old gate required K % 128 == 0, which shut out every layer whose
+    # C*KH*KW is not a multiple of 128 - C=64 3x3 (K=576) is the most common
+    # conv in a MobileNet/ResNet body - and left those cells on the per-item
+    # streaming routes at 13-72 ms.  Zero rows in both operands add nothing.
+    kp = ((K + mp_bk - 1) // mp_bk) * mp_bk
     if (smt is not None and x.dtype == torch.float32
-            and K % mp_bk == 0
+            and kp <= (K * 3) // 2
             and M <= _MP_SMT_MAXM
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
         mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
                   else 32 if OC % 32 == 0 else 0)
     if mp_boc:
         mpad = _mp_mpad(NCOL)
-        p32 = _mp_patch(K, mpad, torch.float32, x.device)
+        p32 = _mp_patch(kp, mpad, torch.float32, x.device)
         if N > 1:
-            p32[:, :NCOL].view(K, N, M).copy_(cols3.permute(1, 0, 2))
+            p32[:K, :NCOL].view(K, N, M).copy_(cols3.permute(1, 0, 2))
         else:
-            p32[:, :NCOL].copy_(cols3[0])
-        args = (w2, p32, bias if bias is not None else w2, y, K, NCOL, OC)
+            p32[:K, :NCOL].copy_(cols3[0])
+        w2k = w2 if kp == K else _mp_weights(weight, kp)
+        args = (w2k, p32, bias if bias is not None else w2k, y, kp, NCOL, OC)
         kw = dict(BM=mp_boc, BN=32, BK=mp_bk, MPAD=mpad,
                   HAS_BIAS=(bias is not None))
         grid = (triton.cdiv(NCOL, 32), OC // mp_boc)
         _conv_mp_smt_kernel[grid](*args, **kw)
         # wave70 pattern: a freshly compiled variant can drop the first store
         # block on this driver, so pay one extra launch the first time.
-        key = (OC, K, NCOL, bias is not None, mp_bk)
+        key = (OC, K, kp, NCOL, bias is not None, mp_bk)
         if key not in _MP_SMT_WARMED:
             _MP_SMT_WARMED.add(key)
             _conv_mp_smt_kernel[grid](*args, **kw)
@@ -2744,9 +2781,13 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     if n > 1:
         # wave86: batch folding as in conv_mp_applies; measured live -> fold
         # N=4 g8 c512 3x3 s2 6->2 13.7 -> 3.5 ms.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "2048")
-                 or 2048)
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
+                 or 4096)
         if n * m > mx:
+            return False
+        # wave88: the grouped patch is a fresh zeros (groups, Kp, mpad) block
+        # every call, not a cached one, so its size is bounded here at 128 MB.
+        if groups * cg * kh * kw * n * m * 4 > (1 << 27):
             return False
         if ((n * m + 31) // 32) * 2 > 5 * n:
             return False
@@ -2803,25 +2844,44 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         # 14->7 37.3 -> 20.7 (1.80x).  The column count bounds the weight
         # re-reads (one pass per 32-column block), so the band stops where the
         # last measured win was.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "2048")
-                 or 2048)
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
+                 or 4096)
         if n * m > mx:
             return False
         # one weight pass per 32-column block against N passes on the per-item
         # routes: measured wins are 1.5-9.8x while passes <= 2.5N (N=4 at 256
-        # columns 2.64x, N=2 at 324 columns 0.96x).
+        # columns 2.64x, N=2 at 324 columns 0.96x); wave88 measured the 4096
+        # column ceiling at 2.39x over the per-item route it replaces.
         if ((n * m + 31) // 32) * 2 > 5 * n:
             return False
-        if (c * kh * kw) % 128 or oc % 32:
+        kt = c * kh * kw
+        if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_KPAD", "1") != "0":
+            # wave88: K is padded up to one 128 block instead of declining the
+            # route; a pad below 50% of K is worth it because the alternative is
+            # the per-item streaming path.  With N items the per-item routes pay
+            # N launches and N weight streams, so the weight floor falls from
+            # 1 MB to 16 KB and a 1 MMAC floor takes its place (the fold's fixed
+            # cost is the patch build, which a cell that small cannot repay).
+            kp = (kt + 127) // 128 * 128
+            if kp > kt + kt // 2:
+                return False
+            floor_w, floor_mac = 1 << 14, 1 << 20
+        else:
+            # pre-wave88 gate, kept for A/B
+            kp = kt
+            if kt % 128:
+                return False
+            floor_w, floor_mac = 1 << 20, 0
+        if oc % 32:
             return False
         if sh * sw > 4:
             return False
         # wave87: the patch matrix is K*NCOL*4 bytes and the unfold holds a
         # second copy of it, so a wide-K layer is bounded here rather than at
         # the allocator (256 MB of patch = 512 MB live).
-        if c * kh * kw * n * m * 4 > (1 << 28):
+        if kp * n * m * 4 > (1 << 28):
             return False
-        return oc * c * kh * kw * 4 >= (1 << 20)
+        return oc * kt * 4 >= floor_w and oc * kt * n * m >= floor_mac
     # 25 is the largest measured win (5x5 s2 9x9 -> 3x3); at M=49 the same
     # route loses on 5x5 (c1024 5x5 s1 7x7 106.3 -> 118.9) and only wins 1.16x
     # on 3x3, so the band stops at 25.
