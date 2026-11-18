@@ -62,8 +62,10 @@ def prod_kernel_result(mid, out, mid_size, BLOCK_MID: tl.constexpr):
     tl.store(out, prod_val)
 
 
-def prod(inp, *, dtype=None):
+def prod(inp, dim=None, keepdim=False, *, dtype=None):
     logger.debug("GEMS PROD")
+    if dim is not None:
+        return prod_dim(inp, dim, keepdim, dtype=dtype)
     if dtype is None:
         dtype = inp.dtype
 
