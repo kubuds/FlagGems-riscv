@@ -71,12 +71,19 @@ Variants folded in:
   overhead on the large cells.
 * Q is packed once per task instead of once per stage pass (bit-exact, 0.1-0.4%
   on causal shapes).
+* plain shapes whose single query block still carries at least 2 MiB of K/V
+  rows (long decode, wide prompts) run as two KV halves in one launch
+  (flash-decoding style) merged by ``_attn_combine``: 1.10-1.77x, largest on
+  the very shapes where the one-program scan was fixed-cost bound
+  (q128 kv1024 d128 7.2 -> 4.1 ms, q1 kv8192 d128 4.1 -> 2.8 ms).  Two splits
+  is the measured optimum; four and eight lose to bandwidth and prologue cost.
 
 Environment knobs (perf experiments only; defaults are the shipped choice):
 ``FLAGGEMS_SPACEMIT_ATTN_FAST=0`` forces the generic path,
 ``..._ATTN_BM`` / ``..._ATTN_BN`` / ``..._ATTN_CTAS`` override the launch (0 or
 unset means the tiered default), ``..._ATTN_ALT=0`` disables the causal task
-alternation.
+alternation, ``..._ATTN_SPLIT=0`` disables the KV split and ``..._ATTN_NS``
+forces its split count.
 """
 
 import math
@@ -152,6 +159,8 @@ def _attn_fwd_inner(
     MICRO_N: tl.constexpr,
     num_m_tiles: tl.constexpr,
     num_n_tiles: tl.constexpr,
+    LO,
+    HI,
 ):
     if STAGE == 1:
         tl.static_assert(BLOCK_M >= BLOCK_N)
@@ -160,6 +169,10 @@ def _attn_fwd_inner(
         tl.static_assert(BLOCK_M >= BLOCK_N)
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
+    elif STAGE == 5 or STAGE == 6:
+        # explicit [LO, HI) range: the KV-split pass hands each program one
+        # chunk of the KV axis (STAGE 5 plain, 6 causal)
+        lo, hi = LO, HI
     else:
         lo, hi = 0, KV_CTX
 
@@ -192,14 +205,14 @@ def _attn_fwd_inner(
         # drop the KV bound whenever BLOCK_N divides KV_CTX: the compare plus
         # select over the BLOCK_M x BLOCK_N score tile is then pure overhead
         if KV_CTX % BLOCK_N == 0:
-            if (STAGE == 2) or (STAGE == 4):
+            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6):
                 qk_rows = tl.where(
                     row_end_2d >= (start_n + offs_n)[None, :], qk_rows, -1.0e6
                 )
         else:
             mask_n = (start_n + offs_n) < KV_CTX
             mask_2d = mask_n[None, :]
-            if (STAGE == 2) or (STAGE == 4):
+            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6):
                 mask_2d = mask_2d & (row_end_2d >= (start_n + offs_n)[None, :])
             qk_rows = tl.where(mask_2d, qk_rows, -1.0e6)
 
@@ -381,6 +394,8 @@ def _attn_fwd(
                 MICRO_N,
                 BLOCK_M // MICRO_M,
                 BLOCK_N // MICRO_N,
+                0,
+                0,
             )
         else:
             if STAGE & 1:
@@ -406,6 +421,8 @@ def _attn_fwd(
                     MICRO_N,
                     BLOCK_M // MICRO_M,
                     BLOCK_N // MICRO_N,
+                    0,
+                    0,
                 )
             if STAGE & 2:
                 acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
@@ -430,6 +447,8 @@ def _attn_fwd(
                     MICRO_N,
                     BLOCK_M // MICRO_M,
                     BLOCK_N // MICRO_N,
+                    0,
+                    0,
                 )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -446,6 +465,225 @@ def _attn_fwd(
         tl.store(
             O_block_ptr, accumulator.to(Out.type.element_ty), boundary_check=(0, 1)
         )
+
+
+
+@libentry()
+@triton.jit
+def _attn_fwd_split(
+    Q,
+    K,
+    V,
+    MMAX,
+    LSUM,
+    ACC,
+    sm_scale,
+    stride_qz: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kk: tl.constexpr,
+    stride_vz: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vn: tl.constexpr,
+    stride_vk: tl.constexpr,
+    Z,
+    H_Q,
+    H_KV,
+    GROUP_SIZE,
+    Q_CTX,
+    KV_CTX,
+    HEAD_DIM,
+    CHUNK,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    MICRO_M: tl.constexpr,
+    MICRO_K: tl.constexpr,
+    MICRO_N: tl.constexpr,
+    NS: tl.constexpr,
+    num_ctas: tl.constexpr,
+):
+    """One KV chunk of a plain (non-causal) attention task.
+
+    A decode call leaves seven of eight cores idle in the single-pass kernel;
+    each program here owns a CHUNK-wide slice of the KV axis and writes the
+    unnormalized accumulator plus its running max / sum so _attn_combine can
+    merge the slices with the exact online-softmax correction.
+    """
+    NUM_BLOCKS_M = tl.cdiv(Q_CTX, BLOCK_M)
+    NUM_BLOCKS = NUM_BLOCKS_M * Z * H_Q
+
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+    sub_num = tl.cdiv(max(NUM_BLOCKS - pid, 0), num_ctas)
+
+    lo = split * CHUNK
+    hi = tl.minimum(lo + CHUNK, KV_CTX)
+
+    num_m_tiles: tl.constexpr = BLOCK_M // MICRO_M
+    num_k_tiles: tl.constexpr = BLOCK_SIZE_K // MICRO_N
+
+    for block_idx in tl.range(0, sub_num):
+        t = pid + num_ctas * block_idx
+        task_hz_idx = t // NUM_BLOCKS_M
+        task_m_idx = t % NUM_BLOCKS_M
+
+        off_z = task_hz_idx // H_Q
+        off_hq = task_hz_idx % H_Q
+        off_hkv = off_hq // GROUP_SIZE
+
+        q_offset = off_z.to(tl.int64) * stride_qz + off_hq.to(tl.int64) * stride_qh
+        k_offset = off_z.to(tl.int64) * stride_kz + off_hkv.to(tl.int64) * stride_kh
+        v_offset = off_z.to(tl.int64) * stride_vz + off_hkv.to(tl.int64) * stride_vh
+
+        Q_block_ptr = tl.make_block_ptr(
+            base=Q + q_offset,
+            shape=(Q_CTX, HEAD_DIM),
+            strides=(stride_qm, stride_qk),
+            offsets=(task_m_idx * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_SIZE_K),
+            order=(1, 0),
+        )
+        q_desc = smt.descriptor_load(Q_block_ptr, (0, 0))
+        q = smt.view(q_desc, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (MICRO_M, MICRO_K))
+        K_block_ptr = tl.make_block_ptr(
+            base=K + k_offset,
+            shape=(KV_CTX, HEAD_DIM),
+            strides=(stride_kn, stride_kk),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, BLOCK_SIZE_K),
+            order=(1, 0),
+        )
+        V_block_ptr = tl.make_block_ptr(
+            base=V + v_offset,
+            shape=(KV_CTX, HEAD_DIM),
+            strides=(stride_vn, stride_vk),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, BLOCK_SIZE_K),
+            order=(1, 0),
+        )
+
+        offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+
+        # l starts at 0 (not 1) so the combine is an exact weighted sum of the
+        # partial normalizers
+        m_i_2d = tl.zeros([num_m_tiles, MICRO_M], dtype=tl.float32) - float("inf")
+        l_i_2d = tl.zeros([num_m_tiles, MICRO_M], dtype=tl.float32)
+        acc_4d = tl.zeros(
+            [num_m_tiles, num_k_tiles, MICRO_M, MICRO_N], dtype=tl.float32
+        )
+
+        acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
+            acc_4d,
+            l_i_2d,
+            m_i_2d,
+            q,
+            K_block_ptr,
+            V_block_ptr,
+            task_m_idx,
+            sm_scale,
+            BLOCK_M,
+            BLOCK_SIZE_K,
+            BLOCK_N,
+            5,
+            offs_m,
+            offs_n,
+            Q_CTX,
+            KV_CTX,
+            MICRO_M,
+            MICRO_K,
+            MICRO_N,
+            num_m_tiles,
+            num_k_tiles,
+            lo,
+            hi,
+        )
+
+        acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
+        m_i = tl.reshape(m_i_2d, (BLOCK_M,))
+        l_i = tl.reshape(l_i_2d, (BLOCK_M,))
+
+        rows = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_SIZE_K)
+        rmask = rows < Q_CTX
+        acc_off = (split * Z * H_Q + task_hz_idx) * Q_CTX
+        ml_off = (split * Z * H_Q + task_hz_idx) * Q_CTX
+        tl.store(
+            ACC + acc_off * HEAD_DIM + rows[:, None] * HEAD_DIM + cols[None, :],
+            acc_2d,
+            mask=rmask[:, None],
+        )
+        tl.store(MMAX + ml_off + rows, m_i, mask=rmask)
+        tl.store(LSUM + ml_off + rows, l_i, mask=rmask)
+
+
+@triton.jit
+def _attn_combine(
+    MMAX,
+    LSUM,
+    ACC,
+    Out,
+    stride_oz: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_om: tl.constexpr,
+    stride_on: tl.constexpr,
+    Z,
+    H,
+    Q_CTX,
+    HEAD_DIM,
+    NS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    zh = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rmask = rows < Q_CTX
+    cols = tl.arange(0, BLOCK_K)
+    ml_base = zh * Q_CTX
+    acc_base = zh * Q_CTX * HEAD_DIM
+    ml_stride = Z * H * Q_CTX
+    acc_stride = Z * H * Q_CTX * HEAD_DIM
+
+    m_best = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    for s in tl.static_range(NS):
+        m_best = tl.maximum(
+            m_best,
+            tl.load(
+                MMAX + s * ml_stride + ml_base + rows,
+                mask=rmask,
+                other=float("-inf"),
+            ),
+        )
+
+    denom = tl.zeros([BLOCK_M], tl.float32)
+    num = tl.zeros([BLOCK_M, BLOCK_K], tl.float32)
+    for s in tl.static_range(NS):
+        m_s = tl.load(
+            MMAX + s * ml_stride + ml_base + rows, mask=rmask, other=float("-inf")
+        )
+        l_s = tl.load(LSUM + s * ml_stride + ml_base + rows, mask=rmask, other=0.0)
+        w = tl.math.exp(m_s - m_best)
+        denom += l_s * w
+        a = tl.load(
+            ACC + s * acc_stride + acc_base + rows[:, None] * HEAD_DIM + cols[None, :],
+            mask=rmask[:, None],
+            other=0.0,
+        )
+        num += a * w[:, None]
+
+    out = num / denom[:, None]
+    o_base = (zh // H) * stride_oz + (zh % H) * stride_oh
+    tl.store(
+        Out + o_base + rows[:, None] * stride_om + cols[None, :] * stride_on,
+        out.to(Out.type.element_ty),
+        mask=rmask[:, None] & (cols[None, :] < HEAD_DIM),
+    )
 
 
 def _launch(q, k, v, sm_scale, is_causal, group_size):
@@ -552,7 +790,34 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         and num_blocks > num_ctas
     )
 
-    def _run():
+    # KV split (flash-decoding): one decode block leaves seven of eight cores
+    # idle, and the single-program scan is a fixed ~0.25 ms plus ~0.44 us/key.
+    # Hand each program half of the KV axis, then merge the two partial
+    # (m, l, acc) triples.  Measured: two splits is the sweet spot on this
+    # backend (4/8 splits cost more than they save -- K/V bandwidth and the
+    # per-program prologue dominate before the cores do), and the win only
+    # appears once each program still has >= 2 MiB of K/V rows to chew through
+    # (q1 kv512 d64 is 0.26 MiB per program and 0.83x; q1 kv2048 d128 is
+    # 2.1 MiB and 1.13x; q128 kv1024 d128 is 16 MiB and 1.74x).  Plain only:
+    # a causal chunk past a row's key bound is all-masked work.
+    split_ns = 0
+    if (
+        stage == 1
+        and _env_int("FLAGGEMS_SPACEMIT_ATTN_SPLIT", 1) != 0
+        and kv_ctx >= 512
+        and num_blocks <= 8
+        and block_m * kv_ctx * head_dim >= (2 << 20)
+    ):
+        ns = 2
+        forced = _env_int("FLAGGEMS_SPACEMIT_ATTN_NS", 0)
+        if forced:
+            ns = max(1, min(16, forced))
+        if ns >= 2:
+            chunk = triton.cdiv(triton.cdiv(kv_ctx, ns), block_n) * block_n
+            split_ns = triton.cdiv(kv_ctx, chunk)
+            split_chunk = chunk
+
+    def _run_main():
         _attn_fwd[(num_ctas,)](
             q_run,
             k,
@@ -597,7 +862,81 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
             num_stages=3,
         )
 
-    _run()
+    def _run_split():
+        acc_s = torch.empty(
+            (split_ns * q.shape[0] * h_q * q_ctx_run, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        mmax = torch.empty(
+            (split_ns * q.shape[0] * h_q * q_ctx_run,),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lsum = torch.empty_like(mmax)
+        _attn_fwd_split[(num_ctas, split_ns)](
+            q_run,
+            k,
+            v,
+            mmax,
+            lsum,
+            acc_s,
+            sm_scale,
+            q_run.stride(0),
+            q_run.stride(1),
+            q_run.stride(2),
+            q_run.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            q_run.shape[0],
+            h_q,
+            h_kv,
+            group_size,
+            q_ctx_run,
+            kv_ctx,
+            head_dim,
+            split_chunk,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_SIZE_K=block_size_k,
+            MICRO_M=micro_m,
+            MICRO_K=micro_k,
+            MICRO_N=micro_n,
+            NS=split_ns,
+            num_ctas=num_ctas,
+            num_warps=8,
+            num_stages=3,
+        )
+        _attn_combine[(triton.cdiv(q_ctx_run, 64), q_run.shape[0] * h_q)](
+            mmax,
+            lsum,
+            acc_s,
+            o_run,
+            o_run.stride(0),
+            o_run.stride(1),
+            o_run.stride(2),
+            o_run.stride(3),
+            q_run.shape[0],
+            h_q,
+            q_ctx_run,
+            head_dim,
+            NS=split_ns,
+            BLOCK_M=64,
+            BLOCK_K=block_size_k,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    if split_ns:
+        _run_split()
+    else:
+        _run_main()
     global _LAST_FOOTPRINT
     key = (
         block_size_k,
@@ -609,6 +948,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         micro_n,
         num_ctas,
         alt,
+        split_ns,
     )
     # two triggers: a configuration that has never run, and a launch whose packed
     # footprint differs from the previous launch in this process in either
@@ -625,9 +965,22 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     ) != 0:
         # see _WARMED: the first launch after the staging footprint changed reads
         # stale data, the second one is exact
-        _run()
+        if split_ns:
+            # the split path fires two kernels back to back (partials, combine);
+            # the second launch of the pair in a process is the one that reads
+            # a half-written staging buffer, so the split warmup burns one extra
+            # pair -- otherwise the first real decode call of a footprint comes
+            # back with one chunk's normalizer wrong (measured: 7.8e-02 on
+            # q1 kv2048 d128, exact from the third pair on)
+            _run_split()
+            _run_split()
+        else:
+            _run_main()
         if widen:
-            _run()
+            if split_ns:
+                _run_split()
+            else:
+                _run_main()
     _WARMED.add(key)
     _LAST_FOOTPRINT = foot
     if padded:
