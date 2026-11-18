@@ -2412,7 +2412,7 @@ _CW = {}
 _MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
-_CW_MAX_ENTRIES = 16
+_CW_MAX_ENTRIES = 64
 _CW_MAX_BYTES = 384 << 20
 
 
@@ -2428,9 +2428,13 @@ def _carrier_weight(weight):
     so the conversion is paid once per layer, not once per call.
 
     Keyed by identity + _version, never by data_ptr alone: a freed weight's
-    address is handed to the next allocation at _version 0.  Sixteen entries and
-    a 384 MB budget (oldest first) so a whole half-precision model can stay
-    resident instead of a 4-entry LRU thrashing layer to layer.
+    address is handed to the next allocation at _version 0.  Sixty-four entries
+    and a 384 MB budget (oldest first) so a whole half-precision model can stay
+    resident instead of thrashing layer to layer: a 24-layer net with 4.7 MB
+    f16 weights needs 216 MB of f32 carriers, and the old 16-entry cap evicted
+    eight of them on every sweep (pass 2 over all layers 366.4 -> 246.5 ms,
+    1.49x, outputs bit-identical to the cache-off arm).  A network whose
+    carriers exceed 384 MB still evicts; that is the documented bound.
 
     Measured live (wave89 bench, interleaved arms, min of 3, ms before -> after):
     N8 c1024 3x3 s2 4->2 f16 44.62 -> 26.16 (1.71x), N1 c2048 3x3 s2 14->7 f16
