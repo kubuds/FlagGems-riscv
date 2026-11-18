@@ -13,6 +13,8 @@
 # limitations under the License.
 
 # from .addmm import addmm
+from .amax import amax
+from .amin import amin
 from .argmax import argmax
 from .argmin import argmin
 from .bmm import bmm, bmm_out
@@ -220,6 +222,8 @@ from .var import std, var, var_correction, var_dim, var_mean
 __all__ = [
     "_conv_depthwise2d",
     "addmm",
+    "amax",
+    "amin",
     "argmax",
     "argmin",
     "bmm",
