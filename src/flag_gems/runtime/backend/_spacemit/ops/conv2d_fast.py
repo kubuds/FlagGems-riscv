@@ -279,6 +279,48 @@ def _conv1x1_smt2_kernel(A1, A2, B, Bias, Y, M, N, K1: tl.constexpr,
     tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit(do_not_specialize=["M", "N", "AGST", "BXGST", "YGST", "BGST"])
+def _conv1x1_g_smt_kernel(A, B, Bias, Y, M, N, K: tl.constexpr,
+    AGST, BXGST, YGST, BGST,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """wave77: _conv1x1_smt_kernel with a group axis.
+
+    Grouped pointwise conv (ShuffleNet's shuffle unit, grouped bottlenecks) had
+    no GEMM route: the 1x1 GEMM requires groups == 1, so it ran the 32-lane
+    group kernel at 0.96-2.97x official.  One group is one (OCG, CG) @ (CG, M)
+    GEMM and every operand is already group-major contiguous in NCHW, so
+    program_id(2) offsets the three bases and the whole layer is one launch.
+    Geometry is do_not_specialize so every layer of a family shares a binary.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_g = tl.program_id(2)
+    A = A + pid_g * AGST
+    B = B + pid_g * BXGST
+    Y = Y + pid_g * YGST
+    a_ptr = tl.make_block_ptr(base=A, shape=[M, K], strides=[K, 1],
+                              offsets=[pid_m * BLOCK_M, 0],
+                              block_shape=[BLOCK_M, K], order=[1, 0])
+    b_ptr = tl.make_block_ptr(base=B, shape=[K, N], strides=[N, 1],
+                              offsets=[0, pid_n * BLOCK_N],
+                              block_shape=[K, BLOCK_N], order=[1, 0])
+    a = smt.view(smt.descriptor_load(a_ptr, (0, 0)), (0, 0),
+                 (BLOCK_M, K), (MICRO_M, MICRO_K))
+    b = smt.view(smt.descriptor_load(b_ptr, (0, 0)), (0, 0),
+                 (K, BLOCK_N), (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(a, b), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + pid_g * BGST + oc, mask=oc < M, other=0.0)[:, None]
+    c_ptr = tl.make_block_ptr(base=Y, shape=[M, N], strides=[N, 1],
+                              offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                              block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
 # wave70: do_not_specialize on every runtime geometry argument.  Triton keys a
 # kernel binary on each int's divisibility (equal_to_1 / %16), so the same tap
 # code was recompiled for every dilation (KDIW 120/180/240 are three keys) and
@@ -1068,6 +1110,56 @@ def _pick_tiles(n, oh, ow, oc, stride=(1, 1)):
     return bow, boc, rows
 
 
+def _pick_1x1g_tiles(CG, M, OCG):
+    """wave77: tiles for the grouped pointwise GEMM (sweep w77 tiles1-4).
+
+    bm follows the group's output-channel count, one quarter of it, clamped to
+    8..64 and rounded to a power of two: OCG 32 -> 8, 64 -> 16, 128 -> 32,
+    256 -> 64, measured on g8 c256 28 (1.14 at bm 8 against 2.02 at 32),
+    g4 c256->512 28 (1.42 at 32 against 1.76 at 16) and g2 c512 28 (2.40 at
+    64 against 2.90 at 32).  CG >= 512 keeps 32: g8 c1024 14 measured 1.12 ms
+    at 32 against 1.52 at 64 and 1.59 at 16, so the A block is not TCM-bound
+    the way the phase kernel's is.  bn is 256 above 128 pixels and 64 below
+    (a 64-wide tile at M = 3136 costs 9.47 ms against 3.22 at 256).
+    """
+    bm = 8 if OCG <= 32 else (16 if OCG <= 64 else (32 if OCG <= 128 else 64))
+    if CG >= 512:
+        bm = min(bm, 32)
+    bn = 256 if M >= 128 else 64
+    bm = int(os.environ.get("FLAGGEMS_SPACEMIT_1X1G_BM", "0")) or bm
+    bn = int(os.environ.get("FLAGGEMS_SPACEMIT_1X1G_BN", "0")) or bn
+    return bm, bn
+
+
+def _conv1x1_gemm_g(input, weight, bias, OH, OW, groups):
+    """wave77: grouped 1x1 stride-1 pad-0 conv as one grouped GEMM launch.
+
+    A grouped pointwise conv is G independent (OCG, CG) @ (CG, M) GEMMs whose
+    operands already sit group-major in the NCHW weight and activation, so the
+    group is program_id(2) and the three bases shift by fixed strides - no
+    frame copy, no tap loop, one launch.  Before this route the class ran the
+    32-lane group kernel at 0.96-2.97x official; the phase kernel (1x1 is one
+    tap) already won 1.4-3.0x over that, and this kernel drops the phase
+    frame copy and buys a taller A block.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    CG, OCG = C // groups, OC // groups
+    M = OH * OW
+    x = input.contiguous().view(N, groups, CG, M)
+    wv = weight.contiguous().view(groups, OCG, CG)
+    y = torch.empty((N, groups, OCG, M), dtype=x.dtype, device=x.device)
+    bm, bn = _pick_1x1g_tiles(CG, M, OCG)
+    grid = (triton.cdiv(OCG, bm), triton.cdiv(M, bn), groups)
+    for n in range(N):
+        _conv1x1_g_smt_kernel[grid](
+            wv, x[n], bias if bias is not None else wv, y[n],
+            OCG, M, CG, OCG * CG, CG * M, OCG * M,
+            BLOCK_M=bm, BLOCK_N=bn, MICRO_M=8, MICRO_N=64, MICRO_K=32,
+            HAS_BIAS=(bias is not None), BGST=OCG)
+    return y.view(N, OC, OH, OW)
+
+
 def _pick_1x1_tiles(C, M, OC):
     """wave60 probe976-980: BLOCK_K=32 wins at C=64/128/256 (43-53 GFLOPS
     against 35-40 at K=64), a 64x64 output tile wins whenever OC > 64, and at
@@ -1380,7 +1472,7 @@ def _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w, out_dtype=None):
 # 9.4 MB, which is 1-2 ms if rebuilt every forward, so it is cached (see
 # _tap_weights for what a safe key looks like).
 _TAP_KERNELS = ((1, 3), (3, 1), (1, 5), (5, 1), (1, 7), (7, 1),
-                (3, 3), (5, 5), (7, 7))
+                (3, 3), (5, 5), (7, 7), (1, 1))
 
 _TAP_W = {}
 _TAP_BUF = {}
@@ -1682,6 +1774,12 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
     return ((kh, kw) in _TAP_KERNELS and 3 <= c <= 2048
             and (cp <= 512 or wide)
             and 32 <= oc <= 4096
+            # wave77: 1x1 belongs to the GEMM routes for a single group (the
+            # stride-1 GEMM and the strided kernel both cover it), so the tap
+            # tuple carries it only for the grouped fallback.  Left in the
+            # single-group gate it would pull padded 1x1 layers off the tap
+            # kernel they already share with the general path.
+            and (kh, kw) != (1, 1)
             # wave76: same sub-16-pixel window as the tap gate (stride > 1
             # single-group: c512 3x3 s2 at 3x3 output 8.573/54.212,
             # c128 5x5 s2 2.184/8.651, c256 3x3 s2 3.016/12.417)
@@ -1707,9 +1805,19 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
     # needs CP >= 32, so a CG=4 group carries 8x padding and the frame becomes
     # groups*CP channels: g16 c64 56x56 s2 measured 14.033 ms on this route
     # against 6.180 on the group kernel (0.44x).  CG < 8 keeps the group kernel.
-    return ((kh, kw) in _TAP_KERNELS and 8 <= cg <= 2048
+    # wave77: grouped 1x1 takes the phase route only where the pointwise GEMM
+    # cannot (CG not a power of two, stride 1) and only once the group is at
+    # least 24 channels wide - CP floors at 32, so CG=24 pads 1.33x and wins
+    # 1.54x over the group kernel (1.41 against 2.16 ms, 1.32x official), while
+    # CG=16 doubles the frame's channel count and loses 0.54x (4.09 against
+    # 2.19).  FLAGGEMS_SPACEMIT_PHG_MINCG moves the floor for the A/B.
+    mincg = int(os.environ.get("FLAGGEMS_SPACEMIT_PHG_MINCG", "0"))
+    if mincg <= 0:
+        mincg = 24 if (kh == 1 and kw == 1) else 8
+    return ((kh, kw) in _TAP_KERNELS and mincg <= cg <= 2048
             and 8 <= ocg <= 2048
             and triton.next_power_of_2(cg) <= 2048
+            and (kh != 1 or kw != 1 or (sh == 1 and sw == 1))
             # wave76: the 16-pixel floor was tuned on stride > 1, where the
             # phase build is real work.  At stride 1 a grouped dilated layer
             # skips it (the frame IS the plane), so 2x2..4x4 outputs win: g16
@@ -1793,6 +1901,21 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                                  C, KH, KW, dil_h=dil_h, dil_w=dil_w)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
+    # wave77: grouped 1x1 stride-1 pad-0 pointwise conv as one grouped GEMM.
+    # The class had no GEMM route (the 1x1 route below requires groups == 1)
+    # and ran the 32-lane group kernel at 0.96-2.97x official; on the phase
+    # kernel (1x1 = one tap) the same cells measure 1.4-3.0x over the group
+    # kernel, and this kernel then removes the phase frame copy and doubles the
+    # A block.  CG must be 32-aligned for the smt view; everything else keeps
+    # the existing routes.  FLAGGEMS_SPACEMIT_CONV_1X1G=0 pins them for A/B.
+    if (groups > 1 and KH == 1 and KW == 1 and pad_h == 0 and pad_w == 0
+            and SH == 1 and SW == 1
+            and C % groups == 0 and OC % groups == 0
+            and (C // groups) >= 32
+            and (((C // groups) & ((C // groups) - 1)) == 0)
+            and OC // groups >= 8 and OH * OW >= 64
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1G", "1") != "0"):
+        return _conv1x1_gemm_g(input, weight, bias, OH, OW, groups)
     # wave60: 1x1 stride-1 pad-0 conv is a GEMM in NCHW already - route it
     # before anything touches the input (no pad, no channel padding, no copy).
     # wave61 extends the same route to strides (the tile walks whole output
