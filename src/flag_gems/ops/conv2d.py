@@ -777,4 +777,22 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                 f"Unsupported padding string: {padding}, only'valild'/'same' are allowed."
             )
     else:
+        # wave97: inference fast entry.  Conv2d.apply (27 us) + its pre-checks
+        # (11 us) + the second predicate cascade in conv2d_direct (18-32 us)
+        # are all a function of the call signature; conv2d_infer memoizes the
+        # plan and calls conv2d_direct directly.  None means "not on the direct
+        # route" (training, non-contiguous, odd shapes) and the call falls
+        # through unchanged, so this cannot alter behaviour outside inference.
+        try:
+            from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
+                conv2d_infer,
+            )
+
+            fast_y = conv2d_infer(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+            if fast_y is not None:
+                return fast_y
+        except ImportError:
+            pass
         return Conv2d.apply(input, weight, bias, stride, padding, dilation, groups)

@@ -295,6 +295,99 @@ def conv_fast_route_applies(n, c, h, ww, oc, kh, kw, sh, sw, ph, pw, dh, dw,
     return applies
 
 
+_INFER_CACHE = {}
+_INFER_CACHE_MAX = 1024
+_INFER_MISS = object()
+
+
+def _conv_infer_plan(input, weight, sh, sw, ph, pw, dh, dw, groups):
+    n, c, h, ww = input.shape
+    oc, cg, kh, kw = weight.shape
+    if cg * groups != c or oc % groups or kh <= 0 or kw <= 0:
+        return None
+    oh = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    ow = (ww + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    if oh <= 0 or ow <= 0:
+        return None
+    if not conv_fast_route_applies(
+        n, c, h, ww, oc, kh, kw, sh, sw, ph, pw, dh, dw, groups,
+        input.dtype, weight.dtype, oh, ow
+    ):
+        return None
+    return (oh, ow)
+
+
+def conv2d_infer(input, weight, bias, stride, padding, dilation, groups):
+    """wave97: public-entry inference path that skips Conv2d.apply.
+
+    The public ``conv2d`` used to pay three host layers before any kernel ran:
+    ``Conv2d.apply`` (27 us of autograd-Function bookkeeping on this board),
+    the pre-check asserts (~11 us) and a second predicate cascade inside
+    ``conv2d_direct`` (18-32 us).  All of it is a pure function of the call
+    signature, and a whole-net inference sweep revisits the same signatures,
+    so cache (normalized params, OH/OW) and call ``conv2d_direct`` straight
+    from the public entry.
+
+    Returns None for anything outside the direct-conv inference route --
+    training, requires_grad inputs, non-contiguous tensors, shapes whose
+    channel counts do not divide -- and the caller then takes the unchanged
+    ``Conv2d.apply`` path, so error behaviour and the training path are
+    untouched.  Any FLAGGEMS_SPACEMIT_CONV_* knob set bypasses the cache, and
+    FLAGGEMS_SPACEMIT_CONV_INFER=0 disables the fast entry for A/B.
+    """
+    env = getattr(os.environ, "_data", os.environ)
+    v = env.get("FLAGGEMS_SPACEMIT_CONV_INFER")
+    if v is None:
+        v = env.get(b"FLAGGEMS_SPACEMIT_CONV_INFER")
+    if v in ("0", b"0"):
+        return None
+    if (
+        torch.is_grad_enabled()
+        or input.requires_grad
+        or weight.requires_grad
+        or (bias is not None and bias.requires_grad)
+    ):
+        return None
+    if input.ndim != 4 or weight.ndim != 4:
+        return None
+    if bias is not None and (bias.ndim != 1 or bias.shape[0] != weight.shape[0]):
+        return None
+    # the direct kernels index flat NCHW; anything else keeps the old path
+    if not input.is_contiguous() or not weight.is_contiguous():
+        return None
+
+    if isinstance(stride, (tuple, list)):
+        sh, sw = stride
+    else:
+        sh = sw = stride
+    if isinstance(padding, (tuple, list)):
+        ph, pw = padding
+    else:
+        ph = pw = padding
+    if isinstance(dilation, (tuple, list)):
+        dh, dw = dilation
+    else:
+        dh = dw = dilation
+
+    key = (input.shape, weight.shape, input.dtype, weight.dtype,
+           sh, sw, ph, pw, dh, dw, groups)
+    live = _route_env_live() or _route_cache_disabled(env)
+    plan = _INFER_CACHE.get(key, _INFER_MISS) if not live else _INFER_MISS
+    if plan is _INFER_MISS:
+        plan = _conv_infer_plan(input, weight, sh, sw, ph, pw, dh, dw, groups)
+        if not live:
+            if len(_INFER_CACHE) >= _INFER_CACHE_MAX:
+                _INFER_CACHE.clear()
+            _INFER_CACHE[key] = plan
+    if plan is None:
+        return None
+    oh, ow = plan
+    return conv2d_direct(
+        input, weight, bias, ph, pw, oh, ow,
+        SH=sh, SW=sw, groups=groups, dil_h=dh, dil_w=dw,
+    )
+
+
 @triton.jit
 def _conv1x1_kernel(X, Wm, Bs, Y, C, M, OC, sxn, syn,
     BLOCK_OC: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
