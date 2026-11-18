@@ -535,7 +535,11 @@ def _rmsb_fast_once(x, dy, inv_rms, weight, n, m):
                         pw, dw, n, fprb, 2048, (n % 2048) == 0
                     )
             return dx, dw
-        if x.dtype == torch.float32:
+        if (x.dtype == torch.float32
+                and os.environ.get("FLAGGEMS_SPACEMIT_RMSB_F32STORE", "1") != "0"):
+            # wave59: FLAGGEMS_SPACEMIT_RMSB_F32STORE=0 drops this two-store
+            # tile (dx 2-D + pw 1-D) for f32 and takes the dw-direct branch
+            # below, which is what the 16-bit path has used since wave42.
             pw = torch.empty((prb, bn), dtype=torch.float32, device=x.device)
             cb = min(2048, bn)
             with nested_dispatch(m * n):
