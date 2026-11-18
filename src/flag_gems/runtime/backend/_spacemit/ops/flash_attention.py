@@ -697,8 +697,65 @@ def _attn_combine(
     )
 
 
-def _launch(q, k, v, sm_scale, is_causal, group_size):
-    """Mirror of Attention.forward without autograd; returns the output tensor."""
+_PLAN_CACHE = {}
+_BUF_POOL = {}
+
+
+def _scratch(shape, dtype, device, kind):
+    """Reusable f32 scratch for one attention call.
+
+    Called tens or hundreds of times per second on a decode loop; three
+    torch.empty calls are ~27 us of a 0.65 ms call.  The buffers are never
+    returned to the caller, so a per-(kind, device, dtype, shape) buffer is
+    safe: kernels on one stream are ordered, the next call overwrites the
+    previous numbers after the previous kernel has consumed them.
+    """
+    key = (kind, str(device), dtype, shape)
+    if _env_int("FLAGGEMS_SPACEMIT_ATTN_HOSTFAST", 1) == 0:
+        return torch.empty(shape, dtype=dtype, device=device)
+    t = _BUF_POOL.get(key)
+    if t is None:
+        t = torch.empty(shape, dtype=dtype, device=device)
+        _BUF_POOL[key] = t
+    return t
+
+_PLAN_KEYS = (
+    "FLAGGEMS_SPACEMIT_ATTN_BM",
+    "FLAGGEMS_SPACEMIT_ATTN_BN",
+    "FLAGGEMS_SPACEMIT_ATTN_CTAS",
+    "FLAGGEMS_SPACEMIT_ATTN_NS",
+    "FLAGGEMS_SPACEMIT_ATTN_ALT",
+    "FLAGGEMS_SPACEMIT_ATTN_SPLIT",
+)
+
+
+def _plan(q, k, v, is_causal, group_size):
+    """Tiles, grid, stage and split for one attention call.
+
+    Pure function of the call signature; the decode path runs it on every
+    token, where the ~11 us of env lookups and branches is 2% of the call, so
+    hits are memoized.  Any experiment override in the environment bypasses
+    the cache (the knobs are read live).
+    """
+    key = (
+        q.dtype,
+        q.shape[0],
+        q.shape[1],
+        k.shape[1],
+        q.shape[2],
+        k.shape[2],
+        k.shape[-1],
+        bool(is_causal),
+        group_size,
+    )
+    live = any(os.environ.get(n) for n in _PLAN_KEYS) or _env_int(
+        "FLAGGEMS_SPACEMIT_ATTN_HOSTFAST", 1
+    ) == 0
+    if not live:
+        hit = _PLAN_CACHE.get(key)
+        if hit is not None:
+            return hit
+
     head_dim = k.shape[-1]
     block_size_k = triton.next_power_of_2(head_dim)
     q_ctx, kv_ctx = q.shape[2], k.shape[2]
@@ -758,29 +815,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     # query rows up to BLOCK_M and slice the result; the padding rows cost one
     # block of work and are dropped.
     padded = q_ctx < block_m
-    if padded:
-        q_run = torch.zeros(
-            (q.shape[0], h_q, block_m, head_dim), dtype=q.dtype, device=q.device
-        )
-        q_run[:, :, :q_ctx] = q
-        o_run = torch.empty_like(q_run)
-        m_run = torch.empty(
-            (q.shape[0], h_q, block_m), dtype=torch.float32, device=q.device
-        )
-        q_ctx_run = block_m
-    else:
-        q_run = q
-        o_run = torch.empty_like(q)
-        m_run = torch.empty(
-            (q.shape[0], h_q, q_ctx), dtype=torch.float32, device=q.device
-        )
-        q_ctx_run = q_ctx
-
-    acc = torch.empty(
-        (q.shape[0], h_q, q_ctx_run, head_dim),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    q_ctx_run = block_m if padded else q_ctx
 
     # causal: square shapes split the KV range into a prefix and a diagonal pass
     # (STAGE 3 = both); non-square shapes keep one masked pass, but it stops at
@@ -815,6 +850,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     # 2.1 MiB and 1.13x; q128 kv1024 d128 is 16 MiB and 1.74x).  Plain only:
     # a causal chunk past a row's key bound is all-masked work.
     split_ns = 0
+    split_chunk = 0
     if (
         stage == 1
         and _env_int("FLAGGEMS_SPACEMIT_ATTN_SPLIT", 1) != 0
@@ -830,6 +866,71 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
             chunk = triton.cdiv(triton.cdiv(kv_ctx, ns), block_n) * block_n
             split_ns = triton.cdiv(kv_ctx, chunk)
             split_chunk = chunk
+
+    plan = (
+        head_dim,
+        block_size_k,
+        q_ctx,
+        kv_ctx,
+        h_q,
+        h_kv,
+        block_m,
+        block_n,
+        micro_m,
+        micro_k,
+        micro_n,
+        num_ctas,
+        alt,
+        stage,
+        padded,
+        q_ctx_run,
+        split_ns,
+        split_chunk,
+    )
+    if not live:
+        _PLAN_CACHE[key] = plan
+    return plan
+
+
+def _launch(q, k, v, sm_scale, is_causal, group_size):
+    """Mirror of Attention.forward without autograd; returns the output tensor."""
+    (
+        head_dim,
+        block_size_k,
+        q_ctx,
+        kv_ctx,
+        h_q,
+        h_kv,
+        block_m,
+        block_n,
+        micro_m,
+        micro_k,
+        micro_n,
+        num_ctas,
+        alt,
+        stage,
+        padded,
+        q_ctx_run,
+        split_ns,
+        split_chunk,
+    ) = _plan(q, k, v, is_causal, group_size)
+
+    if padded:
+        q_run = torch.zeros(
+            (q.shape[0], h_q, block_m, head_dim), dtype=q.dtype, device=q.device
+        )
+        q_run[:, :, :q_ctx] = q
+        o_run = torch.empty_like(q_run)
+    else:
+        q_run = q
+        o_run = torch.empty_like(q)
+
+    m_run = _scratch(
+        (q.shape[0], h_q, q_ctx_run), torch.float32, q.device, "m"
+    )
+    acc = _scratch(
+        (q.shape[0], h_q, q_ctx_run, head_dim), torch.float32, q.device, "acc"
+    )
 
     def _run_main():
         _attn_fwd[(num_ctas,)](
@@ -877,17 +978,24 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         )
 
     def _run_split():
-        acc_s = torch.empty(
+        acc_s = _scratch(
             (split_ns * q.shape[0] * h_q * q_ctx_run, head_dim),
-            dtype=torch.float32,
-            device=q.device,
+            torch.float32,
+            q.device,
+            "acc_s",
         )
-        mmax = torch.empty(
+        mmax = _scratch(
             (split_ns * q.shape[0] * h_q * q_ctx_run,),
-            dtype=torch.float32,
-            device=q.device,
+            torch.float32,
+            q.device,
+            "mmax",
         )
-        lsum = torch.empty_like(mmax)
+        lsum = _scratch(
+            (split_ns * q.shape[0] * h_q * q_ctx_run,),
+            torch.float32,
+            q.device,
+            "lsum",
+        )
         _attn_fwd_split[(num_ctas, split_ns)](
             q_run,
             k,
