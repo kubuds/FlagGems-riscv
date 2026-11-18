@@ -105,11 +105,21 @@ _WILD_MAX_N = 1 << 14
 _WILD_MIN_M = 32
 
 
-def _routes(n: int, m: int):
+def _routes(n: int, m: int, is16: bool = False):
     """(dx K, dx TILE, dw BN) or None when the shape must fall back."""
     ent = _DX_ROUTES.get(n)
     if ent is not None:
         return ent[0], ent[1], _DW_BN[n]
+    # wave36 probe365: (64,64) is the official rms_norm core shape and had no
+    # backward route (the wildcard starts at N=256) - dx at 64 rows 0.403 f16 /
+    # 0.374 f32 against 0.596 / 0.524 on the generic kernels, and at 1024 rows
+    # 1.28 / 0.862 against 3.72 / 2.82.  The tile pick flips with dtype: f16
+    # T=128 (0.404 / 1.28) beats T=64 (0.464 / 2.22), f32 T=64 wins (0.374 /
+    # 0.862 vs 0.407 / 1.28), so it cannot live in the dtype-blind table.
+    if n == 64:
+        if is16:
+            return 4, 128, 128
+        return 8, 64, 64
     if _WILD_MIN_N <= n <= _WILD_MAX_N and m >= _WILD_MIN_M:
         return _WILD_DX[0], _WILD_DX[1], _WILD_BN
     return None
@@ -134,7 +144,7 @@ def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     n = weight.numel()
     if x.numel() % n:
         return False
-    if _routes(n, x.numel() // n) is None:
+    if _routes(n, x.numel() // n, x.dtype != torch.float32) is None:
         return False
     if inv_rms is None or inv_rms.numel() < x.numel() // n:
         return False
@@ -230,7 +240,7 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
     """Launch the fast backward; returns (dx, dw). Caller must have checked ok()."""
     dx = torch.empty_like(x)
     inv = inv_rms.contiguous().reshape(-1)
-    k, tile, bn = _routes(n, m)
+    k, tile, bn = _routes(n, m, x.dtype != torch.float32)
     while k > 1 and m % k:
         k //= 2
     nomask_dx = (n % tile) == 0

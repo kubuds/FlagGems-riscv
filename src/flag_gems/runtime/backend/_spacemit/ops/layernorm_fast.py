@@ -54,6 +54,12 @@ _LN_MIN_N = 1 << 15
 # (M4/N4096 0.079 common vs 0.106 carrier, M1 0.042 vs 0.098), so the floor
 # is dtype aware.
 _LN_MIN_N_16 = 1 << 12
+# wave36 probe366: the backward floor was _LN_MIN_N (32768) for every dtype,
+# but (4,16,64,4) is an official core shape with 16384 elements and the common
+# backward is pathological there - 99.6 ms f16 / 84.4 f32 against 1.11 / 1.24
+# on the carrier (89x / 68x), with dx/dw/db within 3.2e-3 (f16) and 3.5e-6
+# (f32) of a float64 oracle.  f16 (16,16,128) is 13.8x and (16,16,8,48) 32x.
+_LNB_MIN_N = 1 << 12
 _LN_MAX_N = 8192
 # wave35 probe362 (flag_gems.use_gems A/B): the f32 fast kernel loses to the
 # 16-bit carrier from 6144 columns on (M16/N6144 fast 0.581 vs carrier 0.379
@@ -629,6 +635,13 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
 # dX <= 5.7e-6, dW <= 6.1e-5 (scale ~sqrt(M)), dB <= 5e-5.
 
 _DX_BLOCK = 512
+
+
+def _dx_block(n: int) -> int:
+    # wave36 probe370: a fixed BLOCK=512 spends 128 lanes on every useful
+    # element when the row is narrow - at (4096,4) dx alone took 12.8 of the
+    # 13.4 ms while dW/dB took 0.53.  Cap the pass at the row width.
+    return min(_DX_BLOCK, triton.next_power_of_2(n))
 _DWDB_ROWS = 64
 _DWDB_CB = 2048
 
@@ -639,6 +652,12 @@ def _pick_dx_k(m: int, n: int) -> int:
     k = 16 if (n <= 1024 or m >= 2048) else 8
     while k > 1 and m % k:
         k //= 2
+    # wave36 probe372b/372c: a 4-column row cannot amortize 32 serial passes -
+    # at (4096,4) f32 B4/K32 3.19 ms, K4 1.52, K2 1.64, K1 1.75 (the three
+    # per-row loops are the cost, so narrow rows take a small K and leave the
+    # parallelism to the grid).
+    if n <= 8:
+        k = min(k, 4)
     return k
 
 
@@ -665,7 +684,7 @@ def lnb_fast_ok(
     if not input.is_contiguous() or not grad_out.is_contiguous():
         return False
     numel = input.numel()
-    if numel < _LN_MIN_N:
+    if numel < _LNB_MIN_N:
         return False
     try:
         n = _prod(normalized_shape)
@@ -822,6 +841,11 @@ def _pick_dx_k16(m: int, n: int) -> int:
     k = _LN16_BWD_K if n <= 1024 else 16
     while k > 1 and m % k:
         k //= 2
+    # wave36: same narrow-row rule as the f32 picker (probe372b: K32 3.19 ms
+    # against K4 1.52 at 4 columns on the f32 kernel; the 16-bit kernel has the
+    # same three-pass body).
+    if n <= 8:
+        k = min(k, 4)
     return min(k, max(1, m // 8))
 
 
@@ -1021,6 +1045,7 @@ def ln_bwd_fast(
         in_grad = torch.empty_like(x)
         if x.dtype == torch.float32:
             k = _pick_dx_k(m, n)
+            blk = _dx_block(n)
 
             def _launch_dx():
                 _ln_bwd_dx_kernel[(m // k,)](
@@ -1032,8 +1057,8 @@ def ln_bwd_fast(
                     in_grad.view(m, n),
                     n,
                     K=k,
-                    BLOCK=_DX_BLOCK,
-                    NOMASK=(n % _DX_BLOCK == 0),
+                    BLOCK=blk,
+                    NOMASK=(n % blk == 0),
                     HAS_W=has_w,
                 )
 
@@ -1044,6 +1069,7 @@ def ln_bwd_fast(
                 _launch_dx()
         else:
             k16 = _pick_dx_k16(m, n)
+            blk16 = _dx_block(n)
 
             def _launch_dx16():
                 _ln_bwd_dx_kernel_16[(m // k16,)](
@@ -1055,8 +1081,8 @@ def ln_bwd_fast(
                     in_grad.view(m, n),
                     n,
                     K=k16,
-                    BLOCK=_DX_BLOCK,
-                    NOMASK=(n % _DX_BLOCK == 0),
+                    BLOCK=blk16,
+                    NOMASK=(n % blk16 == 0),
                     HAS_W=has_w,
                 )
 
