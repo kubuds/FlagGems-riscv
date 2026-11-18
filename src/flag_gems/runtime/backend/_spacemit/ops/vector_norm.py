@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vendor vector_norm: ord in {1, 2, inf} fast paths; generic elsewhere.
+"""vendor vector_norm: ord in {0, 1, 2, inf} fast paths; generic elsewhere.
 
 torch.norm / torch.linalg.vector_norm dispatch to aten::linalg_vector_norm, so
 this is the entry the norm benchmarks actually measure (probe168:
@@ -22,6 +22,11 @@ wave18 wired ord=2. wave19 adds ord=1 and ord=inf with the same narrow-carrier
 kernels (probe169b, rows f32): ord=1 generic 23.6/193.2/92.0/368.2 ->
 0.347/2.419/1.038/4.356 ms; ord=inf generic 2.86/13.11/4.26/39.24 ->
 0.350/2.400/1.044/4.231 ms at 512^2 / 2048^2 / 512x4096 / 8192x512.
+
+wave20 adds ord=0 (non-zero count). This is also a bug fix: the generic
+implementation does `len(dim)` on an int dim and raises
+`TypeError: object of type 'int' has no len()` for every ord it does not
+specialise (probe174 hit it on ord=0).
 """
 
 import torch
@@ -29,6 +34,8 @@ import torch
 from flag_gems.ops.vector_norm import vector_norm as _generic_vector_norm
 
 from .norm_fast import (
+    l0_flat_launch,
+    l0_rows_launch,
     l1_flat_launch,
     l1_rows_launch,
     linf_flat_launch,
@@ -38,8 +45,18 @@ from .norm_fast import (
     norm_rows_launch,
 )
 
-_ROW_LAUNCH = {"l2": norm_rows_launch, "l1": l1_rows_launch, "linf": linf_rows_launch}
-_FLAT_LAUNCH = {"l2": norm_flat_launch, "l1": l1_flat_launch, "linf": linf_flat_launch}
+_ROW_LAUNCH = {
+    "l2": norm_rows_launch,
+    "l1": l1_rows_launch,
+    "linf": linf_rows_launch,
+    "l0": l0_rows_launch,
+}
+_FLAT_LAUNCH = {
+    "l2": norm_flat_launch,
+    "l1": l1_flat_launch,
+    "linf": linf_flat_launch,
+    "l0": l0_flat_launch,
+}
 
 
 def _mode(ord):
@@ -49,6 +66,8 @@ def _mode(ord):
         return "l1"
     if ord == float("inf"):
         return "linf"
+    if ord == 0 or ord == 0.0:
+        return "l0"
     return None
 
 

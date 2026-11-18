@@ -48,6 +48,8 @@ _DIM0_RB = 128
 _DIM0_BN_SMALL = 256   # K < 2048
 _DIM0_BN_LARGE = 512   # K >= 2048
 _DIM0_MIN_M = 64
+_MID_BN = 256
+_MID_BN_LARGE = 512
 
 
 @triton.jit
@@ -115,8 +117,45 @@ def _lse_dim0_s2(MidM, MidS, Out, NB, K, BN: tl.constexpr):
     tl.store(Out + cols, res.to(Out.dtype.element_ty), mask=cmask)
 
 
+@triton.jit
+def _lse_mid(X, Out, B, C, BN: tl.constexpr):
+    """wave20: reduce a middle dim.  X is viewed as (A, B, C) with C contiguous
+    (A = product of dims before the reduced dim), one program per (a, col block).
+
+    Online fold (max + rescaled sum), so the result is overflow-safe; the
+    unshifted `s += exp(v)` variant is 1.3-2.2x faster but overflows for
+    inputs above ~88 in f32 (probe176 measured both, rejected the naive form).
+    """
+    pa = tl.program_id(0)
+    pc = tl.program_id(1)
+    cols = pc * BN + tl.arange(0, BN)
+    cmask = cols < C
+    base = pa.to(tl.int64) * (B * C)
+    m = tl.full([BN], value=-float("inf"), dtype=tl.float32)
+    s = tl.zeros([BN], dtype=tl.float32)
+    for b in range(0, B):
+        v = tl.load(X + base + b * C + cols, mask=cmask, other=-float("inf")).to(tl.float32)
+        m_new = tl.maximum(m, v)
+        msafe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        s = s * tl.exp(m - msafe) + tl.exp(v - msafe)
+        m = m_new
+    res = m + tl.log(s)
+    res = tl.where(m == -float("inf"), m, res)
+    tl.store(Out + pa * C + cols, res.to(Out.dtype.element_ty), mask=cmask)
+
+
 def logsumexp_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_LOGSUMEXP_FAST", "1") != "0"
+
+
+def logsumexp_mid_launch(x, out, A, B, C) -> bool:
+    """True if the middle-dim fold (A outer x B reduced x C inner) was launched."""
+    if A <= 0 or B <= 1 or C < _MIN_N:
+        return False
+    bn = _MID_BN_LARGE if C >= 2048 else _MID_BN
+    bn = min(bn, triton.next_power_of_2(C))
+    _lse_mid[(A, triton.cdiv(C, bn))](x, out, B, C, BN=bn)
+    return True
 
 
 def logsumexp_rows_launch(x, out, M, N) -> bool:

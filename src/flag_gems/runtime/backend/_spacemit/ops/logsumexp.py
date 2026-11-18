@@ -28,6 +28,7 @@ from flag_gems.ops.logsumexp import logsumexp as _generic_logsumexp
 from .logsumexp_fast import (
     logsumexp_dim0_launch,
     logsumexp_fast_enabled,
+    logsumexp_mid_launch,
     logsumexp_rows_launch,
 )
 
@@ -72,4 +73,12 @@ def logsumexp(inp, dim, keepdim=False):
             if logsumexp_dim0_launch(inp, out32.view(-1), N, K):
                 out = _cast(out32, inp)
                 return out.unsqueeze(0) if keepdim else out
+        elif d > 0 and N > 1 and K > 1:
+            # wave20: middle-dim fold, X viewed as (M, N, K) with K contiguous.
+            out_shape = list(shape)
+            del out_shape[d]
+            out32 = torch.empty(out_shape, dtype=torch.float32, device=inp.device)
+            if logsumexp_mid_launch(inp, out32.view(-1), M, N, K):
+                out = _cast(out32, inp)
+                return out.unsqueeze(d) if keepdim else out
     return _generic_logsumexp(inp, dim, keepdim)

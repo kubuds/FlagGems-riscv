@@ -66,6 +66,8 @@ _MIN_N = 64
 _FLAT_CHUNK = 32768
 _FLAT_CHUNK_SMALL = 8192
 _FLAT_BLOCK = 256
+_SMALL_NUMEL = 16384   # wave20: single-program flat path below this
+_SMALL_BLOCK = 512
 
 
 @triton.jit
@@ -117,6 +119,24 @@ def _linf_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
             v = tl.load(X + base + idx, mask=mk, other=0.0).to(tl.float32)
             acc = tl.maximum(acc, tl.abs(v))
         tl.store(Out + r, tl.max(acc, axis=0).to(Out.dtype.element_ty), mask=rmask)
+
+
+@triton.jit
+def _l0_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """ord=0: count of non-zero elements per row."""
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    for i in tl.static_range(K):
+        r = pid * K + i
+        rmask = r < M
+        base = r.to(tl.int64) * N
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for off in range(0, N, BLOCK_N):
+            idx = off + cols
+            mk = (idx < N) & rmask
+            v = tl.load(X + base + idx, mask=mk, other=0.0)
+            acc += (v != 0).to(tl.float32)
+        tl.store(Out + r, tl.sum(acc, axis=0).to(Out.dtype.element_ty), mask=rmask)
 
 
 @triton.jit
@@ -188,6 +208,78 @@ def _linf_flat_stage2(Mid, Out, NB, BLOCK: tl.constexpr):
     tl.store(Out, tl.max(acc, axis=0).to(Out.dtype.element_ty))
 
 
+@triton.jit
+def _l0_flat_stage1(X, Mid, M, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK):
+        idx = pid.to(tl.int64) * CHUNK + off + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0)
+        acc += (v != 0).to(tl.float32)
+    tl.store(Mid + pid, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _l0_flat_stage2(Mid, Out, NB, BLOCK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for off in range(0, NB, BLOCK):
+        idx = off + cols
+        v = tl.load(Mid + idx, mask=idx < NB, other=0.0)
+        acc += v
+    tl.store(Out, tl.sum(acc, axis=0).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _l2_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    """wave20: one-program flat norm for tiny tensors (numel <= _SMALL_NUMEL).
+
+    The two-stage path costs two launches (~0.19 ms floor); a single program
+    over a 512-lane carrier is ~2x cheaper at 4K elements (probe174).
+    """
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
+        acc += v * v
+    tl.store(Out, tl.sqrt(tl.sum(acc, axis=0)).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _l1_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
+        acc += tl.abs(v)
+    tl.store(Out, tl.sum(acc, axis=0).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _linf_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.full([BLOCK], value=0.0, dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
+        acc = tl.maximum(acc, tl.abs(v))
+    tl.store(Out, tl.max(acc, axis=0).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _l0_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0)
+        acc += (v != 0).to(tl.float32)
+    tl.store(Out, tl.sum(acc, axis=0).to(Out.dtype.element_ty))
+
+
 def norm_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_NORM_FAST", "1") != "0"
 
@@ -224,9 +316,24 @@ def _flat_blocks(numel):
     return chunk, nblk, max(32, triton.next_power_of_2(min(nblk, 1024)))
 
 
+_SINGLE = {"l2": _l2_single, "l1": _l1_single, "linf": _linf_single, "l0": _l0_single}
+
+
+def _small_single_launch(mode, x, out, numel) -> bool:
+    """wave20: one-program flat path for numel <= _SMALL_NUMEL."""
+    if numel > _SMALL_NUMEL:
+        return False
+    block = _SMALL_BLOCK
+    nchunk = triton.cdiv(numel, block)
+    _SINGLE[mode][(1,)](x, out, numel, BLOCK=block, NCHUNK=nchunk)
+    return True
+
+
 def norm_flat_launch(x, out, numel) -> bool:
     if numel < _MIN_N:
         return False
+    if _small_single_launch("l2", x, out, numel):
+        return True
     chunk, nblk, b2 = _flat_blocks(numel)
     mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
     _l2_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
@@ -237,6 +344,8 @@ def norm_flat_launch(x, out, numel) -> bool:
 def l1_flat_launch(x, out, numel) -> bool:
     if numel < _MIN_N:
         return False
+    if _small_single_launch("l1", x, out, numel):
+        return True
     chunk, nblk, b2 = _flat_blocks(numel)
     mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
     _l1_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
@@ -247,8 +356,29 @@ def l1_flat_launch(x, out, numel) -> bool:
 def linf_flat_launch(x, out, numel) -> bool:
     if numel < _MIN_N:
         return False
+    if _small_single_launch("linf", x, out, numel):
+        return True
     chunk, nblk, b2 = _flat_blocks(numel)
     mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
     _linf_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
     _linf_flat_stage2[(1,)](mid, out, nblk, BLOCK=b2)
+    return True
+
+
+def l0_flat_launch(x, out, numel) -> bool:
+    if numel < _MIN_N:
+        return False
+    if _small_single_launch("l0", x, out, numel):
+        return True
+    chunk, nblk, b2 = _flat_blocks(numel)
+    mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
+    _l0_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
+    _l0_flat_stage2[(1,)](mid, out, nblk, BLOCK=b2)
+    return True
+
+
+def l0_rows_launch(x, out, M, N) -> bool:
+    if M <= 0 or N < _MIN_N:
+        return False
+    _l0_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
     return True
