@@ -451,6 +451,8 @@ class Conv2d(torch.autograd.Function):
                         padding_width,
                         out_height,
                         out_width,
+                        SH=stride_height,
+                        SW=stride_width,
                     )
             except ImportError:
                 pass
