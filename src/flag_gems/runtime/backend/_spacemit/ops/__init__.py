@@ -16,6 +16,7 @@
 from .argmax import argmax
 from .argmin import argmin
 from .bmm import bmm, bmm_out
+from .copy import copy_
 
 # from .conv1d import conv1d
 # from .conv2d import conv2d
@@ -49,6 +50,7 @@ __all__ = [
     "bmm_out",
     "conv1d",
     "conv2d",
+    "copy_",
     "flash_attention",
     "gelu",
     "gelu_",
