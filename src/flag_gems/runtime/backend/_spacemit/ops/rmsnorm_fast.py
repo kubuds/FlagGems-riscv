@@ -137,6 +137,61 @@ def _rms_mmk16(X, W, Y, INV, N, eps, K: tl.constexpr, TILE: tl.constexpr):
             )
 
 
+@triton.jit
+def _rms_mmk_m(X, W, Y, INV, M, N, eps, K: tl.constexpr, TILE: tl.constexpr):
+    """wave13: masked multirow - odd M keeps K rows/program (probe110).
+
+    1001x512 1.38 -> 0.55 ms, 1001x2048 2.64 -> 1.28, 513x4096 2.33 -> 1.17
+    (same-session f32; bulk+tail two-launch variant measured slower).
+    """
+    p = tl.program_id(0)
+    num = tl.cdiv(N, TILE)
+    for i in tl.static_range(K):
+        row = p * K + i
+        if row < M:
+            base = X + row * N
+            acc = tl.zeros((TILE,), dtype=tl.float32)
+            for c in range(0, num):
+                offs = c * TILE + tl.arange(0, TILE)
+                xv = tl.load(base + offs, mask=offs < N, other=0.0)
+                acc += xv * xv
+            rr = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / N + eps)
+            tl.store(INV + row, rr)
+            for c in range(0, num):
+                offs = c * TILE + tl.arange(0, TILE)
+                m = offs < N
+                xv = tl.load(base + offs, mask=m, other=0.0)
+                wv = tl.load(W + offs, mask=m, other=0.0)
+                tl.store(Y + row * N + offs, xv * rr * wv, mask=m)
+
+
+@triton.jit
+def _rms_mmk16_m(X, W, Y, INV, M, N, eps, K: tl.constexpr, TILE: tl.constexpr):
+    p = tl.program_id(0)
+    num = tl.cdiv(N, TILE)
+    for i in tl.static_range(K):
+        row = p * K + i
+        if row < M:
+            base = X + row * N
+            acc = tl.zeros((TILE,), dtype=tl.float32)
+            for c in range(0, num):
+                offs = c * TILE + tl.arange(0, TILE)
+                xv = tl.load(base + offs, mask=offs < N, other=0.0).to(tl.float32)
+                acc += xv * xv
+            rr = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / N + eps)
+            tl.store(INV + row, rr)
+            for c in range(0, num):
+                offs = c * TILE + tl.arange(0, TILE)
+                m = offs < N
+                xv = tl.load(base + offs, mask=m, other=0.0).to(tl.float32)
+                wv = tl.load(W + offs, mask=m, other=0.0).to(tl.float32)
+                tl.store(
+                    Y + row * N + offs,
+                    (xv * rr * wv).to(Y.dtype.element_ty),
+                    mask=m,
+                )
+
+
 # N -> (K, TILE) mmk fast path; only verified shapes are wired.
 # wave11 picks (probe100/102, min-of-9 same-session):
 #   f32: 512 -> K16 T256 nest (0.380); 2048 -> K4 T256 nest (3.32);
@@ -172,15 +227,27 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     if ent is None:
         return False
     k0, tile = ent
-    k = _pick_k(M, k0)
-    if k > 1:
-        kern = _rms_mmk16 if f16 else _rms_mmk
-        if k >= 4:
-            with nested_dispatch(M * N):
-                kern[(M // k,)](x, w, y, inv, N, eps, k, tile)
-        else:
-            kern[(M // k,)](x, w, y, inv, N, eps, k, tile)
+    if M < 2 * k0:
+        row = _rms_row16 if f16 else _rms_row
+        row[(M,)](x, w, y, inv, N, eps, tile)
         return True
-    row = _rms_row16 if f16 else _rms_row
-    row[(M,)](x, w, y, inv, N, eps, tile)
+    if M % k0 == 0:
+        kern = _rms_mmk16 if f16 else _rms_mmk
+        grid = M // k0
+
+        def _launch():
+            kern[(grid,)](x, w, y, inv, N, eps, k0, tile)
+    else:
+        # wave13: masked multirow keeps K rows/program for odd M instead of
+        # halving K down to 1 (probe110: 2.1-2.5x on odd-M shapes).
+        kern = _rms_mmk16_m if f16 else _rms_mmk_m
+        grid = triton.cdiv(M, k0)
+
+        def _launch():
+            kern[(grid,)](x, w, y, inv, M, N, eps, k0, tile)
+    if k0 >= 4:
+        with nested_dispatch(M * N):
+            _launch()
+    else:
+        _launch()
     return True

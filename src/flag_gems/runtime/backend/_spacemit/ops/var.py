@@ -53,7 +53,12 @@ from flag_gems.ops.var import (
 from flag_gems.ops.var_mean import var_mean as _orig_var_mean
 from flag_gems.runtime import torch_device_fn
 
-from .var_fast import var_dim_mmk_launch, var_fast_enabled, var_flat_launch
+from .var_fast import (
+    var_dim0_launch,
+    var_dim_mmk_launch,
+    var_fast_enabled,
+    var_flat_launch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +90,9 @@ def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
     """Return var (and mean) on the trailing-dim fast path, else None."""
     t = _trailing_target(x, dim)
     if t is None:
+        c = _col_target(x, dim)
+        if c is not None:
+            return _col_reduce(x, c, corr, keepdim, want_mean, sqrt)
         return None
     M, N = t
     if N - float(corr) <= 0:
@@ -99,6 +107,53 @@ def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
     with torch_device_fn.device(x.device):
         handled = var_dim_mmk_launch(
             x, var_out.reshape(M), mean_flat, M, N, corr, want_mean, sqrt
+        )
+    if not handled:
+        return None
+    if want_mean:
+        return var_out, mean_out
+    return var_out
+
+
+def _col_target(x, dim):
+    """wave13: (M, N) when reducing dim=0 of a 2D contiguous tensor."""
+    if not var_fast_enabled():
+        return None
+    if x.dtype not in _FAST_DTYPES or not x.is_contiguous():
+        return None
+    if dim is None or x.numel() < _FAST_MIN_NUMEL:
+        return None
+    dims = [dim] if isinstance(dim, int) else list(dim)
+    if len(dims) != 1 or x.ndim != 2:
+        return None
+    if dims[0] % x.ndim != 0:
+        return None
+    M, N = x.shape
+    if M <= 0 or N <= 0:
+        return None
+    return int(M), int(N)
+
+
+def _col_reduce(x, t, corr, keepdim, want_mean=False, sqrt=False):
+    """wave13: var/std/var_mean over dim=0 (row-fold two-stage)."""
+    M, N = t
+    if M - float(corr) <= 0:
+        return None
+    shape = ((1,) if keepdim else ()) + tuple(x.shape[1:])
+    var_out = torch.empty(shape, dtype=x.dtype, device=x.device)
+    mean_out = (
+        torch.empty(shape, dtype=x.dtype, device=x.device) if want_mean else None
+    )
+    with torch_device_fn.device(x.device):
+        handled = var_dim0_launch(
+            x,
+            var_out.reshape(N),
+            None if mean_out is None else mean_out.reshape(N),
+            M,
+            N,
+            corr,
+            want_mean,
+            sqrt,
         )
     if not handled:
         return None

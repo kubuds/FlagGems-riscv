@@ -179,8 +179,9 @@ def _ln_fwd_kernel(
                 tl.store(Y + base + offs, y.to(Y.dtype.element_ty), mask=mm)
 
 
-_LN_K_SMALL = 16  # N <= 1024
-_LN_K_LARGE = 8  # N > 1024
+_LN_K_SMALL = 32  # N <= 1024 (wave13 probe109 P3: 512^2 0.404 -> 0.343)
+_LN_K_LARGE = 16  # N > 1024 (wave13 probe112 P1: 2048^2 2.86 -> 2.50,
+# 512x2048 0.79 -> 0.71 at K16)
 
 
 def _pick_k(m: int, n: int) -> int:
@@ -253,8 +254,10 @@ _DWDB_ROWS = 64
 _DWDB_CB = 2048
 
 
-def _pick_dx_k(m: int) -> int:
-    k = 8
+def _pick_dx_k(m: int, n: int) -> int:
+    # wave13 probe109 P5b: K16 wins at 2048^2 (4.68 vs 4.96 ms) and 512^2
+    # (0.526 vs 0.603); 512x2048 keeps K8 (1.27 vs 1.31).
+    k = 16 if (n <= 1024 or m >= 2048) else 8
     while k > 1 and m % k:
         k //= 2
     return k
@@ -513,7 +516,7 @@ def ln_bwd_fast(
     in_grad = None
     if output_mask[0]:
         in_grad = torch.empty_like(x)
-        k = _pick_dx_k(m)
+        k = _pick_dx_k(m, n)
 
         def _launch_dx():
             _ln_bwd_dx_kernel[(m // k,)](
@@ -538,7 +541,9 @@ def ln_bwd_fast(
     dW = None
     dB = None
     if output_mask[1] or output_mask[2]:
-        rows = _DWDB_ROWS
+        # wave13 probe109 P5a: ROWS=32 wins for n>=2048 (2048^2 total
+        # 3.95 vs 4.20; 512x2048 1.06 vs 1.07).
+        rows = 32 if n >= 2048 else _DWDB_ROWS
         nrb = triton.cdiv(m, rows)
         cb = _DWDB_CB if n >= _DWDB_CB else triton.next_power_of_2(n)
         pw = torch.empty(nrb, n, dtype=torch.float32, device=x.device)
