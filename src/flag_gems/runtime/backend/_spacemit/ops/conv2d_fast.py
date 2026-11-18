@@ -658,7 +658,13 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
     # probe1011: the GEMM is bound by the 12.8 MB buffer read, so the widest
     # pixel tile that divides M wins: 32x256 reads 9.74 ms at (1,3,224,224)
     # against 11.33 at 32x128 and 16.2 at 64x128.
-    bn = 256 if M % 256 == 0 else (128 if M % 128 == 0 else 64)
+    # wave63 probe1116: widening further keeps paying wherever it divides M,
+    # because every extra column block re-loads the A tile (64x256 = 64 KB):
+    # M=16384 1024 -> 9.99 ms against 11.65 at 256 (1.17x), M=9216 512 -> 6.05
+    # against 6.40 (1.06x); at M=12544, which 512 does not divide, 1024 buys
+    # nothing (8.65 vs 8.70).  So take the widest tile that divides M.
+    bn = (1024 if M % 1024 == 0 else 512 if M % 512 == 0 else
+          256 if M % 256 == 0 else 128 if M % 128 == 0 else 64)
     # the smt descriptor path has no element mask: it can only run when both
     # grid axes land exactly on the matrix edges
     use_smt = (smt is not None and kpad == 256 and OC % bm == 0
