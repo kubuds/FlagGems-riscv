@@ -1283,6 +1283,20 @@ class Attention(torch.autograd.Function):
                             and q.shape[2] <= 64
                             and q.shape[2] * group_size <= 2048
                         )
+                        # wave101: 4096 rows for the big groups.  The trade is
+                        # the same as at 2048 - the per-block scan is set by
+                        # nq, so extra rows only buy K/V reuse across the
+                        # (head, query) groups - and the nq <= 64 boundary
+                        # still holds: g128 q32 kv512 4.37x, g256 q16 3.80x,
+                        # g64 q64 2.64x, g128 q32 kv1024 d128 3.05x, while
+                        # g16 q256 (nq 256) at 4096 rows is 1.06x.  g64 is the
+                        # smallest group that measured a win at this size (the
+                        # 2048 tier still covers g16..g32).
+                        or (
+                            group_size >= 64
+                            and q.shape[2] <= 64
+                            and q.shape[2] * group_size <= 4096
+                        )
                     )
                 )
                 or (not is_causal and q.shape[2] * group_size <= 32)
