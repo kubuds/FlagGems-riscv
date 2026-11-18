@@ -402,6 +402,7 @@ class Conv2d(torch.autograd.Function):
                     conv_1px_applies,
                     conv_1x1_dense_applies,
                     conv_mp_applies,
+                    conv_mp_g_applies,
                     conv_phase_applies,
                     conv_phase_g_applies,
                     tap_shift_applies,
@@ -505,6 +506,12 @@ class Conv2d(torch.autograd.Function):
                                    weight.shape[0], fast_oh, fast_ow, kh, kw,
                                    groups)
                                or conv_mp_applies(
+                                   input.shape[0], input.shape[1],
+                                   weight.shape[0], fast_oh, fast_ow, kh, kw,
+                                   stride_height, stride_width,
+                                   input.shape[2], input.shape[3],
+                                   dilation_height, dilation_width, groups)
+                               or conv_mp_g_applies(
                                    input.shape[0], input.shape[1],
                                    weight.shape[0], fast_oh, fast_ow, kh, kw,
                                    stride_height, stride_width,

@@ -2406,12 +2406,13 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
 
 _MP_TILES = (128, 32, 128)
 _MP_SMT_TILES = (128, 32, 128)
+_MP_SMT_MAXM = 64
 
 
 @triton.jit(do_not_specialize=["K", "M", "OC"])
 def _conv_mp_smt_kernel(W, X, Bias, Y, K, M, OC,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                        HAS_BIAS: tl.constexpr):
+                        MPAD: tl.constexpr, HAS_BIAS: tl.constexpr):
     """wave84: the M-pixel im2col GEMM on the smt descriptor path.
 
     The plain tl.load + tl.dot kernel moves its operands at 1.7 GB/s (wave83's
@@ -2422,15 +2423,23 @@ def _conv_mp_smt_kernel(W, X, Bias, Y, K, M, OC,
     BM 64+256, BM 32, micro M 16 all lose).  Split-K does not help: 1/2/4/8
     programs per row block measure 3.87/3.47/3.39/3.24 GB/s, so one program per
     row block already saturates the pipe.  The B operand is the patch matrix
-    padded to BN=32 columns (M<=25 by the gate), so no load is masked; K must
-    be a multiple of BK and OC a multiple of BM.
+    padded to MPAD columns (32 or 64) so no load is masked; K must be a multiple
+    of BK and OC a multiple of BM.
+
+    wave85: M 33..64 walks the patch in TWO 32-wide column blocks instead of one
+    64-wide block.  A 64-wide descriptor block measures 1.46 GB/s against 3.9
+    for 32, so reading the weight twice at 3.9 still beats reading it once at
+    1.46: c1024 3x3 s1 7x7->7x7 34.1 (bn64) -> 18.8 ms (2x32), c1536 5x5 203.2
+    -> 114.4, c2048 3x3 8x8->8x8 148.2 -> 92.7.  The plain-dot build of the
+    patch stays one contiguous [K, MPAD] block, so the split costs nothing.
     """
-    pid_oc = tl.program_id(0)
+    pid_m = tl.program_id(0)
+    pid_oc = tl.program_id(1)
     a_ptr = tl.make_block_ptr(base=W, shape=[OC, K], strides=[K, 1],
                               offsets=[pid_oc * BM, 0],
                               block_shape=[BM, BK], order=[1, 0])
-    b_ptr = tl.make_block_ptr(base=X, shape=[K, BN], strides=[BN, 1],
-                              offsets=[0, 0],
+    b_ptr = tl.make_block_ptr(base=X, shape=[K, MPAD], strides=[MPAD, 1],
+                              offsets=[0, pid_m * BN],
                               block_shape=[BK, BN], order=[1, 0])
     acc = tl.zeros((BM, BN), tl.float32)
     for _ in range(0, K, BK):
@@ -2444,8 +2453,56 @@ def _conv_mp_smt_kernel(W, X, Bias, Y, K, M, OC,
     oc = pid_oc * BM + tl.arange(0, BM)
     if HAS_BIAS:
         acc += tl.load(Bias + oc)[:, None]
-    m = tl.arange(0, BN)
+    m = pid_m * BN + tl.arange(0, BN)
     tl.store(Y + oc[:, None] * M + m[None, :], acc, mask=m[None, :] < M)
+
+
+@triton.jit(do_not_specialize=["K", "M", "OCG"])
+def _conv_mp_smt_g_kernel(W, X, Bias, Y, K, M, OCG,
+                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                          MPAD: tl.constexpr, HAS_BIAS: tl.constexpr):
+    """wave85: the same descriptor GEMM with the group on program_id(2).
+
+    Grouped conv at 2..32 output pixels has no GEMM route at all (the mp gate is
+    single-group, dense_g is CG < 8 and capped at 8 MB of weight, and the phase
+    kernel pays its per-pixel fixed cost), so those cells sit at 87-980 MB/s of
+    weight traffic on the group/phase kernels.  Both operand bases are
+    group-major: the packed weight is [OC, Kg] with group g owning rows
+    g*OCG.., and the patch matrix is [groups, K, MPAD] built from one unfold
+    over the full channel axis (the channel order is group-major, so group g
+    owns rows g*Kg..(g+1)*Kg of the unfold result).  Kg is padded up to a
+    multiple of BK with zeros in both the weight and the patch.  Measured live
+    -> here, ms: g2 c2048 3x3 s2 6->2 (M=9) 870.5 -> 29.3, g4 c1024 52.7 ->
+    3.34, g4 c512 12.9 -> 1.41, g8 c512 5x5 17.5 -> 1.91, g16 c1024 12.6 ->
+    1.79, g8 c256 5x5 5->5 1.53 -> 0.67 (1.88-29.7x, rel 2-4e-07).
+    """
+    pid_m = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_g = tl.program_id(2)
+    a_ptr = tl.make_block_ptr(base=W + pid_g * OCG * K,
+                              shape=[OCG, K], strides=[K, 1],
+                              offsets=[pid_oc * BM, 0],
+                              block_shape=[BM, BK], order=[1, 0])
+    b_ptr = tl.make_block_ptr(base=X + pid_g * K * MPAD,
+                              shape=[K, MPAD], strides=[MPAD, 1],
+                              offsets=[0, pid_m * BN],
+                              block_shape=[BK, BN], order=[1, 0])
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(0, K, BK):
+        a = smt.view(smt.descriptor_load(a_ptr, (0, 0)), (0, 0),
+                     (BM, BK), (8, 32))
+        b = smt.view(smt.descriptor_load(b_ptr, (0, 0)), (0, 0),
+                     (BK, BN), (32, 32))
+        acc += smt.view(smt.dot(a, b), (0, 0), (BM, BN), (1, 1))
+        a_ptr = tl.advance(a_ptr, (0, BK))
+        b_ptr = tl.advance(b_ptr, (BK, 0))
+    oc = pid_oc * BM + tl.arange(0, BM)
+    if HAS_BIAS:
+        acc += tl.load(Bias + pid_g * OCG + oc)[:, None]
+    m = pid_m * BN + tl.arange(0, BN)
+    tl.store(Y + (pid_g * OCG + oc)[:, None] * M + m[None, :], acc,
+             mask=m[None, :] < M)
+
 
 
 
@@ -2489,22 +2546,25 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # on f16 aborts spine-opt outright.
     mp_boc = 0
     if (smt is not None and x.dtype == torch.float32 and K % 128 == 0
-            and M <= 32
+            and M <= _MP_SMT_MAXM
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
         mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
                   else 32 if OC % 32 == 0 else 0)
     if mp_boc:
-        p32 = torch.zeros((K, 32), dtype=torch.float32, device=x.device)
+        mpad = 32 if M <= 32 else 64
+        p32 = torch.zeros((K, mpad), dtype=torch.float32, device=x.device)
         p32[:, :M] = p
         args = (w2, p32, bias if bias is not None else w2, y, K, M, OC)
-        kw = dict(BM=mp_boc, BN=32, BK=128, HAS_BIAS=(bias is not None))
-        _conv_mp_smt_kernel[(OC // mp_boc,)](*args, **kw)
+        kw = dict(BM=mp_boc, BN=32, BK=128, MPAD=mpad,
+                  HAS_BIAS=(bias is not None))
+        grid = (triton.cdiv(M, 32), OC // mp_boc)
+        _conv_mp_smt_kernel[grid](*args, **kw)
         # wave70 pattern: a freshly compiled variant can drop the first store
         # block on this driver, so pay one extra launch the first time.
         key = (OC, K, M, bias is not None)
         if key not in _MP_SMT_WARMED:
             _MP_SMT_WARMED.add(key)
-            _conv_mp_smt_kernel[(OC // mp_boc,)](*args, **kw)
+            _conv_mp_smt_kernel[grid](*args, **kw)
         y = y.view(1, OC, OH, OW)
         dt = out_dtype or input.dtype
         return y if y.dtype == dt else y.to(dt)
@@ -2520,6 +2580,120 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     y = y.view(1, OC, OH, OW)
     dt = out_dtype or input.dtype
     return y if y.dtype == dt else y.to(dt)
+
+
+def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
+                    groups, dil_h, dil_w, out_dtype=None):
+    """wave85: grouped conv at 2..32 output pixels as one per-group im2col GEMM.
+
+    See _conv_mp_smt_g_kernel for the measurements.  The patch matrix comes from
+    one unfold over the full channel axis (channel order is group-major, so
+    group g owns rows g*Kg..(g+1)*Kg), the weight stays a view when Kg is
+    already a multiple of 128 and is zero-padded per group otherwise.  The plain
+    tl.dot kernel takes the shapes the descriptor cannot (Kg%128 or OCG%32), the
+    same way the single-group route does.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    CG = C // groups
+    OCG = OC // groups
+    M = OH * OW
+    Kg = CG * KH * KW
+    x = input.contiguous()
+    cols = torch.nn.functional.unfold(
+        x, kernel_size=(KH, KW), dilation=(dil_h, dil_w),
+        padding=(pad_h, pad_w), stride=(SH, SW))[0].contiguous()
+    y = torch.empty((OC, M), dtype=torch.float32, device=x.device)
+    mp_boc = 0
+    Kp = (Kg + 127) // 128 * 128
+    if (smt is not None and x.dtype == torch.float32 and M <= _MP_SMT_MAXM
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_SMT", "1") != "0"):
+        mp_boc = (128 if OCG % 128 == 0 else 64 if OCG % 64 == 0
+                  else 32 if OCG % 32 == 0 else 0)
+    if mp_boc:
+        mpad = 32 if M <= 32 else 64
+        p32 = torch.zeros((groups, Kp, mpad), dtype=torch.float32,
+                          device=x.device)
+        p32[:, :Kg, :M] = cols.view(groups, Kg, M)
+        if Kp == Kg:
+            wp = weight.reshape(OC, Kg)
+            if not wp.is_contiguous():
+                wp = wp.contiguous()
+        else:
+            wp = torch.zeros((groups, OCG, Kp), dtype=torch.float32,
+                             device=x.device)
+            wp[:, :, :Kg] = weight.reshape(groups, OCG, Kg)
+        args = (wp, p32, bias if bias is not None else wp, y, Kp, M, OCG)
+        kw = dict(BM=mp_boc, BN=32, BK=128, MPAD=mpad,
+                  HAS_BIAS=(bias is not None))
+        grid = (triton.cdiv(M, 32), OCG // mp_boc, groups)
+        _conv_mp_smt_g_kernel[grid](*args, **kw)
+        key = ("g", OC, C, Kg, M, groups, bias is not None)
+        if key not in _MP_SMT_WARMED:
+            _MP_SMT_WARMED.add(key)
+            _conv_mp_smt_g_kernel[grid](*args, **kw)
+        y = y.view(1, OC, OH, OW)
+        dt = out_dtype or input.dtype
+        return y if y.dtype == dt else y.to(dt)
+    # safety net: no descriptor path -> one plain-dot GEMM per group
+    boc, bm, bk = _MP_TILES
+    if OCG < boc:
+        boc = triton.next_power_of_2(OCG)
+    nomask = (Kg % bk == 0) and (M % bm == 0) and (OCG % boc == 0)
+    wg = weight.reshape(OC, Kg)
+    cols3 = cols.view(groups, Kg, M)
+    for gi in range(groups):
+        yg = y[gi * OCG:(gi + 1) * OCG]
+        bg = (bias[gi * OCG:(gi + 1) * OCG] if bias is not None
+              else wg[gi * OCG:(gi + 1) * OCG])
+        _conv1x1_kernel[(triton.cdiv(M, bm), triton.cdiv(OCG, boc), 1)](
+            cols3[gi], wg[gi * OCG:(gi + 1) * OCG], bg, yg, Kg, M, OCG,
+            cols3[gi].stride(0), yg.stride(0),
+            BLOCK_OC=boc, BLOCK_M=bm, BLOCK_K=bk,
+            HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=False)
+    y = y.view(1, OC, OH, OW)
+    dt = out_dtype or input.dtype
+    return y if y.dtype == dt else y.to(dt)
+
+
+def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
+                      dil_w=1, groups=1) -> bool:
+    """wave85: grouped 2..32-pixel outputs as a per-group descriptor GEMM.
+
+    Measured live -> here, ms: g2 c2048 3x3 s2 6->2 870.5 -> 29.3 (29.7x),
+    g4 c1024 52.7 -> 3.3 (15.8x), g4 c512 12.9 -> 1.4 (9.2x), g8 c512 5x5
+    17.5 -> 1.9 (9.1x), g16 c1024 12.6 -> 1.8 (7.1x), g8 c256 5x5 5->5 1.53 ->
+    0.67 (2.3x), g4 c512 3x3 s2 7->3 2.59 -> 1.38 (1.88x).  CG >= 16 only:
+    CG 1..7 belongs to the dense block-diagonal route (wave81), OCG >= 32 keeps
+    the A block at a full BM row.
+    FLAGGEMS_SPACEMIT_CONV_MPG=0 pins the grouped kernels for A/B.
+    """
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG", "1") == "0":
+        return False
+    if n != 1 or groups < 2:
+        return False
+    if (kh, kw) not in _TAP_KERNELS or dil_h != dil_w:
+        return False
+    if c % groups or oc % groups:
+        return False
+    cg, ocg = c // groups, oc // groups
+    if cg < 16 or ocg < 32:
+        return False
+    m = oh * ow
+    if not (2 <= m <= 32):
+        return False
+    if sh * sw > 4:
+        return False
+    if oc * cg * kh * kw * 4 < (1 << 18):
+        return False
+    # a 5x5 output is the one band where the grouped phase kernel is already
+    # tight: g8 c256 5x5 s1 5->5 (0.8 MB) measured 1.82 live against 1.94 here
+    # (0.94x) - the unfold, patch and weight pad add 0.9 ms of fixed cost to a
+    # 0.68 ms kernel.  Keep those on phase_g.
+    if m >= 25 and conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw,
+                                        groups):
+        return False
+    return True
 
 
 def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
@@ -2545,7 +2719,14 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
     # 25 is the largest measured win (5x5 s2 9x9 -> 3x3); at M=49 the same
     # route loses on 5x5 (c1024 5x5 s1 7x7 106.3 -> 118.9) and only wins 1.16x
     # on 3x3, so the band stops at 25.
-    if not (2 <= m <= 25):
+    # wave85: that 49-pixel verdict was the PLAIN dot at BN=64.  The descriptor
+    # path with two 32-wide column blocks measures 1.85-6.1x on the same cells
+    # (c1024 5x5 s1 7x7 90.4 -> 49.0, c1024 3x3 s1 7x7 51.9 -> 18.8, c1536 5x5
+    # 698.6 -> 114.4, c2048 3x3 8x8->8x8 219.8 -> 92.7), so the band now runs
+    # to 64 pixels.  FLAGGEMS_SPACEMIT_CONV_MP_EXT=0 pins the 25-pixel gate.
+    if not (2 <= m <= _MP_SMT_MAXM):
+        return False
+    if m > 32 and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_EXT", "1") == "0":
         return False
     if sh * sw > 4:
         return False
@@ -2563,6 +2744,10 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
     # The power-of-two cell at the same shape loses (c1024 5x5 s2 5x5 -> 3x3
     # 59.9 vs 74.7), so the clause is exactly the non-power-of-two class.
     if c >= 1024 and (c & (c - 1)) != 0:
+        return True
+    # wave85: every 33..64-pixel cell with >= 8 MB of weight measured a win
+    # (1.55-5.9x against the phase route), so the whole band takes the GEMM.
+    if m > 32:
         return True
     return m >= 16 or c >= 2048 or w < 4
 
@@ -2630,6 +2815,14 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                              SH, SW, dil_h, dil_w, out_dtype=_out_dtype)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
+    # wave85: grouped conv at 2..32 output pixels has no GEMM route (mp is
+    # single-group, dense_g stops at CG 8 / 8 MB, phase pays per-pixel cost).
+    # One per-group descriptor GEMM off the same patch matrix: 1.9-29.7x.
+    if conv_mp_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW, H, W,
+                         dil_h, dil_w, groups):
+        return _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w,
+                               KH, KW, SH, SW, groups, dil_h, dil_w,
+                               out_dtype=_out_dtype)
     # wave81: CG below the lane floor goes dense (block-diagonal weight, one
     # launch over the whole channel axis).  Everything below this point is a
     # grouped route; the dense rewrite is exact and hands the shape back to the
