@@ -753,6 +753,7 @@ _PLAN_KEYS = (
     "FLAGGEMS_SPACEMIT_ATTN_ALT",
     "FLAGGEMS_SPACEMIT_ATTN_SPLIT",
     "FLAGGEMS_SPACEMIT_ATTN_PACK_BN",
+    "FLAGGEMS_SPACEMIT_ATTN_F32TILE",
 )
 
 
@@ -831,6 +832,27 @@ def _plan(q, k, v, is_causal, group_size, row_mod=0):
         else:
             block_m = bm
             block_n = min(256, max(32, triton.next_power_of_2(kv_ctx)))
+    if (
+        q.dtype == torch.float32
+        and block_m <= 8
+        and q_ctx < kv_ctx
+        and q_ctx <= 8
+        and _env_int("FLAGGEMS_SPACEMIT_ATTN_F32TILE", 1) != 0
+    ):
+        # wave98: f32 has no matrix engine, so an 8-row tile with one real row
+        # is pure padding -- the dot runs on the vector unit and three empty
+        # rows cost as much as the real one.  next_power_of_2(q_ctx) rows
+        # (1/2/4/8) measured 1.45-1.89x on q1..q4 (q1 kv512 d64 0.785 -> 0.502,
+        # q1 kv2048 d64 1.60 -> 0.85, q1 kv2048 d128 1.77 -> 1.38,
+        # q4 kv1024 1.08 -> 0.76) and neutral at q8.  A causal pass also wants
+        # the N tile at 128 (its bound is KV-independent, so a 256-wide tile
+        # spends most of the dot masked: q1 kv512 0.454 vs 0.432, q8 kv512
+        # 0.573 -> 0.496); plain keeps the tier's 256, which is 1.6% better at
+        # kv2048.  f16 keeps the 8-row floor: BLOCK_M 1 fails spine-opt
+        # (vector size 0) and its 16-row micro group already pays the padding.
+        block_m = max(1, min(8, triton.next_power_of_2(q_ctx)))
+        if is_causal:
+            block_n = min(block_n, 128)
     if row_mod > 0 and is_causal:
         # wave97: the packed causal scan stops at nq keys, so the default
         # 256-wide N tile spends 8x the dot on masked columns; 32 is the
@@ -1184,11 +1206,28 @@ class Attention(torch.autograd.Function):
         if (
             group_size > 1
             and q.is_contiguous()
-            # plain packing only fills the padding rows of a short query, so it
-            # pays up to 32 rows; causal packing also collapses the KV scan to
-            # nq keys, which is worth a 64-row block (wave97)
-            and q.shape[2] * group_size <= (64 if is_causal else 32)
-            and (not is_causal or q.shape[2] <= min(16, k.shape[2]))
+            # wave97/98 packing caps.  causal packing collapses the KV scan to
+            # nq keys, so a 128-row block pays for itself: g2 q32 2.41x,
+            # g2 q64 2.18x, g4 q32 1.73x, g8 q16 1.67x, g16 q8 1.65x,
+            # g8 q16 b2 2.81x at 128 rows.  Plain packing only fills the
+            # padding rows of a short query, so 32 rows stays the rule --
+            # except when the per-head query itself is short (nq <= 4): there
+            # an 8-row unpacked tile is mostly padding and 64 packed rows win
+            # 1.69-4.98x (g16 q4 2.19 -> 1.30, g32 q2 3.69 -> 1.35,
+            # g64 q1 6.84 -> 1.37), while nq 8+ at 64 rows loses (g8 q8 0.91x).
+            and (
+                (
+                    is_causal
+                    and q.shape[2] * group_size <= 128
+                    and q.shape[2] <= k.shape[2]
+                )
+                or (not is_causal and q.shape[2] * group_size <= 32)
+                or (
+                    not is_causal
+                    and q.shape[2] <= 4
+                    and q.shape[2] * group_size <= 64
+                )
+            )
             and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK", 1) != 0
         ):
             b, hq, nq, hd = q.shape
