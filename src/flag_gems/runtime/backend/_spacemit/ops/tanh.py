@@ -22,6 +22,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 _tanh = tl_extra_shim.tanh
 
@@ -105,10 +107,11 @@ def _launch_direct(x, out):
     if n == 0:
         return out
     with torch_device_fn.device(x.device):
-        if n % _BLOCK == 0:
-            tanh_kernel_direct_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
-        else:
-            tanh_kernel_direct[(triton.cdiv(n, _BLOCK),)](x, out, n, BLOCK=_BLOCK)
+        with nested_dispatch(n):
+            if n % _BLOCK == 0:
+                tanh_kernel_direct_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
+            else:
+                tanh_kernel_direct[(triton.cdiv(n, _BLOCK),)](x, out, n, BLOCK=_BLOCK)
     return out
 
 
@@ -131,14 +134,15 @@ def tanh_backward(grad_output, output):
         out = torch.empty_like(grad_output)
         n = grad_output.numel()
         with torch_device_fn.device(grad_output.device):
-            if n % _BLOCK == 0:
-                tanh_backward_kernel_direct_nomask[(n // _BLOCK,)](
-                    output, grad_output, out, n, BLOCK=_BLOCK
-                )
-            else:
-                tanh_backward_kernel_direct[(triton.cdiv(n, _BLOCK),)](
-                    output, grad_output, out, n, BLOCK=_BLOCK
-                )
+            with nested_dispatch(n):
+                if n % _BLOCK == 0:
+                    tanh_backward_kernel_direct_nomask[(n // _BLOCK,)](
+                        output, grad_output, out, n, BLOCK=_BLOCK
+                    )
+                else:
+                    tanh_backward_kernel_direct[(triton.cdiv(n, _BLOCK),)](
+                        output, grad_output, out, n, BLOCK=_BLOCK
+                    )
         return out
     return tanh_backward_generic(output, grad_output)
 

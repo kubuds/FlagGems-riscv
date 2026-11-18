@@ -22,6 +22,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 
 erf = tl_extra_shim.erf
@@ -36,6 +38,8 @@ geluNone = tl_extra_shim.gelu_none
 # 22.16 ms; tanh: 1M 5.61 -> 3.69 ms, 2048x2048 21.48 -> 14.68 ms) because its
 # generated kernel lowers worse. Same formulas as the wrapper (maxdiff ~2-5e-07
 # vs torch, equal to the wrapper's own rounding).
+# campaign 1012am: mask-free variants (+4.5% none / +6.0% tanh f32; +2.8% f16,
+# bit-identical) + nested dispatch (2.7x).
 _BLOCK = 8192
 
 
@@ -53,6 +57,17 @@ def gelu_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
 
 @libentry()
 @triton.jit
+def gelu_kernel_nomask(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    x32 = x.to(tl.float32)
+    y = 0.5 * x32 * (1.0 + erf(x32 * 0.7071067811))
+    tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty))
+
+
+@libentry()
+@triton.jit
 def gelu_tanh_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -61,6 +76,17 @@ def gelu_tanh_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
     x32 = x.to(tl.float32)
     y = 0.5 * x32 * (1.0 + tanh(0.79788456 * x32 * (1.0 + 0.044715 * x32 * x32)))
     tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty), mask=m)
+
+
+@libentry()
+@triton.jit
+def gelu_tanh_kernel_nomask(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    x32 = x.to(tl.float32)
+    y = 0.5 * x32 * (1.0 + tanh(0.79788456 * x32 * (1.0 + 0.044715 * x32 * x32)))
+    tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty))
 
 
 @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")])
@@ -121,10 +147,18 @@ def _launch_direct(x, out, approximate):
     n = x.numel()
     if n == 0:
         return out
-    grid = (triton.cdiv(n, _BLOCK),)
-    kernel = gelu_tanh_kernel if approximate == "tanh" else gelu_kernel
     with torch_device_fn.device(x.device):
-        kernel[grid](x, out, n, BLOCK=_BLOCK)
+        with nested_dispatch(n):
+            if approximate == "tanh":
+                if n % _BLOCK == 0:
+                    gelu_tanh_kernel_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
+                else:
+                    gelu_tanh_kernel[(triton.cdiv(n, _BLOCK),)](x, out, n, BLOCK=_BLOCK)
+            else:
+                if n % _BLOCK == 0:
+                    gelu_kernel_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
+                else:
+                    gelu_kernel[(triton.cdiv(n, _BLOCK),)](x, out, n, BLOCK=_BLOCK)
     return out
 
 
@@ -142,10 +176,11 @@ def gelu(A, *, approximate="none"):
 
 def gelu_backward(grad_output, self, *, approximate="none"):
     logger.debug("GEMS_SPACEMIT GELU_BACKWARD")
-    if approximate == "tanh":
-        in_grad = gelu_backward_tanh(self, grad_output)
-    else:
-        in_grad = gelu_backward_none(self, grad_output)
+    with nested_dispatch(grad_output.numel()):
+        if approximate == "tanh":
+            in_grad = gelu_backward_tanh(self, grad_output)
+        else:
+            in_grad = gelu_backward_none(self, grad_output)
     return in_grad
 
 

@@ -23,6 +23,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 _pow = tl_extra_shim.pow
 _exp2 = tl_extra_shim.exp2
 logger = logging.getLogger(__name__)
@@ -229,18 +231,19 @@ def _pow_special_apply(A, special, out=None):
         else:
             km, kn = _pow_negint_kernel, _pow_negint_kernel_nomask
         with torch_device_fn.device(A.device):
-            if n % _POW_BLOCK == 0:
-                grid = (n // _POW_BLOCK,)
-                if kind == "negint":
-                    kn[grid](A, out, n, k=payload, BLOCK=_POW_BLOCK)
+            with nested_dispatch(n):
+                if n % _POW_BLOCK == 0:
+                    grid = (n // _POW_BLOCK,)
+                    if kind == "negint":
+                        kn[grid](A, out, n, k=payload, BLOCK=_POW_BLOCK)
+                    else:
+                        kn[grid](A, out, n, BLOCK=_POW_BLOCK)
                 else:
-                    kn[grid](A, out, n, BLOCK=_POW_BLOCK)
-            else:
-                grid = (triton.cdiv(n, _POW_BLOCK),)
-                if kind == "negint":
-                    km[grid](A, out, n, k=payload, BLOCK=_POW_BLOCK)
-                else:
-                    km[grid](A, out, n, BLOCK=_POW_BLOCK)
+                    grid = (triton.cdiv(n, _POW_BLOCK),)
+                    if kind == "negint":
+                        km[grid](A, out, n, k=payload, BLOCK=_POW_BLOCK)
+                    else:
+                        km[grid](A, out, n, BLOCK=_POW_BLOCK)
     return out
 
 
@@ -254,7 +257,8 @@ def _pow_direct_scalar(A, exponent, out=None):
         # apparently schedules better with the masked load. Keep masked.
         grid = (triton.cdiv(n, _POW_BLOCK),)
         with torch_device_fn.device(A.device):
-            _pow_exp2_se_kernel[grid](A, out, n, float(exponent), BLOCK=_POW_BLOCK)
+            with nested_dispatch(n):
+                _pow_exp2_se_kernel[grid](A, out, n, float(exponent), BLOCK=_POW_BLOCK)
     return out
 
 
@@ -265,7 +269,8 @@ def _pow_direct_tt(A, exponent, out=None):
     if n:
         grid = (triton.cdiv(n, _POW_BLOCK),)
         with torch_device_fn.device(A.device):
-            _pow_exp2_tt_kernel[grid](A, exponent, out, n, BLOCK=_POW_BLOCK)
+            with nested_dispatch(n):
+                _pow_exp2_tt_kernel[grid](A, exponent, out, n, BLOCK=_POW_BLOCK)
     return out
 
 
@@ -344,13 +349,14 @@ def _pow_by_mul(A, exponent):
     n_elements = A.numel()
     BLOCK_SIZE = 8192
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    pow_by_mul_kernel[grid](
-        A,
-        out,
-        n_elements,
-        exponent=exponent,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    with nested_dispatch(n_elements):
+        pow_by_mul_kernel[grid](
+            A,
+            out,
+            n_elements,
+            exponent=exponent,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
     return out
 
 
@@ -451,6 +457,7 @@ def pow_scalar(A, exponent):
         n = exponent.numel()
         grid = (triton.cdiv(n, _POW_BLOCK),)
         with torch_device_fn.device(exponent.device):
-            _pow_exp2_st_kernel[grid](exponent, out, n, l2b, BLOCK=_POW_BLOCK)
+            with nested_dispatch(n):
+                _pow_exp2_st_kernel[grid](exponent, out, n, l2b, BLOCK=_POW_BLOCK)
         return out
     return pow_func_scalar_tensor(A, exponent)

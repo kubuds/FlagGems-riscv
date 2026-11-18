@@ -24,6 +24,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils.type_utils import get_accumulator_dtype
 
+from ._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 
 pow = tl_extra_shim.pow
@@ -285,9 +287,10 @@ class LayerNorm(torch.autograd.Function):
 
         TILE_N = 512
         with torch_device_fn.device(x.device):
-            layer_norm_common_kernel[(M,)](
-                x, y, weight, bias, mean, rstd, M, N, eps, TILE_N=TILE_N
-            )
+            with nested_dispatch(x.numel()):
+                layer_norm_common_kernel[(M,)](
+                    x, y, weight, bias, mean, rstd, M, N, eps, TILE_N=TILE_N
+                )
 
         if x.requires_grad:
             ctx.save_for_backward(x, weight, bias, mean, rstd)

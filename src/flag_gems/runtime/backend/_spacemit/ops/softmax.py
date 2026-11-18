@@ -21,6 +21,8 @@ import triton.language as tl
 from flag_gems.ops.softmax import softmax_backward as common_softmax_backward
 from flag_gems.utils import tl_extra_shim
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 exp = tl_extra_shim.exp
 
@@ -109,16 +111,17 @@ def _spacemit_softmax_lastdim(inp, out):
     row_size = 1 if n_rows < 2 else (2 if n_rows < 8 else 4)
     col_size = 64
     grid = lambda meta: (triton.cdiv(n_rows, meta["ROW_SIZE"]),)
-    softmax_kernel_spacemit[grid](
-        out,
-        inp,
-        inp.stride(0),
-        out.stride(0),
-        n_rows,
-        n_cols,
-        ROW_SIZE=row_size,
-        COL_SIZE=col_size,
-    )
+    with nested_dispatch(inp.numel()):
+        softmax_kernel_spacemit[grid](
+            out,
+            inp,
+            inp.stride(0),
+            out.stride(0),
+            n_rows,
+            n_cols,
+            ROW_SIZE=row_size,
+            COL_SIZE=col_size,
+        )
 
 
 def softmax(self, dim, half_to_float=False):
@@ -144,4 +147,5 @@ def softmax(self, dim, half_to_float=False):
 
 def softmax_backward(grad_output, output, dim, input_dtype):
     logger.debug("GEMS_SPACEMIT SOFTMAX_VJP")
-    return common_softmax_backward(grad_output, output, dim, input_dtype)
+    with nested_dispatch(grad_output.numel()):
+        return common_softmax_backward(grad_output, output, dim, input_dtype)

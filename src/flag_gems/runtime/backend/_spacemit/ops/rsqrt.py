@@ -22,12 +22,16 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 
 # Direct-kernel fast path for floating dtypes. The generic pointwise wrapper
 # measured ~1.3-4.7 ms slower per call than an equivalent direct launch on K3
 # (2048x2048: 17.9 ms vs 13.2 ms; 1M: 4.6 ms vs 3.3 ms) because its generated
 # kernel lowers worse; the direct kernel is bit-exact vs torch.rsqrt.
+# campaign 1012am: mask-free variant (+6.5-7.4% interleaved A/B, all variants
+# bit-exact vs torch) + nested dispatch (2.3x).
 _BLOCK = 8192
 
 
@@ -39,6 +43,15 @@ def rsqrt_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
     m = offs < n
     x = tl.load(x_ptr + offs, mask=m, other=1.0)
     tl.store(y_ptr + offs, tl.rsqrt(x.to(tl.float32)).to(y_ptr.type.element_ty), mask=m)
+
+
+@libentry()
+@triton.jit
+def rsqrt_kernel_nomask(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(y_ptr + offs, tl.rsqrt(x.to(tl.float32)).to(y_ptr.type.element_ty))
 
 
 @libentry()
@@ -61,11 +74,15 @@ def _launch_direct(x, out):
     n = x.numel()
     if n == 0:
         return out
-    grid = (triton.cdiv(n, _BLOCK),)
-    if x.dtype == torch.float64:
-        rsqrt_kernel_f64[grid](x, out, n, BLOCK=_BLOCK)
-    else:
-        rsqrt_kernel[grid](x, out, n, BLOCK=_BLOCK)
+    with nested_dispatch(n):
+        if x.dtype == torch.float64:
+            grid = (triton.cdiv(n, _BLOCK),)
+            rsqrt_kernel_f64[grid](x, out, n, BLOCK=_BLOCK)
+        elif n % _BLOCK == 0:
+            rsqrt_kernel_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
+        else:
+            grid = (triton.cdiv(n, _BLOCK),)
+            rsqrt_kernel[grid](x, out, n, BLOCK=_BLOCK)
     return out
 
 

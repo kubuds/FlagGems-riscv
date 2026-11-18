@@ -20,6 +20,8 @@ import triton.language as tl
 
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
+from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,7 +81,8 @@ def where_self_out(condition, self, other, out=None):
 
     ndim = max(c.ndim, a.ndim, b.ndim)
     where_inner.instantiate(ndim)
-    where_inner(c, a, b, out0=out)
+    with nested_dispatch(out.numel()):
+        where_inner(c, a, b, out0=out)
     return out
 
 

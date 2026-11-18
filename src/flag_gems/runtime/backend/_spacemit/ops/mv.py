@@ -22,6 +22,8 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ._dispatch import nested_dispatch
+
 logger = logging.getLogger(__name__)
 
 # Campaign 1011night: replaced the block-ptr/acc structure (32x32 acc + one
@@ -100,28 +102,29 @@ def mv(inp, vec):
     out = torch.empty((N,), device=inp.device, dtype=inp.dtype)
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
     with torch_device_fn.device(inp.device):
-        if N % 512 == 0 and M % 512 == 0:
-            mv_kernel_even[grid](
-                inp,
-                vec,
-                out,
-                N,
-                M,
-                inp.stride(0),
-                inp.stride(1),
-                vec.stride(0),
-                out.stride(0),
-            )
-        else:
-            mv_kernel[grid](
-                inp,
-                vec,
-                out,
-                N,
-                M,
-                inp.stride(0),
-                inp.stride(1),
-                vec.stride(0),
-                out.stride(0),
-            )
+        with nested_dispatch(N * M):
+            if N % 512 == 0 and M % 512 == 0:
+                mv_kernel_even[grid](
+                    inp,
+                    vec,
+                    out,
+                    N,
+                    M,
+                    inp.stride(0),
+                    inp.stride(1),
+                    vec.stride(0),
+                    out.stride(0),
+                )
+            else:
+                mv_kernel[grid](
+                    inp,
+                    vec,
+                    out,
+                    N,
+                    M,
+                    inp.stride(0),
+                    inp.stride(1),
+                    vec.stride(0),
+                    out.stride(0),
+                )
     return out

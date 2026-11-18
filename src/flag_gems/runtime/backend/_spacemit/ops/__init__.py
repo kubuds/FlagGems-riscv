@@ -29,6 +29,7 @@ from .layernorm import layer_norm
 from .mean import global_avg_pool, mean_dim
 from .mm import mm, mm_out
 from .mv import mv
+from .native_layer_norm import layer_norm_backward, native_layer_norm
 from .pow import (
     pow_scalar,
     pow_tensor_scalar,
@@ -37,10 +38,10 @@ from .pow import (
     pow_tensor_tensor_,
 )
 from .rsqrt import rsqrt, rsqrt_
-from .sigmoid import sigmoid, sigmoid_
-from .silu import silu, silu_
+from .sigmoid import sigmoid, sigmoid_, sigmoid_backward
+from .silu import silu, silu_, silu_backward
 from .tanh import tanh, tanh_, tanh_backward
-from .softmax import softmax
+from .softmax import softmax, softmax_backward
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 
 __all__ = [
@@ -76,12 +77,17 @@ __all__ = [
     "scaled_dot_product_attention",
     "sigmoid",
     "sigmoid_",
+    "sigmoid_backward",
     "silu",
     "silu_",
+    "silu_backward",
     "tanh",
     "tanh_",
     "tanh_backward",
     "softmax",
+    "softmax_backward",
+    "native_layer_norm",
+    "layer_norm_backward",
     "thnn_conv2d",
     "where_scalar_other",
     "where_scalar_self",
