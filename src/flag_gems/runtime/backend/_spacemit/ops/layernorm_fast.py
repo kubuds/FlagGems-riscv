@@ -124,11 +124,24 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
     # over the old f32 fast kernel (0.94x), hence _F32_FAST_MAX_N.
     # f32 keeps the old numel floor: the fast kernel loses when a whole row
     # fits in one 4096-element block and the op is dispatch bound.
+    # wave46 probe506: that floor predates the narrow tile.  When a whole row
+    # fits one tile (n <= 64 with m % BM == 0) the op is one cached launch, not
+    # a dispatch-bound wide-row kernel - (4096,4) f32 measures 0.41 against
+    # 0.71 through the generic path - so both the 4096-column guard and the
+    # numel floor stand aside for that case.  numel >= 8192 keeps truly tiny
+    # calls (< 8 rows of 64) on the generic path where a launch dominates.
+    narrow = (
+        n <= _LN_FWD_TILE_MAX_N
+        and n == triton.next_power_of_2(n)
+        and m >= 8
+        and numel >= 8192
+        and _fwd_tile_bm(m, n) > 0
+    )
     if input.dtype == torch.float32:
-        if n <= 4096 and numel < (1 << 16):
+        if n <= 4096 and numel < (1 << 16) and not narrow:
             return False
     floor = _LN_MIN_N if input.dtype == torch.float32 else _LN_MIN_N_16
-    if numel < floor:
+    if numel < floor and not narrow:
         return False
     # wave33: the 16-bit carrier is no longer capped at _LN_MAX_N - the
     # aligned kernel covers any N up to 65536 (official bench (16,8,128,128)
@@ -566,8 +579,16 @@ _LN_FWD_TILE_MAX_N = 64
 
 
 def _fwd_tile_bm(m: int, bn: int) -> int:
-    """Rows per tile program: ~8K elements, 64-row floor, 2+ programs."""
-    bm = min(1024, max(64, 8192 // bn), max(64, m // 2))
+    """Rows per tile program: ~8K elements, 64-row floor, 2+ programs.
+
+    wave46 probe504: at 16 columns and below the knee is 4K elements, not 8K -
+    (2048,16) f32 0.240 vs 0.328 ms and f16 0.260 vs 0.367, (4096,8) f32 0.263
+    vs 0.371 and f16 0.296 vs 0.439.  Reason: a row narrower than half a vector
+    register leaves the reduce loop with more scalar iterations per element, so
+    the per-program row count has to come down with the width.
+    """
+    per_prog = 4096 if bn <= 16 else 8192
+    bm = min(1024, max(64, per_prog // bn), max(64, m // 2))
     while bm > 8 and m % bm:
         bm //= 2
     return bm if m % bm == 0 else 0
@@ -614,11 +635,17 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     # wave45: the two 2-D views are only needed by the wide-row branches (the
     # tile addresses memory with p*BM*BN + arange), and each .view() costs
     # 7.5 us on this torch build, so they are created lazily below.
+    # wave46 probe506: the stats buffers are allocated with their final shape
+    # instead of being viewed afterwards - the tile and every kernel only use
+    # the data pointer, and the pair of trailing views cost 15 us per call.
     x2d = None
     y2d = None
+    stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [1] * len(
+        normalized_shape
+    )
     y = torch.empty_like(inp)
-    mean = torch.empty(m, dtype=inp.dtype, device=inp.device)
-    rstd = torch.empty(m, dtype=inp.dtype, device=inp.device)
+    mean = torch.empty(stats_shape, dtype=inp.dtype, device=inp.device)
+    rstd = torch.empty(stats_shape, dtype=inp.dtype, device=inp.device)
     sb1 = max(64, triton.next_power_of_2(n))
     # wave39 probe422: never hand this kernel a block narrower than 32 lanes -
     # with SB2/AB == N < 32 the widened row load picks up the tail page and a
@@ -629,9 +656,6 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     ab = max(32, _AB if n >= _AB else triton.next_power_of_2(n))
     w_arg = weight if weight is not None else inp
     b_arg = bias if bias is not None else inp
-    stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [1] * len(
-        normalized_shape
-    )
     bn_t = triton.next_power_of_2(n)
     bm_t = (
         _fwd_tile_bm(m, bn_t)
@@ -675,15 +699,12 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
                 (nprog,),
                 targs,
             )
-        return y, mean.view(stats_shape), rstd.view(stats_shape)
+        return y, mean, rstd
 
     # wide-row branches below need the 2-D views
     x2d = inp.view(m, n)
     y2d = y.view(m, n)
     if inp.dtype != torch.float32 or n > _F32_FAST_MAX_N:
-        stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
-            1
-        ] * len(normalized_shape)
         # wave35 probe356: f32 rows at or above 262144 columns run split-N
         # (9.17 vs 10.36 ms common at (20,6,65536)); every 16-bit width keeps
         # the single-pass carrier (8.05 ms there).
@@ -730,10 +751,7 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
                 HAS_W=(weight is not None),
                 HAS_B=(bias is not None),
             )
-        stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
-            1
-        ] * len(normalized_shape)
-        return y, mean.view(stats_shape), rstd.view(stats_shape)
+        return y, mean, rstd
     k = _pick_k(m, n)
 
     def _launch():
@@ -762,10 +780,7 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
             _launch()
     else:
         _launch()
-    stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
-        1
-    ] * len(normalized_shape)
-    return y, mean.view(stats_shape), rstd.view(stats_shape)
+    return y, mean, rstd
 
 
 # ------------------------- backward (wave4) -------------------------
