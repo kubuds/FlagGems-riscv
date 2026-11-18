@@ -1404,6 +1404,84 @@ def _ln_bwd_combine_kernel(
         tl.store(dB + cols, accB.to(dB.dtype.element_ty), mask=cols < N)
 
 
+_KCACHE = {}
+_LAUNCH = {"ok": True, "stream": None}
+_ND_KEY = "SPINE_TRITON_FORCE_NESTED_DISPATCH_1D"
+
+
+class _FastNested:
+    """wave44: nested dispatch without the os.environ cost.
+
+    _dispatch.nested_dispatch writes through os.environ, whose __setitem__/
+    restore encode both strings (profile485: seven env touches per call, about
+    0.02-0.05 ms at (2048,32)).  The spine launcher only reads the C environ,
+    so os.putenv/unsetenv is enough and costs one call per switch.
+    """
+
+    __slots__ = ("active", "old")
+
+    def __init__(self, numel):
+        self.active = numel >= (1 << 15) and os.environ.get(
+            "FLAGGEMS_SPACEMIT_NESTED", "1"
+        ) != "0"
+        self.old = None
+
+    def __enter__(self):
+        if self.active:
+            self.old = os.environ.get(_ND_KEY)
+            os.putenv(_ND_KEY, "1")
+        return self
+
+    def __exit__(self, *exc):
+        if self.active:
+            if self.old is None:
+                os.unsetenv(_ND_KEY)
+            else:
+                os.putenv(_ND_KEY, self.old)
+        return False
+
+
+def _launch(kern, key, grid, args):
+    """wave44: launch through a cached CompiledKernel.
+
+    JITFunction.run re-binds every argument, rebuilds the specialization key
+    and looks the kernel up on each call - probe482 measured 0.366 ms for the
+    tile through the JIT against 0.317 through the cached CompiledKernel and
+    0.301 through its raw .run() (the .run call also skips the stream lookup
+    and the launch-metadata hook).  The key carries the constexprs and the
+    16-byte alignment of every pointer, which is what the JIT specializes on,
+    so a misaligned tensor compiles (and caches) its own entry.  Any failure
+    falls back to the ordinary launch for the rest of the process.
+    """
+    ent = _KCACHE.get(key)
+    if ent is None:
+        ck = kern.warmup(*args, grid=grid)
+        _KCACHE[key] = ck
+        kern[grid](*args)
+        return
+    if ent is False or not _LAUNCH["ok"]:
+        kern[grid](*args)
+        return
+    st = _LAUNCH["stream"]
+    if st is None:
+        from triton.runtime import driver
+
+        st = driver.active.get_current_stream(driver.active.get_current_device())
+        _LAUNCH["stream"] = st
+    try:
+        ent.run(
+            grid[0], 1, 1, st, ent.function, ent.packed_metadata, None, None, None,
+            *args,
+        )
+    except Exception:
+        _LAUNCH["ok"] = False
+        kern[grid](*args)
+
+
+def _align(*ts):
+    return tuple(t.data_ptr() & 15 == 0 for t in ts)
+
+
 def ln_bwd_fast(
     grad_out,
     input,
@@ -1413,21 +1491,42 @@ def ln_bwd_fast(
     weight=None,
     bias=None,
     output_mask=None,
+    _checked=False,
 ):
-    """Return (in_grad, weight_grad, bias_grad) like native_layer_norm_backward."""
-    g = grad_out.contiguous()
-    x = input.contiguous()
+    """Return (in_grad, weight_grad, bias_grad) like native_layer_norm_backward.
+
+    wave44: the routed caller (`native_layer_norm.layer_norm_backward`) has
+    already run lnb_fast_ok, which checks contiguity of all eight tensors, so
+    it passes _checked=True and the six .contiguous() calls (0.021 ms measured)
+    drop out of the hot path.
+    """
+    if _checked:
+        g = grad_out
+        x = input
+        w = weight
+        b = bias
+    else:
+        g = grad_out.contiguous()
+        x = input.contiguous()
+        w = weight.contiguous() if weight is not None else None
+        b = bias.contiguous() if bias is not None else None
     n = _prod(normalized_shape)
     m = x.numel() // n
-    mean = mean.contiguous().reshape(-1)
-    rstd = rstd.contiguous().reshape(-1)
-    w = weight.contiguous() if weight is not None else None
-    b = bias.contiguous() if bias is not None else None
+    if mean.dim() > 1:
+        mean = mean.reshape(-1)
+    if rstd.dim() > 1:
+        rstd = rstd.reshape(-1)
+    if not _checked:
+        mean = mean.contiguous()
+        rstd = rstd.contiguous()
     if output_mask is None:
         output_mask = (True, True, True)
     has_w = w is not None
-    g2 = g.view(m, n)
-    x2d = x.view(m, n)
+    # wave44: the kernels address G/X/dX with p*BM*BN + arange, so only the
+    # pointers matter - g.view(m,n) and friends cost 7 us each on this torch
+    # build (probe489), and there are three of them on the hot path.
+    g2 = g
+    x2d = x
     in_grad = None
     fused_wb = False
     dW = None
@@ -1501,27 +1600,50 @@ def ln_bwd_fast(
                             BLK=bn_t,
                         )
                 else:
-                    pw = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
-                    pb = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
+                    # wave44: one allocation for both column-partial buffers
+                    # (torch.empty measures ~0.008 ms each) - part[1] is a
+                    # contiguous view whose offset keeps 16-byte alignment.
+                    part = torch.empty(
+                        2, np_t, n, dtype=torch.float32, device=x.device
+                    )
+                    pw = part[0]
+                    pb = part[1]
                     kern = (
                         _ln_bwd_narrow_dot_kernel
                         if (mode != "0" and bn_t >= 16)
                         else _ln_bwd_narrow_kernel
                     )
-                    with nested_dispatch(m * n):
-                        kern[(np_t,)](
-                            g2,
-                            x2d,
-                            w if has_w else x2d,
-                            mean,
-                            rstd,
-                            in_grad.view(m, n),
-                            pw,
-                            pb,
-                            n,
-                            BM=bm_t,
-                            BN=bn_t,
-                            HAS_W=has_w,
+                    warg = w if has_w else x2d
+                    out2d = in_grad.view(m, n)
+                    targs = (
+                        g2,
+                        x2d,
+                        warg,
+                        mean,
+                        rstd,
+                        out2d,
+                        pw,
+                        pb,
+                        n,
+                        bm_t,
+                        bn_t,
+                        has_w,
+                    )
+                    with _FastNested(m * n):
+                        _launch(
+                            kern,
+                            (
+                                kern,
+                                "tile",
+                                n,
+                                bm_t,
+                                bn_t,
+                                has_w,
+                                x.dtype,
+                                _align(g2, x2d, warg, mean, rstd, out2d, pw, pb),
+                            ),
+                            (np_t,),
+                            targs,
                         )
                         # wave40 probe429: a plain launch that follows a nested
                         # one is not ordered against it, and the combine reads
@@ -1531,15 +1653,19 @@ def ln_bwd_fast(
                         # of a process, same-block nested 2.8e-2, four reps
                         # each).  Keep both launches under one dispatcher
                         # dialogue.
-                        _ln_bwd_combine_kernel[(1,)](
-                            pw,
-                            pb,
-                            dW,
-                            dB,
-                            n,
-                            NRB=np_t,
-                            CB2=bn_t,
-                            NOMASK=True,
+                        _launch(
+                            _ln_bwd_combine_kernel,
+                            (
+                                _ln_bwd_combine_kernel,
+                                "comb",
+                                n,
+                                np_t,
+                                bn_t,
+                                x.dtype,
+                                _align(pw, pb, dW, dB),
+                            ),
+                            (1,),
+                            (pw, pb, dW, dB, n, np_t, bn_t, True),
                         )
                 if not want_w:
                     dW = None

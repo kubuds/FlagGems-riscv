@@ -70,7 +70,15 @@ def layer_norm_backward(
         grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
     ):
         return _ln_bwd_fast(
-            grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+            grad_out,
+            input,
+            normalized_shape,
+            mean,
+            rstd,
+            weight,
+            bias,
+            output_mask,
+            _checked=True,
         )
     logger.debug("GEMS_SPACEMIT LAYER_NORM_BACKWARD")
     with nested_dispatch(input.numel()):
