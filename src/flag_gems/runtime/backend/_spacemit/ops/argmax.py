@@ -113,6 +113,21 @@ def argmax_kernel(
     tl.store(out_ptrs, row_argmax.to(out_ptr.dtype.element_ty), mask=row_mask)
 
 
+def _argmax_flat(inp):
+    """Argmax over the whole (already contiguous) tensor via the two-stage path."""
+    M = inp.numel()
+    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    mid_size = triton.cdiv(M, block_size)
+    block_mid = triton.next_power_of_2(mid_size)
+    mid_value = torch.empty((mid_size,), dtype=inp.dtype, device=inp.device)
+    mid_index = torch.empty((mid_size,), dtype=torch.int64, device=inp.device)
+    out = torch.empty([], dtype=torch.int64, device=inp.device)
+    with torch_device_fn.device(inp.device):
+        argmax_kernel_1[(mid_size, 1, 1)](inp, mid_value, mid_index, M, block_size)
+        argmax_kernel_2[(1, 1, 1)](mid_value, mid_index, out, mid_size, block_mid)
+    return out
+
+
 def argmax(inp, dim=None, keepdim=False, *, dtype=None):
     logger.debug("GEMS_SPACEMIT ARGMAX")
     if dim is None:
@@ -163,6 +178,17 @@ def argmax(inp, dim=None, keepdim=False, *, dtype=None):
         K = inp.numel() // M // N
 
         inp = inp.contiguous()
+
+        if M == 1 and K == 1:
+            # Single reduction group (e.g. last-dim argmax on a 1-D tensor): the
+            # row kernel would launch a single program, so reuse the parallel
+            # two-stage reduction instead.
+            out = _argmax_flat(inp)
+            if keepdim:
+                out = out.reshape([1] * inp.dim())
+            else:
+                out = out.reshape(shape[:dim])
+            return out
 
         shape_list = list(shape)
         shape_list[dim] = 1
