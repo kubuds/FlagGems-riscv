@@ -38,6 +38,15 @@ Carriers:
   dim0 : stage 1 multiplies RB rows into a 64-lane column vector per row block,
          stage 2 folds row-block products (mid layout [nrb, K])
 
+wave28: the row kernel was never nested either. Under nested dispatch the
+row count wants to be much larger: 64 rows/program beats 16 by 1.5-1.9x
+(probe285: 512^2 0.341 -> 0.221, 2048^2 2.039 -> 1.179, 512x4096 0.839 ->
+0.492, 8192x512 4.530 -> 2.330, 4096x1024 2.896 -> 1.537 ms) and K128/K256
+give it back (probe286). The same screen showed the rest of the reduce family
+going the other way under nesting - amax/amin 0.57-0.96x, vector_norm
+0.47-0.80x, var 0.48x, sum/mean 0.63-0.79x, argmax/argmin and layer_norm
+neutral - so only prod was wired.
+
 Kill switch: FLAGGEMS_SPACEMIT_PROD_FAST=0.
 f32 only (f16 store in the reduce path aborts spine-opt; generic used there).
 """
@@ -48,8 +57,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
+
 _ROWS_LOOP = 8
-_ROWS_NM = 16
+_ROWS_NM = 64      # wave28: under nested dispatch 64 rows/program is the peak
+#                    (probe285/286: 2048^2 1.18 vs 2.04 at K16; K128 regresses)
 _LOOP_BLOCK = 64
 _MIN_N = 64
 _FLAT_CHUNK = 8192
@@ -152,15 +164,31 @@ def prod_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_PROD_FAST", "1") != "0"
 
 
+def _pick_nm_rows(m: int) -> int:
+    k = _ROWS_NM
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
+
 def prod_rows_launch(x, out, M, N) -> bool:
     """True if the (M rows x N cols) row product was launched."""
     if M <= 0 or N < _MIN_N:
         return False
     block = min(_LOOP_BLOCK, triton.next_power_of_2(N))
-    if N % block == 0 and M % _ROWS_NM == 0:
-        _prod_rows_nm[(M // _ROWS_NM,)](x, out, M, N, K=_ROWS_NM, BLOCK_N=block)
+    if N % block == 0:
+        # wave28: nested dispatch + 64 rows/program: 512^2 0.341 -> 0.221,
+        # 2048^2 2.039 -> 1.179, 8192x512 4.530 -> 2.330 ms (probe285).
+        k = _pick_nm_rows(M)
+        with nested_dispatch(M * N):
+            _prod_rows_nm[(M // k,)](x, out, M, N, K=k, BLOCK_N=block)
         return True
-    _prod_rows_loop[(triton.cdiv(M, _ROWS_LOOP),)](x, out, M, N, K=_ROWS_LOOP, BLOCK_N=block)
+    # The masked fallback stays on the default launcher: nesting it segfaults
+    # spine-opt at 1001x1000 (wave28 probe, reproducible), and tail shapes are
+    # not worth the risk.
+    _prod_rows_loop[(triton.cdiv(M, _ROWS_LOOP),)](
+        x, out, M, N, K=_ROWS_LOOP, BLOCK_N=block
+    )
     return True
 
 
