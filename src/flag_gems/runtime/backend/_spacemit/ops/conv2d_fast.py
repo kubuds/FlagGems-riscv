@@ -58,17 +58,32 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     oc, _, kh, kw = w.shape
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
-        # wave57: grouped conv runs as g independent (c/g -> oc/g) problems,
-        # one launch each, so it needs enough area per group to amortise the
-        # dispatch: (1,256,14,14) g8 (196 px/group) measured 0.76x and
-        # (1,32,16,16) g2 (256 px) 0.72x, while 784 px/group and up wins 1.5x+.
+        # wave57: grouped conv ran as g independent (c/g -> oc/g) problems, one
+        # launch each: 1.5-2.8x against the vendor at 784 px/group and up, but
+        # 0.72-0.76x at 196-256 px/group, where the g-fold dispatch dominates,
+        # so those were gated back to the vendor.
+        # wave58 adds a single-launch kernel (group folded into the leading axis,
+        # weight prepacked per group) and uses it exactly where the per-group
+        # path had nothing to offer: more than 8 groups, or under 512 px of
+        # output per group.  Measured with it: g8/196 px 1.35x, g4/196 px 3.52x,
+        # g16/3136 px 2.43x, g8/256 px 1.17x over the vendor; the per-group path
+        # wins only inside its old band (g4/784 px 0.50x for the single launch).
         if c % groups or oc % groups:
             return False
-        if (c // groups) < 8 or (oc // groups) < 16:
+        if (oc // groups) < 2:
             return False
         sh0, sw0 = (stride, stride) if isinstance(stride, int) else stride
-        if groups > 8 or (h // sh0) * (ww // sw0) < 512:
+        area = (h // sh0) * (ww // sw0)
+        if groups > 32:
             return False
+        macs = n * oc * h * ww * (kh * kw) * (c // groups)
+        if groups <= 8 and area >= 512:
+            return ((c // groups) >= 8) and macs >= (1 << 20) and ww >= 8
+        # single-launch band: K may run thin (g32 at CG=2 measured 3.73x over
+        # the vendor, g16 at CG=4 2.43x) and the launch is one rather than g, so
+        # both the lane floor and the MAC floor come down
+        cg = c // groups
+        return (cg >= (2 if groups > 8 else 4)) and macs >= (1 << 18) and ww >= 8
     macs = n * oc * h * ww * (kh * kw) * (c // groups)
     # depthwise has a much lower launch floor: the vendor path pads 1 input
     # channel to 16 and copies the whole tensor, so even a 512x7x7 depthwise
@@ -133,6 +148,83 @@ def _conv2d_direct_kernel(X, Wt, Bs, Y,
             bias = tl.load(Bs + oc)
         else:
             bias = tl.load(Bs + oc, mask=oc < OC, other=0.0)
+        acc += bias[:, None]
+    yp = (Y + pid_n * syn
+          + (oh0 + ro)[None, :, None] * syoh
+          + (ow0 + lo)[None, None, :] * syow
+          + oc[:, None, None] * syoc)
+    acc3 = tl.reshape(acc, (BLOCK_OC, ROWS, BLOCK_OW))
+    if NOMASK:
+        tl.store(yp, acc3.to(Y.dtype.element_ty))
+    else:
+        tl.store(yp, acc3.to(Y.dtype.element_ty),
+                 mask=(oc[:, None, None] < OC) & ((oh0 + ro)[None, :, None] < OH)
+                 & ((ow0 + lo)[None, None, :] < OW))
+
+
+@triton.jit
+def _conv2d_group_kernel(X, Wt, Bs, Y,
+    C, IH, IW, OH, OW, OC,
+    sxn, sxc, sxh, sxw,
+    swg, swkk, swkw, swc, swoc,
+    syn, syoc, syoh, syow,
+    SH: tl.constexpr, SW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr,
+    BLOCK_OW: tl.constexpr, BLOCK_OC: tl.constexpr, BLOCK_C: tl.constexpr,
+    ROWS: tl.constexpr, NOMASK: tl.constexpr, NG: tl.constexpr,
+):
+    """wave58: one launch for 1 < groups < C.
+
+    The group folds into the leading axis (x is viewed as (N*G, CG, H, W), y as
+    (N*G, OCG, OH, OW)), so the image index already carries the group.  The only
+    thing the per-group loop used to give the kernel was the weight base, and
+    that is the one extra term here: swg is the stride of the prepacked
+    (G, KH, KW, OCG, CG) weight tensor's group axis.  Bias is indexed per group.
+    """
+    pid = tl.program_id(0)
+    n_oh = tl.cdiv(OH, ROWS)
+    n_ow = tl.cdiv(OW, BLOCK_OW)
+    n_oc = tl.cdiv(OC, BLOCK_OC)
+    pid_ow = pid % n_ow
+    pid_oc = (pid // n_ow) % n_oc
+    pid_nh = pid // (n_ow * n_oc)
+    pid_n = pid_nh // n_oh
+    gid = pid_n % NG
+    oh0 = (pid_nh % n_oh) * ROWS
+    ow0 = pid_ow * BLOCK_OW
+    lo = tl.arange(0, BLOCK_OW)
+    ro = tl.arange(0, ROWS)
+    oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    wb = Wt + gid * swg
+    acc = tl.zeros((BLOCK_OC, ROWS * BLOCK_OW), dtype=tl.float32)
+    for kh in tl.static_range(KH):
+        for kw in tl.static_range(KW):
+            iw0 = ow0 * SW + kw
+            for c0 in range(0, C, BLOCK_C):
+                cs = c0 + tl.arange(0, BLOCK_C)
+                xp = (X + pid_n * sxn
+                      + ((oh0 + ro)[None, :, None] * SH + kh) * sxh
+                      + (iw0 + lo[None, None, :] * SW) * sxw
+                      + cs[:, None, None] * sxc)
+                if NOMASK:
+                    xv = tl.load(xp)
+                else:
+                    xv = tl.load(xp, mask=(cs[:, None, None] < C)
+                                 & ((oh0 + ro)[None, :, None] < OH)
+                                 & (lo[None, None, :] < OW - ow0), other=0.0)
+                xv = tl.reshape(xv, (BLOCK_C, ROWS * BLOCK_OW))
+                wpt = wb + kh * swkk + kw * swkw + oc[:, None] * swoc + cs[None, :] * swc
+                if NOMASK:
+                    wv = tl.load(wpt)
+                else:
+                    wv = tl.load(wpt, mask=(oc[:, None] < OC) & (cs[None, :] < C), other=0.0)
+                acc += tl.dot(wv, xv)
+    if HAS_BIAS:
+        if NOMASK:
+            bias = tl.load(Bs + gid * OC + oc)
+        else:
+            bias = tl.load(Bs + gid * OC + oc, mask=oc < OC, other=0.0)
         acc += bias[:, None]
     yp = (Y + pid_n * syn
           + (oh0 + ro)[None, :, None] * syoh
@@ -299,6 +391,37 @@ def _conv_launch(x, weight, bias, y, OH, OW, SH, SW, BLOCK_OW, BLOCK_OC, ROWS, B
     return y
 
 
+def _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
+                       BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None):
+    """One launch over all groups; x/y are (N, C, H, W)/(N, OC, OH, OW)."""
+    N, C, H, W = x.shape
+    OC, CG, KH, KW = weight.shape
+    OCG = OC // groups
+    wp = weight.view(groups, OCG, CG, KH, KW).permute(0, 3, 4, 1, 2).contiguous()
+    xv = x.view(N * groups, CG, H, W)
+    yv = y.view(N * groups, OCG, OH, OW)
+    bow_pick, boc_pick, rows_pick = _pick_tiles(N * groups, OH, OW, OCG, stride=(SH, SW))
+    BLOCK_OW = BLOCK_OW or bow_pick
+    BLOCK_OC = BLOCK_OC or boc_pick
+    ROWS = ROWS or rows_pick
+    BLOCK_C = BLOCK_C or 32
+    nomask = ((ROWS == 1) and (BLOCK_OW >= 32)
+              and (CG % BLOCK_C == 0) and (OW % BLOCK_OW == 0) and (OCG % BLOCK_OC == 0))
+    grid = (N * groups * triton.cdiv(OH, ROWS) * triton.cdiv(OW, BLOCK_OW)
+            * triton.cdiv(OCG, BLOCK_OC),)
+    _conv2d_group_kernel[grid](
+        xv, wp, bias if bias is not None else xv, yv,
+        CG, H, W, OH, OW, OCG,
+        xv.stride(0), xv.stride(1), xv.stride(2), xv.stride(3),
+        wp.stride(0), wp.stride(1), wp.stride(2), wp.stride(4), wp.stride(3),
+        yv.stride(0), yv.stride(1), yv.stride(2), yv.stride(3),
+        SH=SH, SW=SW, HAS_BIAS=(bias is not None), KH=KH, KW=KW,
+        BLOCK_OW=BLOCK_OW, BLOCK_OC=BLOCK_OC, BLOCK_C=BLOCK_C,
+        ROWS=ROWS, NOMASK=nomask, NG=groups,
+    )
+    return y
+
+
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
                   BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None):
     N, C, H, W = input.shape
@@ -325,11 +448,16 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     y = torch.empty((N, OC, OH, OW), dtype=x.dtype, device=x.device)
     if groups == 1:
         return _conv_launch(x, weight, bias, y, OH, OW, SH, SW, BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C)
-    # wave57: 1 < groups < C - the last conv case without coverage.  Each group
-    # is an independent (CG -> OCG) convolution whose channel slabs sit back to
-    # back in x, weight and y, so it is one wave56 launch per group on a strided
-    # slice; the kernel itself is untouched.  (Folding the group into the batch
-    # axis instead reads the wrong weight rows past group 0 - probe952.)
+    # wave58: 1 < groups < C gets ONE launch (group folded into the leading axis,
+    # weight prepacked per group) on the shapes the per-group path could not
+    # serve - more than 8 groups, or under 512 px of output per group - and keeps
+    # the per-group loop inside its old band, where it is the faster of the two
+    # ((1,128,28,28) g4: 7.92 vs 15.86 ms).  FLAGGEMS_SPACEMIT_CONV_GROUP1=0
+    # forces the per-group path for A/B.
+    if ((groups > 8 or OH * OW < 512)
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_GROUP1", "1") != "0"):
+        return _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
+                                  BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C)
     OCG = OC // groups
     xv = x.view(N, groups, CG, H, W)
     wv = weight.view(groups, OCG, CG, KH, KW)
