@@ -779,6 +779,175 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
             y[n].copy_(yv)
     return y
 
+@triton.jit(do_not_specialize=["OC", "OCB", "MY", "PWW", "PLANE", "CSTR",
+                               "AGST", "YGST", "BOCG"])
+def _conv_tap_phase_g_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, MY,
+    PWW, PLANE, CSTR, AGST, YGST, BOCG,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    DILH: tl.constexpr, DILW: tl.constexpr,
+):
+    """wave74: _conv_tap_phase_kernel with a group axis.
+
+    A grouped conv at stride > 1 had no fast route: the phase kernel is the
+    only stride-2 path and it takes groups == 1, so g8/g16/g32 downsamples fell
+    to the 32-lane group kernel (g8 c256 28x28 s2 measured 1.15x official).
+    Each group is an independent (CG -> OCG) convolution and both the packed
+    weight block and the phase buffer are channel-major, so the whole thing
+    runs in ONE launch: program_id(2) selects the group and offsets the three
+    bases by fixed strides.
+    """
+    pid_g = tl.program_id(2)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    A = A + pid_g * AGST
+    Bx = Bx + pid_g * C * CSTR
+    Y = Y + pid_g * YGST
+    ap = tl.make_block_ptr(base=A, shape=[OC, C], strides=[C, 1],
+                           offsets=[pid_m * BLOCK_M, 0],
+                           block_shape=[BLOCK_M, C], order=[1, 0])
+    bp = tl.make_block_ptr(base=Bx, shape=[C, PLANE], strides=[CSTR, 1],
+                           offsets=[0, pid_n * BLOCK_N],
+                           block_shape=[C, BLOCK_N], order=[1, 0])
+    aa = smt.view(smt.descriptor_load(ap, (0, 0)), (0, 0), (BLOCK_M, C),
+                  (MICRO_M, MICRO_K))
+    bb = smt.view(smt.descriptor_load(bp, (0, 0)), (0, 0), (C, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(aa, bb), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    for t in range(1, KH * KW):
+        kh = t // KW
+        kw = t % KW
+        off = ((((kh * DILH) % SH) * SW + ((kw * DILW) % SW)) * PLANE
+               + ((kh * DILH) // SH) * PWW + ((kw * DILW) // SW))
+        at = tl.make_block_ptr(base=A + t * OC * C, shape=[OC, C], strides=[C, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, C], order=[1, 0])
+        bt = tl.make_block_ptr(base=Bx + off, shape=[C, PLANE], strides=[CSTR, 1],
+                               offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[C, BLOCK_N], order=[1, 0])
+        a2 = smt.view(smt.descriptor_load(at, (0, 0)), (0, 0), (BLOCK_M, C),
+                      (MICRO_M, MICRO_K))
+        b2 = smt.view(smt.descriptor_load(bt, (0, 0)), (0, 0), (C, BLOCK_N),
+                      (MICRO_K, MICRO_N))
+        acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + pid_g * BOCG + oc, mask=oc < OCB, other=0.0)[:, None]
+    cp = tl.make_block_ptr(base=Y, shape=[OC, MY], strides=[MY, 1],
+                           offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                           block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(cp, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+_TAP_WG = {}
+
+
+def _tap_weights_g(weight, groups, cpad, ocpad):
+    """(groups, KH*KW, OCP, CP) tap-major weight block, pads zeroed once."""
+    key = (weight.data_ptr(), tuple(weight.shape), groups, cpad, ocpad)
+    ent = _TAP_WG.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    OC, CG, KH, KW = weight.shape
+    OCG = OC // groups
+    at = weight.view(groups, OCG, CG, KH, KW).permute(0, 3, 4, 1, 2)
+    at = at.reshape(groups, KH * KW, OCG, CG)
+    if cpad != CG or ocpad != OCG:
+        z = torch.zeros((groups, KH * KW, ocpad, cpad), dtype=weight.dtype,
+                        device=weight.device)
+        z[:, :, :OCG, :CG].copy_(at)
+        at = z
+    else:
+        at = at.contiguous()
+    if len(_TAP_WG) >= 8:
+        _TAP_WG.pop(next(iter(_TAP_WG)))
+    _TAP_WG[key] = (weakref.ref(weight), weight._version, at)
+    return at
+
+
+def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
+                      groups, dil_h=1, dil_w=1, out_dtype=None):
+    """wave74: grouped KH x KW conv at any stride as KH*KW dots, one launch."""
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    CG = C // groups
+    OCG = OC // groups
+    CP = max(32, triton.next_power_of_2(CG))
+    OCP = ((OCG + 31) // 32) * 32
+    x = input.contiguous()
+    IH, IW = H + 2 * pad_h, W + 2 * pad_w
+    roff = ((KH - 1) * dil_h) // SH
+    coff = ((KW - 1) * dil_w) // SW
+    PHH = OH + roff
+    PWW = OW + coff
+    NP = SH * SW
+    PLANE = PHH * PWW
+    CSTR = NP * PLANE
+    MY = OH * PWW
+    ITOT = groups * CP
+    # wave74: the grouped dot is OCG rows tall against a 32-row floor, so the
+    # launch wants many small programs rather than the single-group pick above.
+    # Scan on g8 c256 14x14 / g8 c512 7x7 / g16 c512 7x7: bm 8-16 with one
+    # column block beats bm=32/bn=128 by 1.9-2.6x.
+    bn = min(256, max(64, triton.next_power_of_2(MY)))
+    bm = 8 if OCP <= 32 else 16
+    bm = min(bm, OCP)
+    MYP = ((MY + bn - 1) // bn) * bn
+    at = _tap_weights_g(weight, groups, CP, OCP)
+    dt = out_dtype or input.dtype
+    y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
+    grid = (triton.cdiv(OCP, bm), triton.cdiv(MYP, bn), groups)
+    warm = _tap_first_launch((bm, bn, KH, KW, CP, x.dtype, OCP, OCG, MYP, PWW,
+                              PLANE, SH, SW, dil_h, dil_w, bias is not None,
+                              groups))
+    for n in range(N):
+        frame = _tap_flat_buf(ITOT, IH, IW, bn + 96, x.dtype, x.device)
+        img = frame[:ITOT * IH * IW].view(ITOT, IH, IW)
+        if CG == CP:
+            # no per-group channel padding: one slice copy for every group
+            # (0.150 vs 0.670 ms at C=256/g8)
+            if pad_h or pad_w:
+                img[:C, pad_h:pad_h + H, pad_w:pad_w + W].copy_(x[n])
+            else:
+                img[:C].copy_(x[n])
+        else:
+            for g in range(groups):
+                if pad_h or pad_w:
+                    img[g * CP:g * CP + CG, pad_h:pad_h + H,
+                        pad_w:pad_w + W].copy_(x[n, g * CG:(g + 1) * CG])
+                else:
+                    img[g * CP:g * CP + CG].copy_(x[n, g * CG:(g + 1) * CG])
+        flat = _tap_phase_buf(ITOT, NP, PHH, PWW, bn + 96, x.dtype, x.device)
+        planes = flat[:ITOT * CSTR].view(ITOT, NP, PHH, PWW)
+        for p in range(SH):
+            for q in range(SW):
+                nh = min(PHH, (IH - p + SH - 1) // SH)
+                nw = min(PWW, (IW - q + SW - 1) // SW)
+                planes[:, p * SW + q, :nh, :nw].copy_(
+                    img[:, p::SH, q::SW][:, :nh, :nw])
+        yext = torch.empty((groups * OCP, MYP), dtype=torch.float32,
+                           device=input.device)
+
+        def _launch():
+            _conv_tap_phase_g_kernel[grid](
+                at, flat, bias if bias is not None else at, yext, OCP, OCG, CP,
+                MYP, PWW, PLANE, CSTR, KH * KW * OCP * CP, OCP * MYP, OCG,
+                BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
+                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                SH=SH, SW=SW, DILH=dil_h, DILW=dil_w)
+
+        _launch()
+        if warm and n == 0:
+            _launch()
+        yv = yext.view(groups, OCP, MYP)
+        for g in range(groups):
+            y[n, g * OCG:(g + 1) * OCG].copy_(
+                yv[g, :OCG].as_strided((OCG, OH, OW), (MYP, PWW, 1)))
+    return y
+
+
 @triton.jit
 def _depthwise_kernel(X, Wt, Bs, Y,
     C, IH, IW, OH, OW,
@@ -1276,6 +1445,10 @@ def _tap_tiles(oc, my, c=None):
     bn = 128 if my >= 128 else 64
     tiles32 = ((oc + 31) // 32) * ((my + bn - 1) // bn)
     bm = 64 if (tiles32 <= 16 and my <= 256) else 32
+    # wave74: the A block is a descriptor of [OC, C]; a BLOCK_M taller than the
+    # padded row count makes that descriptor read past the packed weight buffer.
+    # At OC=32 / MY<=256 the old rule picked 64 rows for a 32-row block.
+    bm = min(bm, max(32, ((oc + 31) // 32) * 32))
     if c is not None and c > 512:
         # wave72: the A block is bm*c*4 bytes of TCM (96 KB); at c=1024 the
         # 32/64-row tiles need 128-256 KB and the launch aborts with
@@ -1486,11 +1659,30 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
     # covers 5x5/7x7 too (the A block is bm*C*4 bytes per tap either way)
     return ((kh, kw) in _TAP_KERNELS and 3 <= c <= 2048
             and (cp <= 512 or wide)
-            and 32 <= oc <= 512 and oh * ow >= 16
+            and 32 <= oc <= 2048 and oh * ow >= 16
             and (sh * sw <= 4
                  or (sh == sw == 3 and kh == kw))   # asym s3 loses
             and n * oc * oh * ow * kh * kw * c >= (1 << 20)
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
+
+
+def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
+    """wave74: grouped counterpart of conv_phase_applies (stride > 1).
+
+    CG >= 8 and OCG >= 8: the packed A block is bm*CP*4 with CP floored at 32,
+    so a group thinner than that only wastes lanes - the band below 8 has not
+    been measured and stays on the group kernel.
+    """
+    if groups <= 1 or c % groups or oc % groups:
+        return False
+    cg, ocg = c // groups, oc // groups
+    return ((kh, kw) in _TAP_KERNELS and 8 <= cg <= 2048
+            and 8 <= ocg <= 2048
+            and triton.next_power_of_2(cg) <= 2048
+            and oh * ow >= 16
+            and (sh * sw <= 4 or (sh == sw == 3 and kh == kw))
+            and n * oc * oh * ow * kh * kw * cg >= (1 << 20)
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHG", "1") != "0")
 
 
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
@@ -1562,6 +1754,15 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         return _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w,
                                KH, KW, SH, SW, dil_h=dil_h, dil_w=dil_w,
                                out_dtype=_out_dtype)
+    # wave74: grouped conv at stride > 1 joins the phase route: the group is
+    # program_id(2) and both packed bases are channel-major already, so one
+    # launch serves every group (g8 c256 28x28 s2 was 5.09 ms on the 32-lane
+    # group kernel against 5.85 official - the worst grouped cell measured).
+    if (groups > 1 and (SH > 1 or SW > 1)
+            and conv_phase_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW, groups)):
+        return _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w,
+                                 KH, KW, SH, SW, groups,
+                                 dil_h=dil_h, dil_w=dil_w, out_dtype=_out_dtype)
     # wave72: the shifted-tap route also covers the asymmetric kernels
     # (1x3/3x1/1x5/5x1/1x7/7x1, 1.83-3.67x over the tap kernel and 4.2-15.5x
     # over official, exact) and KH=KW=7.  The 7x7 class matters most: for C > 8
@@ -1594,7 +1795,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                  or (triton.next_power_of_2(C) <= 2048 and KH * KW <= 49
                      and not (KH == 3 and (C & (C - 1)) == 0
                               and OH * OW <= 64)))
-            and 32 <= OC <= 512 and OH * OW >= 16
+            and 32 <= OC <= 2048 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
             and (KH == 3 or dil_h > 1
                  or (KH == 7 and KW == 7
