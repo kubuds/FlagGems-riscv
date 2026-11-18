@@ -74,9 +74,11 @@ bmm:
     num_stages: 2
 argmax:
 - META:
-    BLOCK_M: 128
-    BLOCK_N: 512
-  num_warps: 8
+    BLOCK_M: 8
+- META:
+    BLOCK_M: 16
+- META:
+    BLOCK_M: 32
 argmin:
 - META:
     BLOCK_M: 8
