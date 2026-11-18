@@ -88,11 +88,23 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
         return False
     sh, sw = (stride, stride) if isinstance(stride, int) else stride
     dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
-    if dh != 1 or dw != 1:
-        return False
     n, c, h, ww = x.shape
     oc, _, kh, kw = w.shape
-    if x.dtype != torch.float32 or w.dtype != torch.float32:
+    return _fast_applies_shapes(n, c, h, ww, oc, kh, kw, x.dtype, w.dtype,
+                                sh, sw, dh, dw, groups)
+
+
+def _fast_applies_shapes(n, c, h, ww, oc, kh, kw, xd, wd, sh, sw, dh, dw,
+                         groups) -> bool:
+    """wave96: shape-only body of conv_fast_applies, for the route cache.
+
+    The predicate never looks at tensor data or strides, only at shapes and
+    dtypes, so the public gate can evaluate it without constructing tensors and
+    memoize the answer per call signature.
+    """
+    if dh != 1 or dw != 1:
+        return False
+    if xd != torch.float32 or wd != torch.float32:
         # wave64: the 7x7 / C<=8 stem has no usable vendor path at all in half
         # precision - f16 measured 372 ms at (1,3,224,224)->64 against 13.8 ms
         # on the f32 stem route - so it takes an f32 carrier instead of falling
@@ -104,9 +116,9 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
         # vendor path than on the f32 tap kernel (3x3 46->15 ms, depthwise
         # 521->9.7), so the carrier is the default there too;
         # FLAGGEMS_SPACEMIT_CONV_F16_CARRIER=0 keeps the vendor path.
-        if w.dtype != x.dtype or x.dtype not in (torch.float16, torch.bfloat16):
+        if wd != xd or xd not in (torch.float16, torch.bfloat16):
             return False
-        if x.dtype == torch.float16:
+        if xd == torch.float16:
             if os.environ.get("FLAGGEMS_SPACEMIT_CONV_F16_CARRIER", "1") != "1":
                 return (groups == 1 and kh == 7 and kw == 7 and c <= 8
                         and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
@@ -128,7 +140,7 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
             return False
         if (oc // groups) < 2:
             return False
-        sh0, sw0 = (stride, stride) if isinstance(stride, int) else stride
+        sh0, sw0 = sh, sw
         area = (h // sh0) * (ww // sw0)
         if groups > 32:
             return False
@@ -147,7 +159,7 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     # wave65: half precision has no vendor fallback at all (bf16 aborts, f16 is
     # 3-60x slower there), so its floor is the launch cost only - 0.78 ms of tap
     # kernel at (1,16,20,20) against 2.9 ms of vendor f32 and 4.6 of vendor f16.
-    if macs < ((1 << 12) if x.dtype != torch.float32
+    if macs < ((1 << 12) if xd != torch.float32
                else (1 << 14) if dwise else (1 << 20)):
         return False
     # wave66: the 3x3 patch-matrix route is a replacement for the fallback path
@@ -167,9 +179,120 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     # they take the same 4-pixel width floor as the deep-stage classes above.
     thinoc = (groups == 1 and kh == kw and kh in (3, 5, 7)
               and 128 <= c <= 2048 and 8 <= oc < 32)
-    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3 or deepw or thinoc) else 8):
+    if ww < (4 if (dwise or xd != torch.float32 or deep3 or deepw or thinoc) else 8):
         return False
     return True
+
+
+# wave96: the public gate evaluates nine route predicates on every call; they
+# depend only on the call signature, not on tensor data.  A whole-net sweep
+# revisits the same few dozen signatures, so memoize the answer.  Any of the
+# route knobs being present in the environment bypasses the cache, exactly as
+# attention's _plan() does, so A/B experiments keep reading the knobs live.
+_ROUTE_ENV_KEYS = (
+    "FLAGGEMS_SPACEMIT_CONV_FAST", "FLAGGEMS_SPACEMIT_CONV_DIL",
+    "FLAGGEMS_SPACEMIT_CONV_DW_DIL", "FLAGGEMS_SPACEMIT_CONV_GEMV",
+    "FLAGGEMS_SPACEMIT_CONV_MP", "FLAGGEMS_SPACEMIT_CONV_MPG",
+    "FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "FLAGGEMS_SPACEMIT_CONV_MP_KPAD",
+    "FLAGGEMS_SPACEMIT_CONV_MP_EXT", "FLAGGEMS_SPACEMIT_CONV_MPG_MAXM",
+    "FLAGGEMS_SPACEMIT_CONV_MP_FORCE",
+    "FLAGGEMS_SPACEMIT_CONV_DENSEG", "FLAGGEMS_SPACEMIT_CONV_OCP",
+    "FLAGGEMS_SPACEMIT_CONV_OCP_EXACT", "FLAGGEMS_SPACEMIT_CONV_F16_CARRIER",
+    "FLAGGEMS_SPACEMIT_CONV_BF16_CARRIER", "FLAGGEMS_SPACEMIT_CONV_STEM_F16",
+    "FLAGGEMS_SPACEMIT_CONV_TAPPHS", "FLAGGEMS_SPACEMIT_CONV_TAPPHG",
+    "FLAGGEMS_SPACEMIT_PHG_MINCG", "FLAGGEMS_SPACEMIT_PHG_MINOCG",
+    "FLAGGEMS_SPACEMIT_CONV_TAP9", "FLAGGEMS_SPACEMIT_CONV_TAP49",
+    "FLAGGEMS_SPACEMIT_CONV_TAP5", "FLAGGEMS_SPACEMIT_CONV_TAPX",
+    "FLAGGEMS_SPACEMIT_CONV_1X1", "FLAGGEMS_SPACEMIT_CONV_1X1G",
+    "FLAGGEMS_SPACEMIT_CONV_1X1GT", "FLAGGEMS_SPACEMIT_CONV_1X1GT16",
+    "FLAGGEMS_SPACEMIT_CONV_1X1S2G", "FLAGGEMS_SPACEMIT_CONV_STEM",
+    "FLAGGEMS_SPACEMIT_CONV_IM2COL3",
+)
+_ROUTE_CACHE = {}
+_ROUTE_CACHE_MAX = 1024
+# Some CPython builds keep os.environ._data keyed by bytes (this board does);
+# cover both key types so the raw-dict fast path works either way.
+_ROUTE_ENV_KEY_SET = (frozenset(_ROUTE_ENV_KEYS)
+                      | frozenset(k.encode() for k in _ROUTE_ENV_KEYS))
+
+
+def _route_env_live():
+    # os.environ.get is 2.2 us per call on this board (its __getitem__ encodes
+    # and decodes every key); the raw dict behind it is 0.17 us.  The gate used
+    # to pay 60+ us just checking which knobs are set.  CPython only; a wheel
+    # without _data falls back to the public mapping.
+    env = getattr(os.environ, "_data", os.environ)
+    return not _ROUTE_ENV_KEY_SET.isdisjoint(env)
+
+
+def _route_cache_disabled(env):
+    v = env.get("FLAGGEMS_SPACEMIT_CONV_ROUTE_CACHE")
+    if v is None:
+        v = env.get(b"FLAGGEMS_SPACEMIT_CONV_ROUTE_CACHE")
+    return v in ("0", b"0")
+
+
+def conv_fast_route_applies(n, c, h, ww, oc, kh, kw, sh, sw, ph, pw, dh, dw,
+                            groups, xd, wd, oh, ow) -> bool:
+    """wave96: memoized form of the public entry's fast-route gate.
+
+    This is the exact predicate the forward pass used to spell out inline in
+    flag_gems/ops/conv2d.py (dilation classes plus the nine route predicates).
+    Measured host cost of that block: 68-78 us per call on a 1-2 ms conv, more
+    than the kernel dispatch itself.  The signature is the whole input to the
+    decision, so a dict hit replaces the whole block.  FLAGGEMS_SPACEMIT_CONV_*
+    overrides bypass the cache.
+    """
+    key = (n, c, h, ww, oc, kh, kw, sh, sw, ph, pw, dh, dw, groups, xd, wd,
+           oh, ow)
+    env = getattr(os.environ, "_data", os.environ)
+    live = _route_env_live() or _route_cache_disabled(env)
+    if not live:
+        hit = _ROUTE_CACHE.get(key)
+        if hit is not None:
+            return hit
+    if not conv_fast_enabled():
+        applies = False
+    else:
+        dil_tap = (
+            dh == dw and dh > 1 and groups == 1
+            and sh == 1 and sw == 1
+            and tap_shift_applies(n, c, oc, oh, ow, kh, kw, 1, dh, dw)
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
+        )
+        dil_dwise = (
+            groups == c == oc
+            and (dh != 1 or dw != 1)
+            and n * oc * oh * ow * kh * kw >= (1 << 14)
+            and ow >= 4
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
+        )
+        dil_phase = (
+            dh == dw and dh > 1 and groups == 1
+            and (sh > 1 or sw > 1)
+            and conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw)
+        )
+        dil_phase_g = (
+            groups > 1
+            and conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups)
+        )
+        applies = (
+            dil_tap or dil_phase or dil_phase_g or dil_dwise
+            or conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups)
+            or conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, ww,
+                               dh, dw, groups)
+            or conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, ww,
+                                 dh, dw, groups)
+            or conv_1x1_dense_applies(n, c, oc, oh, ow, sh, sw, h, ww, kh, kw,
+                                      ph, pw, groups)
+            or _fast_applies_shapes(n, c, h, ww, oc, kh, kw, xd, wd,
+                                    sh, sw, dh, dw, groups)
+        )
+    if not live:
+        if len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
+            _ROUTE_CACHE.clear()
+        _ROUTE_CACHE[key] = applies
+    return applies
 
 
 @triton.jit
@@ -2419,6 +2542,10 @@ _MP_W = {}
 _MP_BUFG = {}
 _MP_WG = {}
 _CW = {}
+# wave96: descriptor patch buffers, 16 entries / 256 MB (the old rule cleared
+# the whole table at four entries).
+_MP_BUF_MAX_ENTRIES = 16
+_MP_BUF_MAX_BYTES = 256 << 20
 _MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 # wave95: the descriptor-weight caches were a hard 4 entries with no byte
@@ -2539,12 +2666,23 @@ def _mp_mpad(ncol):
 
 
 def _mp_patch(K, mpad, dtype, device):
-    """Cached zero-padded patch matrix [K, mpad] (one buffer per size)."""
+    """Cached zero-padded patch matrix [K, mpad].
+
+    wave96: the old rule was "more than three buffers -> clear the table",
+    which on a net with more than three small-output layers re-zeroed every
+    buffer on every pass.  Same entries+bytes LRU as the tap patch buffer:
+    16 entries / 256 MB.  The zero tail (columns NCOL..mpad) stays zero; every
+    call rewrites all real columns.
+    """
     key = (K, mpad, dtype, device)
     buf = _MP_BUF.get(key)
     if buf is None:
-        if len(_MP_BUF) > 3:
-            _MP_BUF.clear()
+        nb = K * mpad * dtype.itemsize
+        while _MP_BUF and (
+                len(_MP_BUF) >= _MP_BUF_MAX_ENTRIES
+                or sum(b.numel() * b.element_size()
+                       for b in _MP_BUF.values()) + nb > _MP_BUF_MAX_BYTES):
+            _MP_BUF.pop(next(iter(_MP_BUF)))
         buf = torch.zeros((K, mpad), dtype=dtype, device=device)
         _MP_BUF[key] = buf
     return buf

@@ -397,141 +397,38 @@ class Conv2d(torch.autograd.Function):
             try:
                 from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
                     conv2d_direct,
-                    conv_fast_applies,
-                    conv_fast_enabled,
-                    conv_1px_applies,
-                    conv_1x1_dense_applies,
-                    conv_mp_applies,
-                    conv_mp_g_applies,
-                    conv_phase_applies,
-                    conv_phase_g_applies,
-                    tap_shift_applies,
+                    conv_fast_route_applies,
                 )
 
-                if conv_fast_enabled():
-                    fast_oh = conv2d_output_size(
-                        input.shape[2],
-                        weight.shape[2],
-                        stride_height,
-                        padding_height,
-                        dilation_height,
-                    )
-                    fast_ow = conv2d_output_size(
-                        input.shape[3],
-                        weight.shape[3],
-                        stride_width,
-                        padding_width,
-                        dilation_width,
-                    )
-                    # wave69: dilated 3x3/5x5 stride-1 takes the shifted-tap
-                    # route, which sets the tap base to kh*DIL*IW + kw*DIL.
-                    # conv_fast_applies() still rejects a dilation != 1 (the
-                    # other fast kernels assume a unit tap lattice), so this
-                    # class enters through its own gate.
-                    kh = weight.shape[2]
-                    kw = weight.shape[3]
-                    # wave75: the gate IS the route predicate now
-                    # (tap_shift_applies).  The old hand-copied window capped
-                    # OC and C at 512 and left every wider dilated layer on the
-                    # vendor im2col: 3x3 d2 c256->1024 measured 313 ms there
-                    # against 48.3 ms for the same class at c256->256.
-                    dil_tap = (
-                        dilation_height == dilation_width
-                        and dilation_height > 1
-                        and groups == 1
-                        and stride_height == 1
-                        and stride_width == 1
-                        and tap_shift_applies(
-                            input.shape[0], input.shape[1], weight.shape[0],
-                            fast_oh, fast_ow, kh, kw, 1,
-                            dilation_height, dilation_width)
-                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
-                    )
-                    # wave70: dilated depthwise is a second class with no fast
-                    # route: conv_fast_applies() rejects dilation and dil_tap
-                    # wants groups == 1, so it lands on the im2col kernel after
-                    # the K>=16 channel padding - 30-39x slower than the
-                    # depthwise kernel with the same dilation as a tap offset.
-                    dil_dwise = (
-                        groups == input.shape[1] == weight.shape[0]
-                        and (dilation_height != 1 or dilation_width != 1)
-                        and input.shape[0] * weight.shape[0] * fast_oh * fast_ow
-                        * kh * kw >= (1 << 14)
-                        and fast_ow >= 4
-                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
-                    )
-                    # wave71: a dilated conv at stride > 1 has no route in
-                    # any stride-1 kernel; the phase planes make the tap base
-                    # affine again, so it joins through the same predicate the
-                    # route uses.
-                    dil_phase = (
-                        dilation_height == dilation_width
-                        and dilation_height > 1
-                        and groups == 1
-                        and (stride_height > 1 or stride_width > 1)
-                        and conv_phase_applies(
-                            input.shape[0], input.shape[1], weight.shape[0],
-                            fast_oh, fast_ow, kh, kw,
-                            stride_height, stride_width)
-                    )
-                    # wave75: grouped x dilation had no fast route: dil_tap
-                    # requires groups == 1 and conv_fast_applies rejects any
-                    # dilation, so it fell to the vendor im2col (30.3-72.2 ms
-                    # at 3x3/5x5 d2).  The phase kernel handles both the group
-                    # axis and the dilation, and at stride 1 its plane build
-                    # collapses to the frame copy.
-                    # wave76: the same predicate now also covers grouped
-                    # stride-1 non-dilated conv, which used to sit on the
-                    # group kernel: phase is 2.2-3.6x faster there (g8 c256
-                    # 28 12.028 -> 4.523, g4 c512 56 148.751 -> 52.959) and
-                    # 1.7-13.6x over the vendor.  The predicate keeps CG/OCG
-                    # >= 8 and the MAC floor, so thin groups stay behind.
-                    dil_phase_g = (
-                        groups > 1
-                        and conv_phase_g_applies(
-                            input.shape[0], input.shape[1], weight.shape[0],
-                            fast_oh, fast_ow, kh, kw,
-                            stride_height, stride_width, groups)
-                    )
-                    # wave82: a 1-pixel output is a weight-stream problem (every
-                    # route reads the whole weight for one element) and the new
-                    # row-stream gemv reads it at 6-9 GB/s against the phase
-                    # kernel's 113 MB/s.
-                    # wave83: 2..64 output pixels as one im2col GEMM (the
-                    # phase kernel pays its fixed cost per pixel; cells with an
-                    # input narrower than 4 fall to the vendor path).
-                    applies = (dil_tap or dil_phase or dil_phase_g or dil_dwise
-                               or conv_1px_applies(
-                                   input.shape[0], input.shape[1],
-                                   weight.shape[0], fast_oh, fast_ow, kh, kw,
-                                   groups)
-                               or conv_mp_applies(
-                                   input.shape[0], input.shape[1],
-                                   weight.shape[0], fast_oh, fast_ow, kh, kw,
-                                   stride_height, stride_width,
-                                   input.shape[2], input.shape[3],
-                                   dilation_height, dilation_width, groups)
-                               or conv_mp_g_applies(
-                                   input.shape[0], input.shape[1],
-                                   weight.shape[0], fast_oh, fast_ow, kh, kw,
-                                   stride_height, stride_width,
-                                   input.shape[2], input.shape[3],
-                                   dilation_height, dilation_width, groups)
-                               or conv_1x1_dense_applies(
-                                   input.shape[0], input.shape[1],
-                                   weight.shape[0], fast_oh, fast_ow,
-                                   stride_height, stride_width,
-                                   input.shape[2], input.shape[3], kh, kw,
-                                   padding_height, padding_width, groups)
-                               or conv_fast_applies(
-                        input,
-                        weight,
-                        (stride_height, stride_width),
-                        (dilation_height, dilation_width),
-                        groups,
-                    ))
-                else:
-                    applies = False
+                fast_oh = conv2d_output_size(
+                    input.shape[2],
+                    weight.shape[2],
+                    stride_height,
+                    padding_height,
+                    dilation_height,
+                )
+                fast_ow = conv2d_output_size(
+                    input.shape[3],
+                    weight.shape[3],
+                    stride_width,
+                    padding_width,
+                    dilation_width,
+                )
+                # wave96: the whole fast-route gate is one memoized predicate.
+                # It used to be nine inline predicate calls here (68-78 us on a
+                # 1-2 ms conv); the answer depends only on the call signature,
+                # and a whole-net sweep revisits the same signatures.  The
+                # function reads the FLAGGEMS_SPACEMIT_CONV_* knobs live (any
+                # of them set bypasses the cache), so A/B experiments are
+                # unaffected.
+                applies = conv_fast_route_applies(
+                    input.shape[0], input.shape[1],
+                    input.shape[2], input.shape[3],
+                    weight.shape[0], weight.shape[2], weight.shape[3],
+                    stride_height, stride_width,
+                    padding_height, padding_width,
+                    dilation_height, dilation_width, groups,
+                    input.dtype, weight.dtype, fast_oh, fast_ow)
                 if applies:
                     return conv2d_direct(
                         input,
