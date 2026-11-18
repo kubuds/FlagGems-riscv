@@ -248,6 +248,35 @@ def _conv1x1_s2_kernel(X, Wm, Bs, Y, C, IH, IW, OH, OW, OC, sxn,
 
 
 @triton.jit
+def _im2col_kernel(X, B, C, IH, IW, OH, OW, M,
+                   SH: tl.constexpr, SW: tl.constexpr,
+                   KH: tl.constexpr, KW: tl.constexpr,
+                   BLOCK_C: tl.constexpr, BLOCK_OW: tl.constexpr):
+    """wave62: build the (KH*KW*C, M) patch matrix for a small-C conv.
+
+    Only worth it when C is tiny: at C=3 the tap kernel pads to 16 and runs
+    49 dots whose 32 lanes carry 3 real values, while the buffer is 7 MB and
+    the K=147 GEMM is the same arithmetic the 43-53 GFLOPS 1x1 route gets.
+    """
+    pid_ow = tl.program_id(0)
+    oh = tl.program_id(1)
+    pid_c = tl.program_id(2)
+    ow0 = pid_ow * BLOCK_OW
+    lo = tl.arange(0, BLOCK_OW)
+    cs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    m = oh * OW + ow0 + lo
+    for kh in tl.static_range(KH):
+        ih = oh * SH + kh
+        for kw in tl.static_range(KW):
+            iw = (ow0 + lo) * SW + kw
+            xp = X + cs[:, None] * (IH * IW) + ih * IW + iw[None, :]
+            mm = (cs[:, None] < C) & (lo[None, :] < OW - ow0)
+            xv = tl.load(xp, mask=mm, other=0.0)
+            k = (kh * KW + kw) * C + cs
+            tl.store(B + k[:, None] * M + m[None, :], xv, mask=mm)
+
+
+@triton.jit
 def _conv2d_direct_kernel(X, Wt, Bs, Y,
     C, IH, IW, OH, OW, OC,
     sxn, sxc, sxh, sxw,
@@ -598,6 +627,69 @@ def _conv1x1_strided(input, weight, bias, OH, OW, SH, SW):
     return y
 
 
+def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
+    """wave62: a 7x7 stride-2 first layer with C<=8 through a buffered im2col.
+
+    The tap kernel is the wrong shape for this layer: it pads C=3 to 16 and
+    runs 49 dots whose 32 lanes carry 3 real values, which is why the stem
+    costs 143 ms.  The patch matrix is 147 x OH*OW (7.4 MB at 112x112) and the
+    GEMM on it is the ordinary 1x1 dot, so build + GEMM measures 17.0 ms at
+    (1,3,224,224)->64 on the smt kernel (8.4x) and 19.0 ms on the tl kernel
+    (7.5x) against the tap path.  K is padded to a power of two (147 -> 256 for
+    smt, 160 for tl) so the GEMM carries no mask; only the tail rows are
+    zeroed per forward.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    KH, KW = weight.shape[2], weight.shape[3]
+    xp = F.pad(input, (pad_w, pad_w, pad_h, pad_h)) if (pad_h or pad_w) else input
+    IH, IW = xp.shape[2], xp.shape[3]
+    M = OH * OW
+    K = C * KH * KW
+    if smt is not None and K <= 192:
+        kpad = 256
+    else:
+        kpad = max(32, triton.next_power_of_2(K))
+    w2 = torch.zeros((OC, kpad), dtype=weight.dtype, device=weight.device)
+    w2[:, :K] = weight.permute(0, 2, 3, 1).reshape(OC, K)
+    y = torch.empty((N, OC, OH, OW), dtype=input.dtype, device=input.device)
+    bc = 4 if C <= 4 else (8 if C <= 8 else 16)
+    bm = 32 if M >= 4096 else 64
+    # probe1011: the GEMM is bound by the 12.8 MB buffer read, so the widest
+    # pixel tile that divides M wins: 32x256 reads 9.74 ms at (1,3,224,224)
+    # against 11.33 at 32x128 and 16.2 at 64x128.
+    bn = 256 if M % 256 == 0 else (128 if M % 128 == 0 else 64)
+    # the smt descriptor path has no element mask: it can only run when both
+    # grid axes land exactly on the matrix edges
+    use_smt = (smt is not None and kpad == 256 and OC % bm == 0
+               and M % bn == 0)
+    for n in range(N):
+        buf = torch.empty((kpad, M), dtype=input.dtype, device=input.device)
+        grid = (triton.cdiv(OW, 64), OH, triton.cdiv(C, bc))
+        _im2col_kernel[grid](xp[n], buf, C, IH, IW, OH, OW, M,
+                             SH=SH, SW=SW, KH=KH, KW=KW,
+                             BLOCK_C=bc, BLOCK_OW=64)
+        if kpad > K:
+            buf[K:].zero_()
+        if use_smt:
+            g = (triton.cdiv(OC, bm), triton.cdiv(M, bn))
+            _conv1x1_smt_kernel[g](w2, buf, bias if bias is not None else w2, y[n],
+                                   OC, M, kpad, BLOCK_M=bm, BLOCK_N=bn,
+                                   MICRO_M=8, MICRO_N=64, MICRO_K=32,
+                                   HAS_BIAS=(bias is not None))
+        else:
+            bmk = 128 if M % 128 == 0 else 64
+            g = (triton.cdiv(OC, 64), triton.cdiv(M, bmk), 1)
+            _conv1x1_kernel[g](buf, w2, bias if bias is not None else buf, y[n],
+                               kpad, M, OC, 0, 0,
+                               BLOCK_OC=64, BLOCK_M=bmk, BLOCK_K=32,
+                               HAS_BIAS=(bias is not None),
+                               NOMASK=(M % bmk == 0 and OC % 64 == 0
+                                       and kpad % 32 == 0),
+                               SWAP=True)
+    return y
+
+
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
                       BLOCK_OW=None, BLOCK_C=None):
     N, _, H, W = input.shape
@@ -705,6 +797,14 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         if SH == 1 and SW == 1:
             return _conv1x1_gemm(input, weight, bias, OH, OW)
         return _conv1x1_strided(input, weight, bias, OH, OW, SH, SW)
+    # wave62: the 7x7 stride-2 stem is the one layer where 32-lane dots are
+    # almost all padding (C=3 padded to 16 across 49 taps), so it goes through
+    # a 147-row im2col buffer and the ordinary 1x1 GEMM: 143 -> 17.0 ms at
+    # (1,3,224,224)->64.  FLAGGEMS_SPACEMIT_CONV_STEM=0 puts the tap kernel
+    # back for A/B.
+    if (groups == 1 and C <= 8 and KH == 7 and KW == 7
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
+        return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w)
     x = input.contiguous()
     if pad_h or pad_w:
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
