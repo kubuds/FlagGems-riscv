@@ -156,12 +156,22 @@ def _rmsb_tile_bm(m: int, bn: int) -> int:
 
 
 def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
-    # f32 only: on a cold process the f16 tile still returned a garbage dw
-    # (2.1e3 against |dw| 105 at (2048,32)) when the fused forward's nested
-    # group was still draining, even with the sync below; every f32 case in the
-    # same cold-process battery is exact, so the gate admits f32 alone and the
-    # f16 narrow backward stays on the generic kernels until the dispatcher
-    # interaction is understood.
+    # f32 only, for two different reasons now.
+    # (1) wave40 probe429: the garbage dw that wave39 saw on a cold process was
+    # a launch-ordering bug, not accuracy - with a nested forward in front of
+    # it, a *plain* combine launch is not ordered against the tile's nested
+    # group, so it read pw before the tile's stores landed: (2048,32) f16 came
+    # back dw 4.5e2 against |dw| 105 as tile-nested/combine-plain, while both
+    # same-dispatcher arrangements (nested/nested, plain/plain) were exact on
+    # all four reps.  torch_device_fn.synchronize() is `pass` on this driver,
+    # which is why wave39's sync never helped.  rmsb_fast now keeps both
+    # launches in one nested block (worth 6.5% at (2048,32) f16: 0.737 ->
+    # 0.785 ms) and the direct-call battery is exact for f32/f16/bf16.
+    # (2) probe433 still measures dw 6.107e3 on the *autograd* path for f16
+    # (2048,32) with RMSB_FAST=1 against 2.9e-2 with RMSB_FAST=0, dx correct in
+    # both, and instrumenting RmsNorm.backward and rmsb_fast shows neither is
+    # entered - so that number comes from a path this gate does not control and
+    # f16 stays out until it is explained.
     return (
         f32
         and n <= _RMSB_TILE_MAX_N
@@ -302,22 +312,21 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
     inv = inv_rms.contiguous().reshape(-1)
     if _rmsb_tile_ok(n, m, x.dtype == torch.float32):
         # wave39: one pass over a narrow tile does dx and the dw partials.
-        # The sync is load-bearing: the fused forward's tile runs under the
-        # nested dispatcher and that group's completion is not awaited by the
-        # plain launches that follow, so without it the first backward of a
-        # process returned dw at 6.1e3 against |dw| 105 at (2048,32) f16 while
-        # dx stayed correct (probe435/436: disabling nesting or syncing first
-        # both fix it, and the generic backward never showed it because its own
-        # launch chain gives the group time to drain).
-        torch_device_fn.synchronize()
+        # wave40 probe429: the tile and the combine must sit in the same nested
+        # block - a plain launch that follows a nested one is not ordered
+        # against it, and on a cold process the combine then read pw before the
+        # tile's stores landed (dw 4.5e2 against |dw| 105 at (2048,32) f16).
+        # The sync that wave39 added here did nothing: torch_device_fn
+        # .synchronize() is `pass` on this driver.
         bm = _rmsb_tile_bm(m, n)
         prb = m // bm
         pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
         cb = min(2048, triton.next_power_of_2(n))
         dw = torch.empty(n, dtype=x.dtype, device=x.device)
-        with torch_device_fn.device(x.device):
-            _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n, BM=bm, BN=n)
-            _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
+        with nested_dispatch(m * n):
+            with torch_device_fn.device(x.device):
+                _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n, BM=bm, BN=n)
+                _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
         return dx, dw
     k, tile, bn = _routes(n, m, x.dtype != torch.float32)
     while k > 1 and m % k:

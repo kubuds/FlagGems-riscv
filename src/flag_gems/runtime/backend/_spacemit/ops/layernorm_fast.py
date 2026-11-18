@@ -945,15 +945,30 @@ def _ln_bwd_dx_kernel(
 # narrow row in one block, so both row sums come from one tl.sum(axis=1) each
 # and the apply reuses the same registers.  Same-session minima, f32:
 # (4096,4) 1.51 -> 0.53, (4096,8) 1.90 -> 0.94, (2048,16) 1.14 -> 0.73,
-# (2048,32) 2.23 -> 1.35; f16 (4096,4) 1.65 -> 0.54.  At 64 columns the
-# per-row kernel wins again (1.42 vs 0.73) and the tile also loses on
-# non-power-of-two widths (N=100: 12.9 against 5.98 ms), so the tile is gated
-# on n == next_power_of_2(n) and n <= 32.
-_LN_DX_TILE_MAX_N = 32
+# (2048,32) 2.23 -> 1.35; f16 (4096,4) 1.65 -> 0.54.  Non-power-of-two widths
+# lose badly (N=100: 12.9 against 5.98 ms), so the tile is gated on
+# n == next_power_of_2(n).
+# wave40 probe428/430: 64 columns was called a loss for the tile in wave38
+# (1.42 vs 0.73 against the per-row kernel) but that compared against the
+# per-row *dx* kernel alone; against the whole routed backward the tile wins at
+# every M >= 128 rows - f32 1.16/0.98/1.32/1.26/1.29/1.23/1.19x and f16
+# 1.61/1.53/2.04/2.08/2.30/2.37/2.39x at M = 128/256/512/1024/2048/4096/8192 -
+# so the gate now stops at 64.  At 128 columns the tile is still a loss (0.87
+# f32 / 0.77 f16 at 2048 rows), which is where the gate stays.
+_LN_DX_TILE_MAX_N = 64
 
 
 def _dx_tile_bm(m: int, bn: int) -> int:
     """Rows per tile program; the tile is ~4-16K elements, grid stays >16."""
+    if bn >= 64:
+        # wave40 probe430: at 64 lanes the tile is register-bound, not launch
+        # bound - 128 rows/program is the knee at every M (8192 rows: BM128
+        # 4.13 ms against BM256 4.90 and BM512 6.29), and at 128 rows the
+        # single-program tile loses 12% so keep at least two programs.
+        cap = 128
+        while cap > 16 and (m % cap or m // cap < 2):
+            cap //= 2
+        return cap if m % cap == 0 else 0
     cap = 1024 if bn <= 8 else 512
     bm = cap
     while bm > 16 and m % bm:
@@ -1302,16 +1317,23 @@ def ln_bwd_fast(
                         BN=bn_t,
                         HAS_W=has_w,
                     )
-                _ln_bwd_combine_kernel[(1,)](
-                    pw,
-                    pb,
-                    dW,
-                    dB,
-                    n,
-                    NRB=np_t,
-                    CB2=bn_t,
-                    NOMASK=True,
-                )
+                    # wave40 probe429: a plain launch that follows a nested one
+                    # is not ordered against it, and the combine reads pw.  A
+                    # nested launch inside the same block is (probe429: the
+                    # (2048,32) f16 tile-then-plain-combine arrangement returned
+                    # dw 4.5e2 on the first backward of a process, same-block
+                    # nested 2.8e-2, four reps each).  Keep both launches under
+                    # one dispatcher dialogue.
+                    _ln_bwd_combine_kernel[(1,)](
+                        pw,
+                        pb,
+                        dW,
+                        dB,
+                        n,
+                        NRB=np_t,
+                        CB2=bn_t,
+                        NOMASK=True,
+                    )
                 if not want_w:
                     dW = None
                 if not want_b:
