@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 import triton
@@ -234,6 +235,163 @@ def _softmax_flat(inp, out):
     return out
 
 
+# wave25: softmax over a dim that is not the last one.  Until now the vendor
+# path reshaped the tensor to (numel / last, last) and reduced the LAST axis no
+# matter which dim the caller asked for, so every non-last-dim call returned the
+# softmax of the wrong axis (w24-dim-ignored: 2.1e-2 abs error, row sums off by
+# 0.24 at (8,512,512) dim=1).  Turning dim into the last dim needs a transpose
+# and every transpose on this board measures badly - torch's contiguous() copy
+# 2.3 GB/s, a tiled Triton transpose 2.3 GB/s and wrong - so walk the reduce
+# axis in place instead: one program owns a CB-wide slice of the contiguous tail
+# and all n_cols values of the reduce axis, with 1-D state only (2-D tile
+# reduces scalarise, wave21).
+#
+# Structure priced at (64,512,512) f32, probe244/247/248:
+#   online (m,s), 2 accumulators + x = 6 KB state  98.0 ms  (register spills)
+#   three passes, CB=512                           71.0 ms
+#   three passes with exp cached in the output     56.5 ms
+# and then probe250/251 showed the launch shape matters far more than the width:
+# with nested dispatch on, CB = the whole contiguous tail is best (one wide
+# stream per outer) - 19.2 ms at (64,512,512), 72.3 ms at (64,1024,1024),
+# 66.3 ms at (32,1024,2048) - while splitting the tail in two halves costs 1.9x
+# (134 vs 66 ms at inner=2048).  So CB = next_pow2(inner), capped at 2048.
+_SM_COL_CB = 2048
+
+
+@triton.jit
+def softmax_col_max(X, MB, n_cols, inner, n_cb, CB: tl.constexpr):
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    offs = cb * CB + tl.arange(0, CB)
+    base = o.to(tl.int64) * (n_cols * inner) + offs
+    m = tl.full((CB,), -float("inf"), dtype=tl.float32)
+    for j in range(n_cols):
+        m = tl.maximum(m, tl.load(X + base + j * inner).to(tl.float32))
+    tl.store(MB + pid.to(tl.int64) * CB + tl.arange(0, CB), m)
+
+
+@triton.jit
+def softmax_col_max_m(X, MB, n_cols, inner, n_cb, CB: tl.constexpr):
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    offs = cb * CB + tl.arange(0, CB)
+    mask = offs < inner
+    base = o.to(tl.int64) * (n_cols * inner) + offs
+    m = tl.full((CB,), -float("inf"), dtype=tl.float32)
+    for j in range(n_cols):
+        x = tl.load(X + base + j * inner, mask=mask, other=-float("inf"))
+        m = tl.maximum(m, x.to(tl.float32))
+    tl.store(MB + pid.to(tl.int64) * CB + tl.arange(0, CB), m)
+
+
+@triton.jit
+def softmax_col_exp(X, Y, MB, SB, n_cols, inner, n_cb, CB: tl.constexpr):
+    """Pass 2: write exp(x - max) into the output and accumulate its sum."""
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    r = tl.arange(0, CB)
+    base = o.to(tl.int64) * (n_cols * inner) + cb * CB + r
+    m = tl.load(MB + pid.to(tl.int64) * CB + r)
+    s = tl.zeros((CB,), dtype=tl.float32)
+    for j in range(n_cols):
+        y = exp_fast(tl.load(X + base + j * inner).to(tl.float32) - m, 1)
+        s += y
+        tl.store(Y + base + j * inner, y.to(Y.dtype.element_ty))
+    tl.store(SB + pid.to(tl.int64) * CB + r, 1.0 / s)
+
+
+@triton.jit
+def softmax_col_exp_m(X, Y, MB, SB, n_cols, inner, n_cb, CB: tl.constexpr):
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    r = tl.arange(0, CB)
+    offs = cb * CB + r
+    mask = offs < inner
+    base = o.to(tl.int64) * (n_cols * inner) + offs
+    m = tl.load(MB + pid.to(tl.int64) * CB + r)
+    s = tl.zeros((CB,), dtype=tl.float32)
+    for j in range(n_cols):
+        x = tl.load(X + base + j * inner, mask=mask, other=-float("inf")).to(tl.float32)
+        y = exp_fast(x - m, 1)
+        s += tl.where(mask, y, 0.0)
+        tl.store(Y + base + j * inner, y.to(Y.dtype.element_ty), mask=mask)
+    tl.store(SB + pid.to(tl.int64) * CB + r, 1.0 / s)
+
+
+@triton.jit
+def softmax_col_norm(Y, SB, n_cols, inner, n_cb, CB: tl.constexpr):
+    """Pass 3: rescale the cached exp values in place."""
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    r = tl.arange(0, CB)
+    base = o.to(tl.int64) * (n_cols * inner) + cb * CB + r
+    inv = tl.load(SB + pid.to(tl.int64) * CB + r)
+    for j in range(n_cols):
+        y = tl.load(Y + base + j * inner).to(tl.float32)
+        tl.store(Y + base + j * inner, (y * inv).to(Y.dtype.element_ty))
+
+
+@triton.jit
+def softmax_col_norm_m(Y, SB, n_cols, inner, n_cb, CB: tl.constexpr):
+    pid = tl.program_id(0)
+    o = pid // n_cb
+    cb = pid % n_cb
+    r = tl.arange(0, CB)
+    offs = cb * CB + r
+    mask = offs < inner
+    base = o.to(tl.int64) * (n_cols * inner) + offs
+    inv = tl.load(SB + pid.to(tl.int64) * CB + r)
+    for j in range(n_cols):
+        y = tl.load(Y + base + j * inner, mask=mask, other=0.0).to(tl.float32)
+        tl.store(Y + base + j * inner, (y * inv).to(Y.dtype.element_ty), mask=mask)
+
+
+def _softmax_nonlast_enabled() -> bool:
+    return os.environ.get("FLAGGEMS_SPACEMIT_SOFTMAX_NONLAST", "1") != "0"
+
+
+def _softmax_col_cb() -> int:
+    """Tunable column width for the non-last-dim walk (default 512)."""
+    try:
+        return max(32, int(os.environ.get("FLAGGEMS_SPACEMIT_SOFTMAX_COL_CB", _SM_COL_CB)))
+    except ValueError:
+        return _SM_COL_CB
+
+
+def _softmax_nonlast(inp, out, dim):
+    """Softmax over dim != last, walked in place over the reduce axis."""
+    n_cols = inp.shape[dim]
+    inner = 1
+    for s in inp.shape[dim + 1:]:
+        inner *= s
+    outer = inp.numel() // (n_cols * inner)
+    if inp.numel() == 0:
+        return out
+    cb = _softmax_col_cb()
+    if inner < cb:
+        cb = max(32, triton.next_power_of_2(inner))
+    n_cb = (inner + cb - 1) // cb
+    grid = outer * n_cb
+    exact = (inner % cb) == 0
+    mb = torch.empty(grid * cb, dtype=torch.float32)
+    sb = torch.empty(grid * cb, dtype=torch.float32)
+    with nested_dispatch(inp.numel()):
+        if exact:
+            softmax_col_max[(grid,)](inp, mb, n_cols, inner, n_cb, CB=cb)
+            softmax_col_exp[(grid,)](inp, out, mb, sb, n_cols, inner, n_cb, CB=cb)
+            softmax_col_norm[(grid,)](out, sb, n_cols, inner, n_cb, CB=cb)
+        else:
+            softmax_col_max_m[(grid,)](inp, mb, n_cols, inner, n_cb, CB=cb)
+            softmax_col_exp_m[(grid,)](inp, out, mb, sb, n_cols, inner, n_cb, CB=cb)
+            softmax_col_norm_m[(grid,)](out, sb, n_cols, inner, n_cb, CB=cb)
+    return out
+
+
 def _spacemit_softmax_lastdim(inp, out):
     n_rows, n_cols = inp.shape
     n = inp.numel()
@@ -303,6 +461,13 @@ def softmax(self, dim, half_to_float=False):
 
     inp = self.contiguous()
 
+    # wave25: a non-last dim now gets its own walk instead of being silently
+    # reduced along the last axis (pre-existing vendor bug, see block comment).
+    if dim != inp.ndim - 1 and _softmax_nonlast_enabled():
+        out = torch.empty_like(inp, dtype=dtype)
+        _softmax_nonlast(inp, out, dim)
+        return out
+
     n_cols = inp.shape[-1]
     n_rows = inp.numel() // n_cols
     inp_2d = inp.view(n_rows, n_cols)
@@ -366,5 +531,9 @@ def softmax_out(self, dim, half_to_float=False, *, out):
         _spacemit_softmax_lastdim(inp.view(n_rows, n_cols), out.view(n_rows, n_cols))
         return out
     logger.debug("GEMS_SPACEMIT SOFTMAX_OUT (non-inner)")
+    # wave25: dim != last is a real walk now, not the last axis in disguise.
+    if dim != inp.ndim - 1 and _softmax_nonlast_enabled() and out.is_contiguous():
+        _softmax_nonlast(inp, out, dim)
+        return out
     with nested_dispatch(self.numel()):
         return common_softmax_out(self, dim, half_to_float, out=out)
