@@ -442,8 +442,33 @@ upsample_bicubic2d_aa:
 
 mv:
 - META:
-    BLOCK_M: 32
+    BLOCK_N: 128
+    BLOCK_K: 256
+- META:
+    BLOCK_N: 256
+    BLOCK_K: 128
+- META:
+    BLOCK_N: 256
+    BLOCK_K: 256
+- META:
+    BLOCK_N: 64
+    BLOCK_K: 512
+- META:
     BLOCK_N: 32
+    BLOCK_K: 512
+mv_even:
+- META:
+    BLOCK_N: 128
+    BLOCK_K: 128
+- META:
+    BLOCK_N: 128
+    BLOCK_K: 256
+- META:
+    BLOCK_N: 64
+    BLOCK_K: 512
+- META:
+    BLOCK_N: 256
+    BLOCK_K: 128
 nonzero:
 - gen: true
   param_map:
