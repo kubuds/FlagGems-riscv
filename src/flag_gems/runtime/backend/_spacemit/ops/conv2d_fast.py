@@ -1019,6 +1019,23 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
         bn = 32
         mn = 32
     bm = min(bm, OCP)      # wave80: thin OC pads to 8/16 rows, not 32
+    # wave82 A/B knob (measured, dead end for now): pin the column tile.  A
+    # 14x14 output is MY=196, which the wave68 rule puts on BLOCK_N=128 - two
+    # column tiles, i.e. two programs for the whole layer on an 8-core part.
+    # Splitting to 64/32 measured neutral to worse on every cell tried (g32 c64
+    # 3x3 s2 28 1.668 auto / 1.719 at 64 / 2.121 at 32; g16 c64 3x3 s2 56 2.966
+    # / 3.005 / 3.953), so the program count is not what limits those cells.
+    ph_bn = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_BN", "0"))
+    if ph_bn:
+        bn = min(bn, ph_bn)
+    # wave82 A/B knob (no effect measured): pin the row tile.  The tiny-output
+    # rule above raises bm to OCP (64) without looking at CP, so a 1024-channel
+    # layer runs a 64x1024 A block = 256 KiB, over the 96 KiB TCM block the tap
+    # tiles were designed around - yet bm 32/16 left the 1-pixel cell at 334 ms
+    # (334.1 / 334.1 / 333.5), so that cell is not A-block-bound.
+    ph_bm = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_BM", "0"))
+    if ph_bm:
+        bm = min(bm, ph_bm)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -2254,6 +2271,151 @@ def dense_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups, dil_h=1,
     return True
 
 
+def dense_g_1x1_applies(n, c, oc, oh, ow, sh, sw, groups) -> bool:
+    """wave82: grouped 1x1 with a thin group (CG < 16) as one dense 1x1 GEMM.
+
+    The pointwise GEMM routes start at CG >= 16 (the smt descriptor needs a
+    32-aligned K block, the tl variant 16), and the grouped phase gate asks for
+    CG >= 24 at (1,1), so CG 1..15 ran the 32-lane group kernel with 2-32x of
+    its K lanes padding.  The block-diagonal dense weight turns the layer into
+    the ordinary 1x1 GEMM over the full channel axis: g8 c32 56x56 10.22 -> 1.23
+    (8.31x), g16 c64 112x112 18.94 -> 3.06 (6.19x), g8 c64 28x28 3.30 -> 0.60
+    (5.51x), g4 c32 56x56 6.26 -> 1.23 (5.07x), g16 c64 56x56 5.01 -> 1.06
+    (4.74x), g32 c128 28x28 3.06 -> 1.04 (2.95x), f16 6.83 -> 3.55 (1.93x),
+    stride 2 1.68 -> 1.25 (1.35x).  At CG=16 the 1X1GT16 GEMM already owns the
+    cell (2.222 vs 2.145, a tie), so the band stops below 16.
+
+    C must be 32-aligned: at C=48 the single-group 1x1 pick takes BLOCK_K=16 and
+    spine-opt aborts (MMT4D ``nb >= GetNumelPerVReg``); 48/3=16 would otherwise
+    pass every other test.
+    FLAGGEMS_SPACEMIT_CONV_DENSEG=0 pins the group kernel for A/B.
+    """
+    if groups <= 1 or groups >= c or groups >= oc or c % groups or oc % groups:
+        return False
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
+        return False
+    cg = c // groups
+    if not (1 <= cg < 16):
+        return False
+    if c % 32 or oc < 32:
+        return False
+    if oc * c * 4 > (8 << 20):
+        return False
+    if n * oc * oh * ow * c < (1 << 20):
+        return False
+    return True
+
+
+_GEMV_BK = 512
+_GEMV_WARMED = set()
+
+
+@triton.jit(do_not_specialize=["K"])
+def _conv1px_gemv_kernel(W, V, Bias, Y, K, BK: tl.constexpr,
+                         HAS_BIAS: tl.constexpr):
+    """wave82: one output pixel as a row-streaming matrix-vector product.
+
+    The phase kernel reads the packed weight through descriptor blocks at
+    113 MB/s (37.7 MB in 334 ms at c1024 3x3 s2 2x2 -> 1x1), while a plain
+    contiguous 1024-lane load of the same bytes runs at 12.7 GB/s.  One program
+    per output channel walks its own row of W in BK-lane chunks, accumulates
+    W*v and reduces once at the end: 4.0 ms for the same cell (83x), 5.6 ms with
+    the K tail masked.
+    """
+    row = tl.program_id(0)
+    acc = tl.zeros((BK,), tl.float32)
+    kfull = (K // BK) * BK
+    for k0 in range(0, kfull, BK):
+        kk = k0 + tl.arange(0, BK)
+        acc += tl.load(W + row * K + kk) * tl.load(V + kk)
+    if kfull < K:
+        kk = kfull + tl.arange(0, BK)
+        m = kk < K
+        acc += tl.load(W + row * K + kk, mask=m, other=0.0) * tl.load(
+            V + kk, mask=m, other=0.0)
+    s = tl.sum(acc, 0)
+    if HAS_BIAS:
+        s += tl.load(Bias + row)
+    tl.store(Y + row, s)
+
+
+def _conv1px_patch(x, KH, KW, pad_h, pad_w, dil_h, dil_w):
+    """Gather the single input patch in weight order [C, KH, KW]."""
+    C, H, W = x.shape[1], x.shape[2], x.shape[3]
+    v = torch.zeros((C, KH, KW), dtype=x.dtype, device=x.device)
+    for kh in range(KH):
+        ih = kh * dil_h - pad_h
+        if not (0 <= ih < H):
+            continue
+        for kw in range(KW):
+            iw = kw * dil_w - pad_w
+            if 0 <= iw < W:
+                v[:, kh, kw] = x[0, :, ih, iw]
+    return v.reshape(-1)
+
+
+def _conv_1px_gemv(input, weight, bias, pad_h, pad_w, KH, KW, dil_h, dil_w,
+                   out_dtype=None):
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    x = input.contiguous()
+    w2 = weight.contiguous().view(OC, C * KH * KW)
+    v = _conv1px_patch(x, KH, KW, pad_h, pad_w, dil_h, dil_w).contiguous()
+    K = w2.shape[1]
+    y = torch.empty((OC,), dtype=torch.float32, device=input.device)
+    key = (OC, K, _GEMV_BK, bias is not None, x.dtype)
+    args = (w2, v, bias if bias is not None else w2, y, K)
+    _conv1px_gemv_kernel[(OC,)](*args, BK=_GEMV_BK, HAS_BIAS=(bias is not None))
+    # wave70 pattern: the driver has no fence and a freshly compiled variant can
+    # drop the first store block; one extra launch on a call that already paid
+    # the compile is cheaper than a wrong answer.
+    if key not in _GEMV_WARMED:
+        _GEMV_WARMED.add(key)
+        _conv1px_gemv_kernel[(OC,)](*args, BK=_GEMV_BK,
+                                    HAS_BIAS=(bias is not None))
+    dt = out_dtype or input.dtype
+    return y.to(dt).view(1, OC, 1, 1)
+
+
+def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
+    """wave82: a 1-pixel output whose weight stream dominates the whole call.
+
+    Only one output pixel exists, so every route reads the whole weight tensor
+    and does almost no arithmetic: the cost IS the weight stream.  The phase
+    kernel's descriptor path streams it at 113 MB/s; the row-stream gemv at
+    5.9-9.4 GB/s.  Measured live -> gemv, ms: c1024 3x3 s2 2x2 -> 1x1 333.0 ->
+    4.74 (70x, vendor 427.7 -> 90x), c1024 5x5 s2 2018 -> 9.50 (213x), c512 7x7
+    s2 571 -> 5.44 (105x), c2048 3x3 s2 1805 -> 13.83 (131x), c1024 3x3 d2
+    19.6 -> 4.41 (4.45x), f16 234 -> 23.4 (10x, the carrier conversion is then
+    the floor).
+
+    FLAGGEMS_SPACEMIT_CONV_GEMV=0 pins the old route for A/B.
+    """
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_GEMV", "1") == "0":
+        return False
+    if n != 1 or groups != 1 or oh != 1 or ow != 1:
+        return False
+    if (kh, kw) not in _TAP_KERNELS or oc < 32:
+        return False
+    # below a megabyte of weights the stream is not the cost any more and the
+    # OC-program launch is the floor
+    return oc * c * kh * kw >= (1 << 18)
+
+
+def conv_1x1_dense_applies(n, c, oc, oh, ow, sh, sw, h, w, kh, kw, pad_h,
+                           pad_w, groups) -> bool:
+    """wave82: the routing form of dense_g_1x1_applies for the public entries.
+
+    The stride and pad checks live here because the single-group 1x1 routes need
+    pad 0 and (OH-1)*SH < H to read the last row/col in range; the public gate
+    does not otherwise know H/W.
+    """
+    if kh != 1 or kw != 1 or pad_h or pad_w:
+        return False
+    return ((oh - 1) * sh < h and (ow - 1) * sw < w
+            and dense_g_1x1_applies(n, c, oc, oh, ow, sh, sw, groups))
+
+
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
                   BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None,
                   dil_h=1, dil_w=1, _out_dtype=None):
@@ -2278,6 +2440,13 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     if groups == C == OC:
         return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW,
                                  C, KH, KW, dil_h=dil_h, dil_w=dil_w)
+    # wave82: a 1-pixel output is a matrix-vector product.  Every other route
+    # reads the whole weight tensor for one output element, and the phase
+    # kernel's descriptor blocks stream it at 113 MB/s; the row-stream gemv
+    # below runs at 5.9-9.4 GB/s (334 -> 5.6 ms at c1024 3x3 s2 2x2 -> 1x1).
+    if conv_1px_applies(N, C, OC, OH, OW, KH, KW, groups):
+        return _conv_1px_gemv(input, weight, bias, pad_h, pad_w, KH, KW,
+                              dil_h, dil_w, out_dtype=_out_dtype)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
     # wave81: CG below the lane floor goes dense (block-diagonal weight, one
@@ -2286,6 +2455,17 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # single-group tap/phase pickers, so it must run before them.
     if (groups > 1 and dense_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW,
                                        groups, dil_h, dil_w)):
+        return conv2d_direct(input, _dense_group_weight(weight, groups), bias,
+                             pad_h, pad_w, OH, OW, SH, SW, 1,
+                             BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
+                             dil_h=dil_h, dil_w=dil_w, _out_dtype=_out_dtype)
+    # wave82: grouped 1x1 with a thin group goes dense (block-diagonal weight,
+    # one ordinary 1x1 GEMM over the full channel axis).  The grouped GEMM
+    # routes above start at CG >= 16 and the phase gate at CG >= 24, so CG 1..15
+    # otherwise runs the 32-lane group kernel; see dense_g_1x1_applies for the
+    # measured band.
+    if conv_1x1_dense_applies(N, C, OC, OH, OW, SH, SW, H, W, KH, KW,
+                              pad_h, pad_w, groups):
         return conv2d_direct(input, _dense_group_weight(weight, groups), bias,
                              pad_h, pad_w, OH, OW, SH, SW, 1,
                              BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
