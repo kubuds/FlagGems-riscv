@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # implementation is already a direct kernel but runs BLOCK=1024 (1M: 1.82 ms
 # vs 0.63 ms at BLOCK=8192; 2048x2048: 8.70 -> 2.50 ms) plus per-call grid
 # lambda overhead. Numerically equivalent (maxdiff 5.96e-08 on fp32 randn).
+# campaign 1011pm: mask-free variant for n divisible by BLOCK (mask handling
+# costs ~0.6 ms at 2048^2: 2.68 -> 2.09 ms measured); hardsigmoid_out added
+# for the aten out= variant (was on the generic BLOCK=1024 kernel: 8.65 ms
+# at 2048^2 vs 2.1 ms with the direct kernel).
 _BLOCK = 8192
 
 
@@ -45,6 +49,19 @@ def hardsigmoid_kernel_direct(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
     # this backend (max(nan, 0) -> 0). Restore NaN positions explicitly.
     y = tl.where(x32 != x32, float("nan"), y)
     tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty), mask=m)
+
+
+@libentry()
+@triton.jit
+def hardsigmoid_kernel_direct_nomask(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    x32 = x.to(tl.float32)
+    y = x32 * (1.0 / 6.0) + 0.5
+    y = tl.minimum(tl.maximum(y, 0.0), 1.0)
+    y = tl.where(x32 != x32, float("nan"), y)
+    tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty))
 
 
 @pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")])
@@ -68,9 +85,12 @@ def _launch_direct(x, out):
     n = x.numel()
     if n == 0:
         return out
-    grid = (triton.cdiv(n, _BLOCK),)
     with torch_device_fn.device(x.device):
-        hardsigmoid_kernel_direct[grid](x, out, n, BLOCK=_BLOCK)
+        if n % _BLOCK == 0:
+            hardsigmoid_kernel_direct_nomask[(n // _BLOCK,)](x, out, n, BLOCK=_BLOCK)
+        else:
+            grid = (triton.cdiv(n, _BLOCK),)
+            hardsigmoid_kernel_direct[grid](x, out, n, BLOCK=_BLOCK)
     return out
 
 
@@ -80,6 +100,18 @@ def hardsigmoid(x):
         out = torch.empty_like(x)
         return _launch_direct(x, out)
     return hardsigmoid_forward(x)
+
+
+def hardsigmoid_out(x, out):
+    logger.debug("GEMS_SPACEMIT HARDSIGMOID_OUT")
+    if (
+        isinstance(out, torch.Tensor)
+        and out.shape == x.shape
+        and _direct_ok(x)
+        and _direct_ok(out)
+    ):
+        return _launch_direct(x, out)
+    return hardsigmoid_forward(x, out0=out)
 
 
 def hardsigmoid_(A):

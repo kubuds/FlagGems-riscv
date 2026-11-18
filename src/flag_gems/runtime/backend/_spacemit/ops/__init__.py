@@ -24,7 +24,7 @@ from .copy import copy_
 # from .conv_depthwise2d import _conv_depthwise2d
 # from .flash_attention import flash_attention, scaled_dot_product_attention
 from .gelu import gelu, gelu_, gelu_backward
-from .hardsigmoid import hardsigmoid, hardsigmoid_
+from .hardsigmoid import hardsigmoid, hardsigmoid_, hardsigmoid_out
 from .layernorm import layer_norm
 from .mean import global_avg_pool, mean_dim
 from .mm import mm, mm_out
@@ -59,6 +59,7 @@ __all__ = [
     "gelu_backward",
     "hardsigmoid",
     "hardsigmoid_",
+    "hardsigmoid_out",
     "global_avg_pool",
     "layer_norm",
     "mean_dim",

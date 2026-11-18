@@ -83,8 +83,22 @@ def mean(inp, *, dtype=None):
     if dtype is None:
         dtype = inp.dtype
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    if block_size < 32:
+        # campaign 1011pm: tl.sum over extents 2..16 lowers to NaN on the K3
+        # spine backend (extent 1 trivial, >= 32 correct; probed exhaustively).
+        block_size = 32
+    if M >= 4096 and block_size < 4096:
+        # campaign 1011pm: a tl.sum segment below 2048 elements lowers to
+        # scalar code on the K3 spine backend (~2.8 ns/elem vs ~0.35 ns/elem
+        # vectorized), so the sqrt-based block size put stage 1 on the scalar
+        # side for mid-size inputs. Keeping segments >= 4096 wide: 1M flat
+        # mean 1.81 -> 0.61 ms, 2048x2048 flat 2.33 -> 1.93 ms (measured).
+        block_size = 4096
     mid_size = triton.cdiv(M, block_size)
-    block_mid = triton.next_power_of_2(mid_size)
+    # campaign 1011pm: tl.sum over extents 2..16 lowers to NaN on the K3
+    # spine backend (extent 1 trivial, >=32 correct; probed exhaustively).
+    # Keep the combine-stage reduce extent at >=32.
+    block_mid = max(32, triton.next_power_of_2(mid_size))
 
     mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
     out = torch.empty([], dtype=dtype, device=inp.device)

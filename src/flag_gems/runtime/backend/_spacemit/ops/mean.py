@@ -114,6 +114,37 @@ def mean_dim_kernel(X, Mean, M, N, TILE_N: tl.constexpr):
 
 @libentry()
 @triton.jit
+def mean_dim_kernel_bp(X, Mean, N, TILE_N: tl.constexpr):
+    # campaign 1011pm: non-autotuned block-ptr copy for a deterministic
+    # short-row route. The autotuner's per-process picks fluctuated on
+    # (4096,1024) between ~5.7 and ~8.0 ms; explicit TILE_N=512 measured
+    # 5.68 ms vs 8.04 ms for the autotuned path in the same session.
+    row = tl.program_id(0)
+    X = X + row * N
+    Mean = Mean + row
+    _mean = 0.0
+    num_pid_n = tl.cdiv(N, TILE_N)
+    x_ptr_desc = tl.make_block_ptr(
+        base=X,
+        shape=[N],
+        strides=[1],
+        offsets=[0],
+        block_shape=[TILE_N],
+        order=[0],
+    )
+    for off_n in range(0, num_pid_n):
+        a = tl.load(
+            x_ptr_desc,
+            boundary_check=[0],
+        )
+        _mean += tl.sum(a)
+        x_ptr_desc = tl.advance(x_ptr_desc, [TILE_N])
+    mean = _mean / N
+    tl.store(Mean, mean)
+
+
+@libentry()
+@triton.jit
 def mean_dim_kernel_plain(X, Mean, N, TILE_N: tl.constexpr):
     # campaign 1011am: plain-pointer row kernel; no block_ptr, fixed TILE_N.
     row = tl.program_id(0)
@@ -154,6 +185,10 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
             # block_ptr loop on long-row shapes; short rows (N <= 1024) stay
             # on the old path (plain was slower there).
             mean_dim_kernel_plain[grid](x, out, N, TILE_N=2048)
+        elif x.is_contiguous() and 512 <= N <= 1024 and N % 512 == 0:
+            # campaign 1011pm: deterministic TILE_N=512 block_ptr route for
+            # short rows (autotuner picks fluctuated, see kernel note).
+            mean_dim_kernel_bp[grid](x, out, N, TILE_N=512)
         else:
             mean_dim_kernel[grid](x, out, M, N)
     if not keepdim:
