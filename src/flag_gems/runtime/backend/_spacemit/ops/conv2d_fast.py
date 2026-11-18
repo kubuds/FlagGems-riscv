@@ -142,6 +142,14 @@ def _fast_applies_shapes(n, c, h, ww, oc, kh, kw, xd, wd, sh, sw, dh, dw,
                         and _env_str("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
         elif _env_str("FLAGGEMS_SPACEMIT_CONV_BF16_CARRIER", "1") == "0":
             return False
+    # wave101: one pixel per image (H = W = 1) with a 1x1 weight is the shape
+    # a classifier head has after global pooling, and the vendor entry runs one
+    # conv per image there: 28.1 ms at B=1 and 888 ms at B=32 for C512 OC1024,
+    # against 2.6 ms of GEMM.  Every width floor below is about tiling a row;
+    # there is no row, so this class bypasses them and takes the batch fold.
+    if (groups == 1 and kh == 1 and kw == 1 and sh == 1 and sw == 1
+            and h == 1 and ww == 1 and n >= 1 and c >= 16 and oc >= 1):
+        return True
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
         # wave57: grouped conv ran as g independent (c/g -> oc/g) problems, one
@@ -451,6 +459,47 @@ def _conv1x1_kernel(X, Wm, Bs, Y, C, M, OC, sxn, syn,
     else:
         tl.store(yb + oc[:, None] * M + m[None, :], acc.to(Y.dtype.element_ty),
                  mask=(oc[:, None] < OC) & (m[None, :] < M))
+
+
+
+@triton.jit
+def _conv1x1_px_kernel(X, Wm, Bs, Y, C, N, OC,
+    BLOCK_OC: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, NOMASK: tl.constexpr,
+):
+    """wave101: a batch of 1-pixel images as one GEMM.
+
+    With H = W = 1 a 1x1 conv is y[n, oc] = sum_c w[oc, c] x[n, c]: the batch
+    axis is the GEMM's N axis and there is no pixel axis at all.  The vendor
+    entry launches one conv per image and pays 27.8 ms for each at C512 OC1024
+    (28.1 ms at B=1 and 888 ms at B=32, against 2.6 ms of GEMM), so folding the
+    batch into one dot is 10x at B=1 and 300x at B=32.  x is read transposed
+    (stride 1 along K) because NCHW with one pixel is already (N, C), and y is
+    stored the same way.
+    """
+    pid_oc = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_OC, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, C, BLOCK_K):
+        cs = k0 + tl.arange(0, BLOCK_K)
+        if NOMASK:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :])
+            xv = tl.load(X + cs[:, None] + n[None, :] * C)
+        else:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :],
+                         mask=(oc[:, None] < OC) & (cs[None, :] < C), other=0.0)
+            xv = tl.load(X + cs[:, None] + n[None, :] * C,
+                         mask=(cs[:, None] < C) & (n[None, :] < N), other=0.0)
+        acc += tl.dot(wv, xv)
+    if HAS_BIAS:
+        acc += tl.load(Bs + oc, mask=oc < OC, other=0.0)[:, None]
+    if NOMASK:
+        tl.store(Y + oc[:, None] + n[None, :] * OC, acc.to(Y.dtype.element_ty))
+    else:
+        tl.store(Y + oc[:, None] + n[None, :] * OC, acc.to(Y.dtype.element_ty),
+                 mask=(oc[:, None] < OC) & (n[None, :] < N))
 
 
 @triton.jit
@@ -1667,6 +1716,78 @@ def _conv1x1_gemm_g(input, weight, bias, OH, OW, groups):
             BLOCK_M=bm, BLOCK_N=bn, MICRO_M=8, MICRO_N=64, MICRO_K=32,
             HAS_BIAS=(bias is not None), BGST=OCG)
     return y.view(N, OC, OH, OW)
+
+
+def _pick_px1_tiles(C, N, OC):
+    """wave101: the dot is (BLOCK_OC x C) @ (C x BLOCK_N), batch on N.
+
+    BLOCK_K=64, not the 1x1 rule's 32: on the transposed-B layout the K loop
+    feeds one accumulator tile and 64 measured 4.93 ms against 9.66 at 32
+    (C512 OC1024 f16, batch 32).
+    BLOCK_N covers the batch, 64 at a time; a batch below 32 still runs a
+    32-wide tile because spine-opt rejects narrower dots, and that wasted half
+    tile is 0.2 ms.
+    """
+    bk = 64 if C % 64 == 0 else (32 if C % 32 == 0
+                                  else (16 if C % 16 == 0
+                                        else triton.next_power_of_2(C)))
+    boc = 64 if OC > 64 else max(16, triton.next_power_of_2(OC))
+    # 32 is the narrowest N tile this backend lowers: a 16-wide tile aborts in
+    # spine-opt ("inner_tiles should be divisible by core_tiles") with the
+    # transposed-B load, so a one-image batch runs a padded 32-wide tile.
+    bn = max(32, min(64, triton.next_power_of_2(max(1, N))))
+    return boc, bn, bk
+
+
+def _conv1x1_px(input, weight, bias):
+    """wave101: 1-pixel 1x1 conv as one batch-folded GEMM (see the kernel).
+
+    Two routes.  The smt descriptor path (the mm recipe) is 2-4x faster than
+    tl.load + tl.dot here: one descriptor load sweeps the whole K, and at
+    C512 OC1024 f16 it measured 0.50 ms against 4.93 ms on the plain kernel
+    and 892 ms on the vendor entry.  It needs C 32-aligned (K is one block),
+    OC a multiple of 64 (the A descriptor has no row bound), C <= 1024 (the
+    A block is BLOCK_M x C in TCM) and C a power of two (the descriptor block
+    shape is one K block); everything else takes the masked plain kernel,
+    which is still 180x over the vendor and compiles for C 96/160/320 (measured
+    0.33-2.36 ms).  The batch is padded
+    up to the 32-wide N tile because the B descriptor has no column bound
+    either.  Both operands are transposed once on the host: NCHW with one
+    pixel is (N, C), and the GEMM wants (C, N).
+    """
+    N, C, _, _ = input.shape
+    OC = weight.shape[0]
+    x = input.reshape(N, C)
+    w2 = weight.reshape(OC, C).contiguous()
+    if (smt is not None and C % 32 == 0 and C <= 1024 and OC % 64 == 0
+            and (C & (C - 1)) == 0
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1SMT", "1") != "0"):
+        bn = 32
+        npad = (N + bn - 1) // bn * bn
+        if npad != N:
+            xt = torch.zeros((C, npad), dtype=x.dtype, device=x.device)
+            xt[:, :N] = x.t()
+        else:
+            xt = x.t().contiguous()
+        yt = torch.empty((OC, npad), dtype=x.dtype, device=x.device)
+        micro = (16, 32, 8) if x.dtype == torch.float16 else (8, 64, 32)
+        _conv1x1_smt_kernel[(OC // 64, npad // bn)](
+            w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
+            BLOCK_M=64, BLOCK_N=bn,
+            MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
+            HAS_BIAS=(bias is not None),
+        )
+        return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
+    y = torch.empty((N, OC), dtype=input.dtype, device=input.device)
+    boc, bn, bk = _pick_px1_tiles(C, N, OC)
+    nomask = (C % bk == 0) and (N % bn == 0) and (OC % boc == 0)
+    grid = (triton.cdiv(OC, boc), triton.cdiv(N, bn))
+    _conv1x1_px_kernel[grid](
+        x, w2, bias if bias is not None else x, y, C, N, OC,
+        BLOCK_OC=boc, BLOCK_N=bn, BLOCK_K=bk,
+        HAS_BIAS=(bias is not None), NOMASK=nomask,
+    )
+    return y.view(N, OC, 1, 1)
 
 
 def _pick_1x1_tiles(C, M, OC):
@@ -3341,6 +3462,18 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                   dil_h=1, dil_w=1, _out_dtype=None):
     N, C, H, W = input.shape
     OC, CG, KH, KW = weight.shape
+    # wave101: a 1-pixel image through a 1x1 weight is a (OC, C) @ (C, N) GEMM
+    # over the batch.  The vendor entry has no batch fold: it runs one conv per
+    # image at 27.8 ms (C512 OC1024), whatever the batch size, and the tap /
+    # phase routes cannot tile a row that does not exist.  FLAGGEMS_SPACEMIT_
+    # CONV_PX1=0 pins the old routes for A/B.  Kept above the half-precision
+    # carrier: f16 stays f16 here (the dot accumulates in f32).
+    if (groups == 1 and KH == 1 and KW == 1 and OH == 1 and OW == 1
+            and pad_h == 0 and pad_w == 0 and SH == 1 and SW == 1
+            and C >= 16 and N >= 1 and input.dtype == weight.dtype
+            and input.dtype in (torch.float16, torch.float32)
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1", "1") != "0"):
+        return _conv1x1_px(input, weight, bias)
     if input.dtype != torch.float32:
         # wave83: the f16/bf16 1-pixel cell is a row-stream gemv on the stored
         # weights; the carrier below would first convert the whole weight to
