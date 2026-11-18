@@ -31,6 +31,7 @@ from flag_gems.runtime.backend._spacemit.ops.softmax_backward_fast import (
 from flag_gems.utils import tl_extra_shim
 
 from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
+from flag_gems.runtime.backend._spacemit.ops.fastmath import exp_fast
 
 logger = logging.getLogger(__name__)
 exp = tl_extra_shim.exp
@@ -128,8 +129,138 @@ def softmax_kernel_block(input_ptr, output_ptr, n_cols, COL: tl.constexpr):
     tl.store(output_ptr + base + offs, (e / s).to(output_ptr.dtype.element_ty))
 
 
+# wave24: the resident row is not just a f16 trick, and the column loop is what
+# costs the time.  probe228 priced one 1M f32 row: copy 0.46 ns/elem, element-wise
+# max 0.29, exp+store 0.53, but a tl.sum over a block *inside* the loop 5.35 - the
+# block reduction is scalar-lowered, so every 256-column chunk of the three-pass
+# path pays it twice per row.  Keeping the row (or ROWS rows) in one block leaves
+# exactly two reductions per row and one load plus one store:
+# 4096^2 29.1 -> 17.0, 32768x512 60.9 -> 17.4, 8192x512 15.1 -> 5.8,
+# 1024^2 2.8 -> 1.6 ms (probe229/230b/231).  ROWS is a plain dynamic loop on
+# purpose: static_range unrolls it (128 rows = 62 s of compile, and slower).
+@triton.jit
+def softmax_kernel_rowres(X, Y, n_cols, ROWS: tl.constexpr, COL: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, COL)
+    for i in range(ROWS):
+        r = pid * ROWS + i
+        base = r.to(tl.int64) * n_cols
+        x = tl.load(X + base + offs).to(tl.float32)
+        m = tl.max(x, axis=0)
+        e = exp_fast(x - m, 1)
+        s = tl.sum(e, axis=0)
+        tl.store(Y + base + offs, (e / s).to(Y.dtype.element_ty))
+
+
+@triton.jit
+def softmax_kernel_rowres_m(X, Y, n_cols, ROWS: tl.constexpr, COL: tl.constexpr):
+    """Row resident, masked: n_cols is not a power of two (COL = next_pow2)."""
+    pid = tl.program_id(0)
+    offs = tl.arange(0, COL)
+    mo = offs < n_cols
+    for i in range(ROWS):
+        r = pid * ROWS + i
+        base = r.to(tl.int64) * n_cols
+        x = tl.load(X + base + offs, mask=mo, other=-float("inf")).to(tl.float32)
+        m = tl.max(x, axis=0)
+        e = exp_fast(x - m, 1)
+        s = tl.sum(e, axis=0)
+        tl.store(Y + base + offs, (e / s).to(Y.dtype.element_ty), mask=mo)
+
+
+# wave24: a single row wider than any block (official shape 1048576 is one row).
+# The live wrapper launches grid=1 and walks 4096 x 256 columns on one core.
+# Two levels: per-chunk max and lane-wise sum of exp, one fold, one rescale pass.
+_FLAT_CHUNK = 32768
+_FLAT_BLOCK = 1024
+
+
+@triton.jit
+def _sm_flat_s1(X, MB, SB, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * CHUNK
+    offs = tl.arange(0, BLOCK)
+    m = tl.full((BLOCK,), -float("inf"), dtype=tl.float32)
+    for o in range(0, CHUNK, BLOCK):
+        x = tl.load(X + base + o + offs).to(tl.float32)
+        m = tl.maximum(m, x)
+    mt = tl.max(m, axis=0)
+    s = tl.zeros((BLOCK,), dtype=tl.float32)
+    for o in range(0, CHUNK, BLOCK):
+        x = tl.load(X + base + o + offs).to(tl.float32)
+        s = s + exp_fast(x - mt, 1)
+    tl.store(MB + pid, mt)
+    tl.store(SB + pid, tl.sum(s, axis=0))
+
+
+@triton.jit
+def _sm_flat_s2(MB, SB, GM, GS, nblk, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mk = offs < nblk
+    m = tl.load(MB + offs, mask=mk, other=-float("inf"))
+    s = tl.load(SB + offs, mask=mk, other=0.0)
+    gm = tl.max(m, axis=0)
+    gs = tl.sum(s * exp_fast(m - gm, 1), axis=0)
+    tl.store(GM, gm)
+    tl.store(GS, gs)
+
+
+@triton.jit
+def _sm_flat_s3(X, Y, GM, GS, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * CHUNK
+    offs = tl.arange(0, BLOCK)
+    gm = tl.load(GM)
+    inv = 1.0 / tl.load(GS)
+    for o in range(0, CHUNK, BLOCK):
+        x = tl.load(X + base + o + offs).to(tl.float32)
+        y = exp_fast(x - gm, 1) * inv
+        tl.store(Y + base + o + offs, y.to(Y.dtype.element_ty))
+
+
+def _softmax_flat(inp, out):
+    """Two-level softmax for one very wide row (10.66 -> 1.58 ms f32, probe229)."""
+    n = inp.numel()
+    nblk = n // _FLAT_CHUNK
+    mb = torch.empty(nblk, dtype=torch.float32)
+    sb = torch.empty(nblk, dtype=torch.float32)
+    gm = torch.empty(1, dtype=torch.float32)
+    gs = torch.empty(1, dtype=torch.float32)
+    with nested_dispatch(n):
+        _sm_flat_s1[(nblk,)](inp, mb, sb, CHUNK=_FLAT_CHUNK, BLOCK=_FLAT_BLOCK)
+        _sm_flat_s2[(1,)](mb, sb, gm, gs, nblk,
+                          BLOCK=max(64, triton.next_power_of_2(nblk)))
+        _sm_flat_s3[(nblk,)](inp, out, gm, gs, CHUNK=_FLAT_CHUNK, BLOCK=_FLAT_BLOCK)
+    return out
+
+
 def _spacemit_softmax_lastdim(inp, out):
     n_rows, n_cols = inp.shape
+    n = inp.numel()
+    # wave24: a single very wide row is a grid=1 launch on the live path (one core
+    # walking 4096 column blocks).  Two levels over 32768-element chunks:
+    # 10.66 -> 1.58 ms f32, 14.34 -> 1.29 f16 at 1048576 (probe229).
+    if n_rows == 1 and n >= (1 << 16) and n % _FLAT_CHUNK == 0:
+        _softmax_flat(inp, out)
+        return
+    # wave24: rows that fit in one block stay resident, ROWS rows per program.
+    # The three-pass path below pays a scalar-lowered tl.sum for every 256-wide
+    # chunk and three passes over the row, which is 1.7-3.5x slower (probe231).
+    if n_cols <= 8192 and n >= (1 << 16):
+        col = triton.next_power_of_2(n_cols)
+        rows = max(1, min(128, n_rows // 128))
+        if n_rows % rows:
+            rows = 1  # keep every launch exact; a masked row store is not safe here
+        with nested_dispatch(n):
+            if col == n_cols:
+                softmax_kernel_rowres[(n_rows // rows,)](
+                    inp, out, n_cols, ROWS=rows, COL=col
+                )
+            else:
+                softmax_kernel_rowres_m[(n_rows // rows,)](
+                    inp, out, n_cols, ROWS=rows, COL=col
+                )
+        return
     row_size = 1 if n_rows < 2 else (2 if n_rows < 8 else 4)
     # wave22: 256-wide column blocks are 6-13% faster than 64-wide on every
     # official shape (probe197b), and f16 rows of length 256-1024 are better
