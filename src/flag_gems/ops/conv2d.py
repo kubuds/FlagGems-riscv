@@ -400,6 +400,8 @@ class Conv2d(torch.autograd.Function):
                     conv_fast_applies,
                     conv_fast_enabled,
                     conv_phase_applies,
+                    conv_phase_g_applies,
+                    tap_shift_applies,
                 )
 
                 if conv_fast_enabled():
@@ -424,19 +426,21 @@ class Conv2d(torch.autograd.Function):
                     # class enters through its own gate.
                     kh = weight.shape[2]
                     kw = weight.shape[3]
+                    # wave75: the gate IS the route predicate now
+                    # (tap_shift_applies).  The old hand-copied window capped
+                    # OC and C at 512 and left every wider dilated layer on the
+                    # vendor im2col: 3x3 d2 c256->1024 measured 313 ms there
+                    # against 48.3 ms for the same class at c256->256.
                     dil_tap = (
                         dilation_height == dilation_width
                         and dilation_height > 1
                         and groups == 1
-                        and kh == kw
-                        and (kh == 3
-                             or dilation_height > 1
-                             or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")
                         and stride_height == 1
                         and stride_width == 1
-                        and 3 <= input.shape[1] <= 512
-                        and 32 <= weight.shape[0] <= 512
-                        and fast_oh * fast_ow >= 16
+                        and tap_shift_applies(
+                            input.shape[0], input.shape[1], weight.shape[0],
+                            fast_oh, fast_ow, kh, kw, 1,
+                            dilation_height, dilation_width)
                         and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
                     )
                     # wave70: dilated depthwise is a second class with no fast
@@ -466,7 +470,21 @@ class Conv2d(torch.autograd.Function):
                             fast_oh, fast_ow, kh, kw,
                             stride_height, stride_width)
                     )
-                    applies = (dil_tap or dil_phase or dil_dwise
+                    # wave75: grouped x dilation is the last conv class with
+                    # no fast route: dil_tap requires groups == 1 and
+                    # conv_fast_applies rejects any dilation, so it fell to the
+                    # vendor im2col (30.3-72.2 ms at 3x3/5x5 d2).  The phase
+                    # kernel handles both the group axis and the dilation, and
+                    # at stride 1 its plane build collapses to the frame copy.
+                    dil_phase_g = (
+                        (dilation_height != 1 or dilation_width != 1)
+                        and groups > 1
+                        and conv_phase_g_applies(
+                            input.shape[0], input.shape[1], weight.shape[0],
+                            fast_oh, fast_ow, kh, kw,
+                            stride_height, stride_width, groups)
+                    )
+                    applies = (dil_tap or dil_phase or dil_phase_g or dil_dwise
                                or conv_fast_applies(
                         input,
                         weight,

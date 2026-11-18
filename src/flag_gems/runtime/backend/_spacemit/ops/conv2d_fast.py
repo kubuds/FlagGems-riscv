@@ -893,6 +893,18 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # column block beats bm=32/bn=128 by 1.9-2.6x.
     bn = min(256, max(64, triton.next_power_of_2(MY)))
     bm = 8 if OCP <= 32 else 16
+    if CP >= 256:
+        # wave75 scan: a CP >= 256 group carries a 4-8x wider B block, so the
+        # launch wants a taller A block instead of a wider N tile.  g2 c1024
+        # d2 28: 218.3 (bm16/bn256) -> 101.1 (bm32/bn128); g4 c1024 CP=256
+        # 61.0 -> 42.4.  The A block is bm*CP*4 bytes, so CP 1024 caps bm at
+        # 16 (32*1024*4 = 128 KB against the 96 KB TCM), CP 2048 at 8.
+        bn = 128
+        bm = 32 if CP <= 512 else (16 if CP <= 1024 else 8)
+    # wave75: scan knobs for the grouped phase tile (CP 32/64 was tuned in
+    # wave74; a CP >= 256 group carries a much wider B block).
+    bm = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_G_BM", "0")) or bm
+    bn = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_G_BN", "0")) or bn
     bm = min(bm, OCP)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights_g(weight, groups, CP, OCP)
@@ -903,7 +915,12 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                               PLANE, SH, SW, dil_h, dil_w, bias is not None,
                               groups))
     for n in range(N):
-        frame = _tap_flat_buf(ITOT, IH, IW, bn + 96, x.dtype, x.device)
+        # wave75: at stride 1 the padded frame IS the single phase plane
+        # (PHH*PWW == IH*IW), so the plane build is a pure image copy and is
+        # skipped: the B operand reads the frame directly.  The tail absorbs
+        # the last tile's column overrun inside that plane.
+        tail = bn + 96 + ((KW - 1) * dil_w if NP == 1 else 0)
+        frame = _tap_flat_buf(ITOT, IH, IW, tail, x.dtype, x.device)
         img = frame[:ITOT * IH * IW].view(ITOT, IH, IW)
         if CG == CP:
             # no per-group channel padding: one slice copy for every group
@@ -919,14 +936,19 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                         pad_w:pad_w + W].copy_(x[n, g * CG:(g + 1) * CG])
                 else:
                     img[g * CP:g * CP + CG].copy_(x[n, g * CG:(g + 1) * CG])
-        flat = _tap_phase_buf(ITOT, NP, PHH, PWW, bn + 96, x.dtype, x.device)
-        planes = flat[:ITOT * CSTR].view(ITOT, NP, PHH, PWW)
-        for p in range(SH):
-            for q in range(SW):
-                nh = min(PHH, (IH - p + SH - 1) // SH)
-                nw = min(PWW, (IW - q + SW - 1) // SW)
-                planes[:, p * SW + q, :nh, :nw].copy_(
-                    img[:, p::SH, q::SW][:, :nh, :nw])
+        if NP == 1 and os.environ.get(
+                "FLAGGEMS_SPACEMIT_PH_G_PLANE", "1") == "1":
+            flat = frame
+        else:
+            flat = _tap_phase_buf(ITOT, NP, PHH, PWW, bn + 96, x.dtype,
+                                  x.device)
+            planes = flat[:ITOT * CSTR].view(ITOT, NP, PHH, PWW)
+            for p in range(SH):
+                for q in range(SW):
+                    nh = min(PHH, (IH - p + SH - 1) // SH)
+                    nw = min(PWW, (IW - q + SW - 1) // SW)
+                    planes[:, p * SW + q, :nh, :nw].copy_(
+                        img[:, p::SH, q::SW][:, :nh, :nw])
         yext = torch.empty((groups * OCP, MYP), dtype=torch.float32,
                            device=input.device)
 
@@ -1676,6 +1698,10 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
     if groups <= 1 or c % groups or oc % groups:
         return False
     cg, ocg = c // groups, oc // groups
+    # wave75: the lane floor was tried at 2 and stays at 8.  The phase kernel
+    # needs CP >= 32, so a CG=4 group carries 8x padding and the frame becomes
+    # groups*CP channels: g16 c64 56x56 s2 measured 14.033 ms on this route
+    # against 6.180 on the group kernel (0.44x).  CG < 8 keeps the group kernel.
     return ((kh, kw) in _TAP_KERNELS and 8 <= cg <= 2048
             and 8 <= ocg <= 2048
             and triton.next_power_of_2(cg) <= 2048
@@ -1683,6 +1709,39 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
             and (sh * sw <= 4 or (sh == sw == 3 and kh == kw))
             and n * oc * oh * ow * kh * kw * cg >= (1 << 20)
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHG", "1") != "0")
+
+
+def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
+                      dil_h=1, dil_w=1) -> bool:
+    """wave75: the stride-1 shifted-tap gate, shared by the route and the
+    public dilated gate so the two cannot drift apart.
+
+    This is the exact condition conv2d_direct has always used; the public
+    entry's dil_tap used to hand-copy a narrower OC/C window (OC, C <= 512),
+    which left every dilated layer above 512 channels on the vendor im2col
+    (measured 313 / 684 / 760 ms at 3x3 d2 c256->1024, c512->1024, c256->768).
+    """
+    if groups != 1 or (kh, kw) not in _TAP_KERNELS:
+        return False
+    if dil_h != dil_w:
+        return False
+    cp = triton.next_power_of_2(c)
+    if not (3 <= c <= 2048 and 32 <= oc <= 2048 and oh * ow >= 16):
+        return False
+    if not (cp <= 512
+            or (cp <= 1024 and kh * kw <= 49)
+            or (cp <= 2048 and kh * kw <= 49
+                and not (kh == 3 and (c & (c - 1)) == 0 and oh * ow <= 64))):
+        return False
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") == "0":
+        return False
+    return (kh == 3 or dil_h > 1
+            or (kh == 7 and kw == 7
+                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP49", "1") != "0")
+            or (kh != kw
+                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPX", "1") != "0")
+            or (kh == 5
+                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))
 
 
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
@@ -1758,7 +1817,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # program_id(2) and both packed bases are channel-major already, so one
     # launch serves every group (g8 c256 28x28 s2 was 5.09 ms on the 32-lane
     # group kernel against 5.85 official - the worst grouped cell measured).
-    if (groups > 1 and (SH > 1 or SW > 1)
+    if (groups > 1 and (SH > 1 or SW > 1 or dil_h != 1 or dil_w != 1)
             and conv_phase_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW, groups)):
         return _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w,
                                  KH, KW, SH, SW, groups,
@@ -1788,22 +1847,9 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # 277-282 ms against 13.3-16.0 on this kernel), so it turns on by itself;
     # the non-dilated 5x5 stays opt-in because the tap kernel is a working
     # alternative there and the 25-dot compile is 158 s.
-    if (groups == 1 and (KH, KW) in _TAP_KERNELS and SH == 1 and SW == 1
-            and dil_h == dil_w and 3 <= C <= 2048
-            and (triton.next_power_of_2(C) <= 512
-                 or (triton.next_power_of_2(C) <= 1024 and KH * KW <= 49)
-                 or (triton.next_power_of_2(C) <= 2048 and KH * KW <= 49
-                     and not (KH == 3 and (C & (C - 1)) == 0
-                              and OH * OW <= 64)))
-            and 32 <= OC <= 2048 and OH * OW >= 16
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
-            and (KH == 3 or dil_h > 1
-                 or (KH == 7 and KW == 7
-                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP49", "1") != "0")
-                 or (KH != KW
-                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPX", "1") != "0")
-                 or (KH == 5
-                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))):
+    if (groups == 1 and SH == 1 and SW == 1
+            and tap_shift_applies(N, C, OC, OH, OW, KH, KW, 1,
+                                  dil_h, dil_w)):
         return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
                                out_dtype=_out_dtype, dil_h=dil_h, dil_w=dil_w)
     if dil_h != 1 or dil_w != 1:
