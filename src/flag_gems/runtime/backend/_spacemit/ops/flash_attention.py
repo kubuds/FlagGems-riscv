@@ -1269,6 +1269,20 @@ class Attention(torch.autograd.Function):
                             group_size >= 8
                             and q.shape[2] * group_size <= 1024
                         )
+                        # wave100: 2048 rows measured against 1024 for the
+                        # bigger groups.  The per-block scan is bounded by nq,
+                        # so extra rows only buy K/V reuse across groups; that
+                        # holds while nq stays <= 64.  At 2048 rows: g64 q32
+                        # kv512 4.25x, g64 q32 kv1024 d128 3.22x, g128 q16
+                        # 3.68x, g32 q64 2.50x; but g16 q128 (nq 128) 1.38x and
+                        # g8 q256 (nq 256) 0.98x, so nq > 64 stays out.  Grid
+                        # sweep at 2048 rows (ctas 2/4/8/16/32) is flat within
+                        # 2%, so the default grid rule is unchanged.
+                        or (
+                            group_size >= 16
+                            and q.shape[2] <= 64
+                            and q.shape[2] * group_size <= 2048
+                        )
                     )
                 )
                 or (not is_causal and q.shape[2] * group_size <= 32)
