@@ -166,6 +166,7 @@ def _attn_fwd_inner(
     LO,
     HI,
     ROW_MOD: tl.constexpr,
+    EXACT_BOUND: tl.constexpr,
 ):
     if STAGE == 1:
         tl.static_assert(BLOCK_M >= BLOCK_N)
@@ -194,7 +195,19 @@ def _attn_fwd_inner(
             # tensor<?x1x32x8>, got 4x4x32x8), so clamp the old runtime
             # expression instead of using ROW_MOD directly
             hi = tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
-            lo, hi = 0, tl.minimum(hi, ROW_MOD)
+            if EXACT_BOUND:
+                # wave99: row r is query r % ROW_MOD, so a block starting at
+                # start_m * BLOCK_M spans query positions s .. s + BLOCK_M - 1
+                # (mod ROW_MOD), s = start_m * BLOCK_M % ROW_MOD.  When the
+                # block covers only part of a group (BLOCK_M < ROW_MOD) the
+                # last live query in it is s + BLOCK_M - 1, not ROW_MOD - 1:
+                # g2 q128 at a 64-row tile scanned all 128 keys for 64 live
+                # rows.  Clamp to s + BLOCK_M (exclusive) instead.
+                s0 = (start_m * BLOCK_M) % ROW_MOD
+                hi = tl.minimum(hi, tl.minimum(ROW_MOD, s0 + BLOCK_M))
+            else:
+                hi = tl.minimum(hi, ROW_MOD)
+            lo = 0
         else:
             lo, hi = 0, tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
     else:
@@ -322,6 +335,7 @@ def _attn_fwd(
     num_ctas: tl.constexpr,
     ALT: tl.constexpr,
     ROW_MOD: tl.constexpr,
+    EXACT_BOUND: tl.constexpr,
 ):
     NUM_BLOCKS_M = tl.cdiv(Q_CTX, BLOCK_M)
     NUM_BLOCKS = NUM_BLOCKS_M * Z * H_Q
@@ -430,6 +444,7 @@ def _attn_fwd(
                 0,
                 0,
                 ROW_MOD,
+                EXACT_BOUND,
             )
         else:
             if STAGE & 1:
@@ -458,6 +473,7 @@ def _attn_fwd(
                     0,
                     0,
                     ROW_MOD,
+                    EXACT_BOUND,
                 )
             if STAGE & 2:
                 acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
@@ -485,6 +501,7 @@ def _attn_fwd(
                     0,
                     0,
                     ROW_MOD,
+                    EXACT_BOUND,
                 )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -639,6 +656,7 @@ def _attn_fwd_split(
             lo,
             hi,
             False,
+            False,
         )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -754,6 +772,7 @@ _PLAN_KEYS = (
     "FLAGGEMS_SPACEMIT_ATTN_SPLIT",
     "FLAGGEMS_SPACEMIT_ATTN_PACK_BN",
     "FLAGGEMS_SPACEMIT_ATTN_F32TILE",
+    "FLAGGEMS_SPACEMIT_ATTN_PACKBOUND",
 )
 
 
@@ -860,6 +879,10 @@ def _plan(q, k, v, is_causal, group_size, row_mod=0):
         pack_bn = _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK_BN", 32)
         if pack_bn > 0:
             block_n = min(block_n, pack_bn)
+    # wave99: exact per-block causal bound for packed rows (row r -> query
+    # r % nq, so a block only needs keys up to start%nq + BLOCK_M).  Off
+    # restores the wave98 "every block scans nq keys" bound for A/B.
+    exact = row_mod > 0 and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACKBOUND", 1) != 0
 
     num_ctas = _env_int("FLAGGEMS_SPACEMIT_ATTN_CTAS", 0)
     micro_m, micro_k, micro_n = _micros_for(q.dtype)
@@ -947,11 +970,11 @@ def _plan(q, k, v, is_causal, group_size, row_mod=0):
         q_ctx_run,
         split_ns,
         split_chunk,
+        exact,
     )
     if not live:
         _PLAN_CACHE[key] = plan
     return plan
-
 
 def _launch(q, k, v, sm_scale, is_causal, group_size, row_mod=0):
     """Mirror of Attention.forward without autograd; returns the output tensor."""
@@ -974,6 +997,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size, row_mod=0):
         q_ctx_run,
         split_ns,
         split_chunk,
+        exact,
     ) = _plan(q, k, v, is_causal, group_size, row_mod)
 
     if padded:
@@ -1035,6 +1059,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size, row_mod=0):
             num_ctas=num_ctas,
             ALT=alt,
             ROW_MOD=row_mod,
+            EXACT_BOUND=exact,
             num_warps=8,
             num_stages=3,
         )
@@ -1220,8 +1245,31 @@ class Attention(torch.autograd.Function):
             and (
                 (
                     is_causal
-                    and q.shape[2] * group_size <= 128
                     and q.shape[2] <= k.shape[2]
+                    and (
+                        q.shape[2] * group_size <= 128
+                        # wave99: the row cap was set when only 64/128-row
+                        # packings had been measured.  Packing more rows shares
+                        # one K/V stream across more (head, query) groups and
+                        # cuts the per-block prologue count; the scan itself is
+                        # bounded by nq, so it stays cheap.  Measured against
+                        # the unpacked entry: 256 rows g8 q32 2.00x, g16 q16
+                        # 1.94x, g32 q8 2.19x, g64 q4 3.83x, f32 g16 q16 3.27x;
+                        # 512 rows g8 q64 2.52x (b2 2.45x), g16 q32 2.73x,
+                        # g32 q16 3.05x, g64 q8 3.45x, f32 g32 q16 3.61x;
+                        # 1024 rows g8 q128 1.48x, g16 q64 2.26x, g32 q32
+                        # 3.24x.  Boundaries: g2 at 256 rows and g4 at 768 rows
+                        # lose (0.72x, 0.86x), so the cap grows with the group
+                        # (128 / 512 / 1024 for g2 / g4 / g8+).
+                        or (
+                            group_size >= 4
+                            and q.shape[2] * group_size <= 512
+                        )
+                        or (
+                            group_size >= 8
+                            and q.shape[2] * group_size <= 1024
+                        )
+                    )
                 )
                 or (not is_causal and q.shape[2] * group_size <= 32)
                 or (
