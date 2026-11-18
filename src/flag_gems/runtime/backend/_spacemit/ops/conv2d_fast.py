@@ -1752,6 +1752,13 @@ _TAP_KERNELS = ((1, 3), (3, 1), (1, 5), (5, 1), (1, 7), (7, 1),
 
 _TAP_W = {}
 _TAP_BUF = {}
+# wave95: same whole-net rule as _MP_W.  Twelve distinct tap-route layers with
+# an 8-entry weight cap re-permute four weights per sweep, and a 4-entry buffer
+# cap re-allocates (and zeroes) eight flat buffers per sweep.
+_TAP_W_MAX_ENTRIES = 64
+_TAP_W_MAX_BYTES = 384 << 20
+_TAP_BUF_MAX_ENTRIES = 16
+_TAP_BUF_MAX_BYTES = 256 << 20
 # wave70: per-(binary, shape) first-launch guard, the rmsb_fast wave50/53
 # pattern.  The driver has no fence and a freshly compiled variant can drop the
 # first store block; the two garbage returns wave69 saw at CP=256/14x14 (rel
@@ -1792,9 +1799,9 @@ def _tap_weights(weight, cpad=None, ocpad=None):
         at = z
     else:
         at = at.contiguous()
-    if len(_TAP_W) >= 8:
-        _TAP_W.pop(next(iter(_TAP_W)))
-    _TAP_W[key] = (weakref.ref(weight), weight._version, at)
+    _mp_cache_put(_TAP_W, key, (weakref.ref(weight), weight._version, at),
+                  at.numel() * at.element_size(), _TAP_W_MAX_ENTRIES,
+                  _TAP_W_MAX_BYTES)
     return at
 
 
@@ -1807,7 +1814,10 @@ def _tap_flat_buf(c, ih, iw, tail, dtype, device):
     key = (c, ih, iw, tail, dtype, str(device))
     buf = _TAP_BUF.get(key)
     if buf is None:
-        if len(_TAP_BUF) >= 4:
+        while _TAP_BUF and (
+                len(_TAP_BUF) >= _TAP_BUF_MAX_ENTRIES
+                or sum(b.numel() * b.element_size() for b in _TAP_BUF.values())
+                + (c * srow + tail) * dtype.itemsize > _TAP_BUF_MAX_BYTES):
             _TAP_BUF.pop(next(iter(_TAP_BUF)))
         # the tail absorbs the last tile's out-of-range reads beyond C*SROW; it
         # is written once at allocation because the real span is rewritten on
@@ -2411,6 +2421,28 @@ _MP_WG = {}
 _CW = {}
 _MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048, 4096)
 
+# wave95: the descriptor-weight caches were a hard 4 entries with no byte
+# bound.  An 8-layer small-output net (the shape class this route owns) then
+# evicted four padded weights on every sweep and paid the pad copy again on
+# every pass.  Same rule as the carrier cache: 64 entries plus a byte budget,
+# oldest first.  Measured on an 8-layer net whose layers all pad (K % 128 != 0):
+# pass 2 69.19 -> 57.04 ms (1.21x), four interleaved visits all positive.
+_MP_W_MAX_ENTRIES = 64
+_MP_W_MAX_BYTES = 384 << 20
+_MP_WG_MAX_ENTRIES = 64
+_MP_WG_MAX_BYTES = 384 << 20
+
+
+def _mp_cache_put(cache, key, item, nbytes, max_entries, max_bytes):
+    """Insert into a descriptor-weight cache, oldest first, entries + bytes."""
+    while cache:
+        if (len(cache) < max_entries
+                and sum(e[2].numel() * e[2].element_size()
+                        for e in cache.values()) + nbytes <= max_bytes):
+            break
+        cache.pop(next(iter(cache)))
+    cache[key] = item
+
 
 _CW_MAX_ENTRIES = 64
 _CW_MAX_BYTES = 384 << 20
@@ -2485,9 +2517,8 @@ def _mp_weights(weight, k):
         w2 = w2.float()
     z = torch.zeros((oc, k), dtype=torch.float32, device=weight.device)
     z[:, :kt].copy_(w2)
-    if len(_MP_W) >= 4:
-        _MP_W.pop(next(iter(_MP_W)))
-    _MP_W[key] = (weakref.ref(weight), weight._version, z)
+    _mp_cache_put(_MP_W, key, (weakref.ref(weight), weight._version, z),
+                  z.numel() * 4, _MP_W_MAX_ENTRIES, _MP_W_MAX_BYTES)
     return z
 
 
@@ -2571,9 +2602,8 @@ def _mp_weights_g(weight, groups, kp):
     z = torch.zeros((groups, OCG, kp), dtype=torch.float32,
                     device=weight.device)
     z[:, :, :kg].copy_(w2)
-    if len(_MP_WG) >= 4:
-        _MP_WG.pop(next(iter(_MP_WG)))
-    _MP_WG[key] = (weakref.ref(weight), weight._version, z)
+    _mp_cache_put(_MP_WG, key, (weakref.ref(weight), weight._version, z),
+                  z.numel() * 4, _MP_WG_MAX_ENTRIES, _MP_WG_MAX_BYTES)
     return z
 
 
