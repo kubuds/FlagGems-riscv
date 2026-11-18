@@ -34,7 +34,7 @@ from .pow import (
     pow_tensor_tensor,
     pow_tensor_tensor_,
 )
-from .rsqrt import rsqrt
+from .rsqrt import rsqrt, rsqrt_
 from .sigmoid import sigmoid
 from .silu import silu
 from .softmax import softmax
@@ -65,6 +65,7 @@ __all__ = [
     "pow_tensor_tensor",
     "pow_tensor_tensor_",
     "rsqrt",
+    "rsqrt_",
     "scaled_dot_product_attention",
     "sigmoid",
     "silu",

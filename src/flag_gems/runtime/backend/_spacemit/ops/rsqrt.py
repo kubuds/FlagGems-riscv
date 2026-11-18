@@ -71,22 +71,24 @@ def _launch_direct(x, out):
 
 def rsqrt(A):
     logger.debug("GEMS_SPACEMIT RSQRT")
-    if A.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        x = A if A.is_contiguous() else A.contiguous()
-        out = torch.empty_like(x)
-        with torch_device_fn.device(x.device):
-            _launch_direct(x, out)
+    if (
+        A.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        and A.is_contiguous()
+    ):
+        out = torch.empty_like(A)
+        with torch_device_fn.device(A.device):
+            _launch_direct(A, out)
         return out
     return rsqrt_func_generic(A)
 
 
 def rsqrt_(A):
     logger.debug("GEMS_SPACEMIT RSQRT_")
-    if A.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-        if A.is_contiguous():
-            with torch_device_fn.device(A.device):
-                _launch_direct(A, A)
-            return A
-        A.copy_(rsqrt(A))
+    if (
+        A.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        and A.is_contiguous()
+    ):
+        with torch_device_fn.device(A.device):
+            _launch_direct(A, A)
         return A
     return rsqrt_func_generic(A, out0=A)
