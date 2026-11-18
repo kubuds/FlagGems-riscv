@@ -49,6 +49,9 @@ from ._dispatch import nested_dispatch
 
 _LN_MIN_N = 1 << 15
 _LN_MAX_N = 8192
+# 16-bit carrier is a 128-lane streaming loop with a masked tail, so it does
+# not need the f32 block-size ceiling; the tests exercise N=40999.
+_LN16_MAX_N = 1 << 16
 _SB2 = 512
 # wave15 probe133/134: AB=2048 loses 31% at 2048^2 (4.21 -> 2.90) and 28% at
 # 512x2048 (1.12 -> 0.80); 1024 and 512 tie within 1%.
@@ -202,7 +205,10 @@ def _ln16_ab(n: int) -> int:
 
 
 def _pick_k16(m: int, n: int) -> int:
-    k = 8
+    # wave32 probe322: K=32 wins at every 16-bit shape measured (512^2 0.712 ->
+    # 0.422, 2048^2 3.04 -> 2.24, 8192x512 7.04 -> 4.88, 4096x1024 4.22 ->
+    # 3.07 ms); more rows per program amortises the launch.
+    k = 32
     while k > 1 and m % k:
         k //= 2
     return k
@@ -386,8 +392,8 @@ def lnb_fast_ok(
         return False
     if (
         grad_out.shape != input.shape
-        or grad_out.dtype != torch.float32
-        or input.dtype != torch.float32
+        or input.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        or grad_out.dtype != input.dtype
     ):
         return False
     if not input.is_contiguous() or not grad_out.is_contiguous():
@@ -399,14 +405,19 @@ def lnb_fast_ok(
         n = _prod(normalized_shape)
     except (TypeError, ValueError):
         return False
-    if n <= 0 or n > _LN_MAX_N or numel % n:
+    nmax = _LN16_MAX_N  # the backward kernels are masked streaming loops at any N
+    if n <= 0 or n > nmax or numel % n:
         return False
     m = numel // n
     if not (isinstance(mean, torch.Tensor) and isinstance(rstd, torch.Tensor)):
         return False
     if mean.numel() != m or rstd.numel() != m:
         return False
-    if mean.dtype != torch.float32 or rstd.dtype != torch.float32:
+    if mean.dtype != rstd.dtype or mean.dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ):
         return False
     if not mean.is_contiguous() or not rstd.is_contiguous():
         return False
@@ -415,6 +426,7 @@ def lnb_fast_ok(
             if (
                 not isinstance(t, torch.Tensor)
                 or t.numel() != n
+                or t.dtype != input.dtype
                 or not t.is_contiguous()
             ):
                 return False
@@ -447,6 +459,122 @@ def _ln_bwd_dx_kernel(
     for i in tl.static_range(K):
         row = p * K + i
         base = row * N
+        m = tl.load(Mean + row).to(tl.float32)
+        rs = tl.load(Rstd + row).to(tl.float32)
+        acc2 = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    acc2 += g * w
+                else:
+                    acc2 += g
+            else:
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    acc2 += g * w
+                else:
+                    acc2 += g
+        dx2 = tl.sum(acc2, axis=0)
+        acc3 = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                x = tl.load(X + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                acc3 += dwh * xh
+            else:
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                acc3 += dwh * xh
+        dx3 = tl.sum(acc3, axis=0)
+        for c in range(0, N, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(G + base + offs).to(tl.float32)
+                x = tl.load(X + base + offs).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                dx = rs * (dwh - (dx2 + xh * dx3) / N)
+                tl.store(dX + base + offs, dx.to(dX.dtype.element_ty))
+            else:
+                mm = offs < N
+                g = tl.load(G + base + offs, mask=mm, other=0.0).to(tl.float32)
+                x = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                if HAS_W:
+                    w = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
+                    dwh = g * w
+                else:
+                    dwh = g
+                xh = (x - m) * rs
+                dx = rs * (dwh - (dx2 + xh * dx3) / N)
+                tl.store(
+                    dX + base + offs, dx.to(dX.dtype.element_ty), mask=mm
+                )
+
+
+# ---------------- wave32: 16-bit backward dx carrier ----------------
+# probe320 (same session, common vendor backward -> carrier): dx 512^2 11.22 ->
+# 0.58, 2048^2 45.95 -> 4.25, 512x4096 20.68 -> 3.35, 8192x512 163.0 -> 7.23,
+# 4096x1024 87.8 -> 5.55 ms (5-23x). BN=128 K=16 BLOCK=512; the three-pass
+# structure (acc g*w, acc g*w*xh, apply) beats a fused two-accumulator loop by
+# 2-8% on short rows and ties on long rows, so the f32 layout is reused with
+# fp32 casts on every load. dW/dB reuse _ln_bwd_wb_kernel unchanged: it already
+# accumulates in fp32 and casts on store; 16-bit only needed the gate lifted,
+# plus ROWS=64 and a n/2 column block (probe320 wb: 6-43x over the common path).
+_LN16_BWD_K = 16
+_LN16_BWD_BN = 128
+
+
+def _pick_dx_k16(m: int, n: int) -> int:
+    # wave32 probe323: rows/program 32 for short rows, 16 for n>=2048
+    # (512^2 0.575 -> 0.540, 8192x512 7.23 -> 6.96, 4096x1024 5.55 -> 5.25;
+    # 512x4096 and 2048^2 tie within 1-3%).
+    k = _LN16_BWD_K if n <= 1024 else 16
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
+
+@triton.jit
+def _ln_bwd_dx_kernel_16(
+    G,
+    X,
+    W,
+    Mean,
+    Rstd,
+    dX,
+    N,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NOMASK: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    p = tl.program_id(0)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = row.to(tl.int64) * N
         m = tl.load(Mean + row).to(tl.float32)
         rs = tl.load(Rstd + row).to(tl.float32)
         acc2 = tl.zeros((BLOCK,), dtype=tl.float32)
@@ -623,36 +751,68 @@ def ln_bwd_fast(
     in_grad = None
     if output_mask[0]:
         in_grad = torch.empty_like(x)
-        k = _pick_dx_k(m, n)
+        if x.dtype == torch.float32:
+            k = _pick_dx_k(m, n)
 
-        def _launch_dx():
-            _ln_bwd_dx_kernel[(m // k,)](
-                g2,
-                x2d,
-                w if has_w else x2d,
-                mean,
-                rstd,
-                in_grad.view(m, n),
-                n,
-                K=k,
-                BLOCK=_DX_BLOCK,
-                NOMASK=(n % _DX_BLOCK == 0),
-                HAS_W=has_w,
-            )
+            def _launch_dx():
+                _ln_bwd_dx_kernel[(m // k,)](
+                    g2,
+                    x2d,
+                    w if has_w else x2d,
+                    mean,
+                    rstd,
+                    in_grad.view(m, n),
+                    n,
+                    K=k,
+                    BLOCK=_DX_BLOCK,
+                    NOMASK=(n % _DX_BLOCK == 0),
+                    HAS_W=has_w,
+                )
 
-        if k >= 4:
-            with nested_dispatch(m * n):
+            if k >= 4:
+                with nested_dispatch(m * n):
+                    _launch_dx()
+            else:
                 _launch_dx()
         else:
-            _launch_dx()
+            k16 = _pick_dx_k16(m, n)
+
+            def _launch_dx16():
+                _ln_bwd_dx_kernel_16[(m // k16,)](
+                    g2,
+                    x2d,
+                    w if has_w else x2d,
+                    mean,
+                    rstd,
+                    in_grad.view(m, n),
+                    n,
+                    K=k16,
+                    BLOCK=_DX_BLOCK,
+                    NOMASK=(n % _DX_BLOCK == 0),
+                    HAS_W=has_w,
+                )
+
+            if k16 >= 4:
+                with nested_dispatch(m * n):
+                    _launch_dx16()
+            else:
+                _launch_dx16()
     dW = None
     dB = None
     if output_mask[1] or output_mask[2]:
         # wave13 probe109 P5a: ROWS=32 wins for n>=2048 (2048^2 total
         # 3.95 vs 4.20; 512x2048 1.06 vs 1.07).
-        rows = 32 if n >= 2048 else _DWDB_ROWS
+        if x.dtype == torch.float32:
+            rows = 32 if n >= 2048 else _DWDB_ROWS
+            cb = _DWDB_CB if n >= _DWDB_CB else triton.next_power_of_2(n)
+        else:
+            # probe320 wb scan: ROWS=64 wins at all five shapes; the column
+            # block prefers n itself at 512 and about n/2 above (2048^2 1024
+            # 2.14 vs 2048 2.87; 512x4096 2048 1.05 vs 1024 ~1.1).
+            rows = _DWDB_ROWS
+            nn = triton.next_power_of_2(n)
+            cb = nn if n <= 512 else min(_DWDB_CB, nn // 2)
         nrb = triton.cdiv(m, rows)
-        cb = _DWDB_CB if n >= _DWDB_CB else triton.next_power_of_2(n)
         pw = torch.empty(nrb, n, dtype=torch.float32, device=x.device)
         pb = torch.empty(nrb, n, dtype=torch.float32, device=x.device)
         _ln_bwd_wb_kernel[(nrb, triton.cdiv(n, cb))](
@@ -668,7 +828,7 @@ def ln_bwd_fast(
             CB=cb,
             NOMASK=(n % cb == 0),
         )
-        cb2 = _DWDB_CB if n >= _DWDB_CB else triton.next_power_of_2(n)
+        cb2 = cb
         dW = torch.empty_like(w) if output_mask[1] else pw[0]
         dB = torch.empty_like(b) if output_mask[2] else pb[0]
         _ln_bwd_combine_kernel[(triton.cdiv(n, cb2),)](
