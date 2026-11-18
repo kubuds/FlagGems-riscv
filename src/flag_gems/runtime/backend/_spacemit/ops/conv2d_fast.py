@@ -66,10 +66,17 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
     if dh != 1 or dw != 1:
         return False
-    if x.dtype != torch.float32 or w.dtype != torch.float32:
-        return False
     n, c, h, ww = x.shape
     oc, _, kh, kw = w.shape
+    if x.dtype != torch.float32 or w.dtype != torch.float32:
+        # wave64: the 7x7 / C<=8 stem has no usable vendor path at all in half
+        # precision - f16 measured 372 ms at (1,3,224,224)->64 against 13.8 ms
+        # on the f32 stem route - so it takes an f32 carrier instead of falling
+        # back.  Everything else in half precision stays on the vendor path.
+        return (x.dtype in (torch.float16, torch.bfloat16)
+                and w.dtype == x.dtype and groups == 1
+                and kh == 7 and kw == 7 and c <= 8
+                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
         # wave57: grouped conv ran as g independent (c/g -> oc/g) problems, one
@@ -912,6 +919,14 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # back for A/B.
     if (groups == 1 and C <= 8 and KH == 7 and KW == 7
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
+        if input.dtype != torch.float32:
+            # wave64 carrier: half precision never enters the stem kernels, so
+            # the patch-matrix build and the smt dot stay f32 and only the
+            # boundaries convert (input 0.4 MB, output 12.8 MB f32 -> half).
+            y = _conv_stem_im2col(input.float(), weight.float(),
+                                  bias.float() if bias is not None else None,
+                                  OH, OW, SH, SW, pad_h, pad_w)
+            return y.to(input.dtype)
         return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w)
     x = input.contiguous()
     if pad_h or pad_w:
