@@ -199,6 +199,11 @@ from .binary_fast import (
     where_self_out,
 )
 
+# Direct-kernel log-family fast paths (campaign 1013pm). Imported LAST so the
+# poly-log2 kernels win over the elemwise_nested wrap for the shared names
+# (log, log_).
+from .log_fast import log, log10, log10_, log10_out, log2, log2_, log_
+
 __all__ = [
     "_conv_depthwise2d",
     "addmm",
@@ -312,6 +317,11 @@ __all__ = [
     "exp_out",
     "log",
     "log_",
+    "log2",
+    "log2_",
+    "log10",
+    "log10_",
+    "log10_out",
     "sqrt",
     "sqrt_",
     "reciprocal",
