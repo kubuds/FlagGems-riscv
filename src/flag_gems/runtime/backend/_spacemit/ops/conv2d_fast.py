@@ -2308,6 +2308,7 @@ def dense_g_1x1_applies(n, c, oc, oh, ow, sh, sw, groups) -> bool:
 
 _GEMV_BK = 512
 _GEMV_WARMED = set()
+_MP_SMT_WARMED = set()
 
 
 @triton.jit(do_not_specialize=["K"])
@@ -2404,6 +2405,48 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
 
 
 _MP_TILES = (128, 32, 128)
+_MP_SMT_TILES = (128, 32, 128)
+
+
+@triton.jit(do_not_specialize=["K", "M", "OC"])
+def _conv_mp_smt_kernel(W, X, Bias, Y, K, M, OC,
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                        HAS_BIAS: tl.constexpr):
+    """wave84: the M-pixel im2col GEMM on the smt descriptor path.
+
+    The plain tl.load + tl.dot kernel moves its operands at 1.7 GB/s (wave83's
+    ceiling); the descriptor pipe moves the same [BM,BK] f32 tile at 3.9-4.0
+    GB/s and the whole GEMM at 2.2-2.25 GB/s.  Measured (probe192/195, six
+    rounds): (OC=1024, K=9216, M=9) 22.2 -> 17.1 ms, (K=25600, M=25) 61.8 ->
+    46.7 ms; BM=128/BK=128/micro 8-32-32 is the best of nine configs (BK 64,
+    BM 64+256, BM 32, micro M 16 all lose).  Split-K does not help: 1/2/4/8
+    programs per row block measure 3.87/3.47/3.39/3.24 GB/s, so one program per
+    row block already saturates the pipe.  The B operand is the patch matrix
+    padded to BN=32 columns (M<=25 by the gate), so no load is masked; K must
+    be a multiple of BK and OC a multiple of BM.
+    """
+    pid_oc = tl.program_id(0)
+    a_ptr = tl.make_block_ptr(base=W, shape=[OC, K], strides=[K, 1],
+                              offsets=[pid_oc * BM, 0],
+                              block_shape=[BM, BK], order=[1, 0])
+    b_ptr = tl.make_block_ptr(base=X, shape=[K, BN], strides=[BN, 1],
+                              offsets=[0, 0],
+                              block_shape=[BK, BN], order=[1, 0])
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(0, K, BK):
+        a = smt.view(smt.descriptor_load(a_ptr, (0, 0)), (0, 0),
+                     (BM, BK), (8, 32))
+        b = smt.view(smt.descriptor_load(b_ptr, (0, 0)), (0, 0),
+                     (BK, BN), (32, 32))
+        acc += smt.view(smt.dot(a, b), (0, 0), (BM, BN), (1, 1))
+        a_ptr = tl.advance(a_ptr, (0, BK))
+        b_ptr = tl.advance(b_ptr, (BK, 0))
+    oc = pid_oc * BM + tl.arange(0, BM)
+    if HAS_BIAS:
+        acc += tl.load(Bias + oc)[:, None]
+    m = tl.arange(0, BN)
+    tl.store(Y + oc[:, None] * M + m[None, :], acc, mask=m[None, :] < M)
+
 
 
 def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
@@ -2440,6 +2483,31 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     K = p.shape[0]
     w2 = weight.reshape(OC, K).contiguous()
     y = torch.empty((OC, M), dtype=torch.float32, device=x.device)
+    # wave84: f32 cells take the descriptor path when the shape fits its
+    # constraints (K a multiple of 128, OC a multiple of 32/64/128).  f16 stays
+    # on the plain kernel: a f16 dot measures 0.3 GB/s here and descriptor_load
+    # on f16 aborts spine-opt outright.
+    mp_boc = 0
+    if (smt is not None and x.dtype == torch.float32 and K % 128 == 0
+            and M <= 32
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
+        mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
+                  else 32 if OC % 32 == 0 else 0)
+    if mp_boc:
+        p32 = torch.zeros((K, 32), dtype=torch.float32, device=x.device)
+        p32[:, :M] = p
+        args = (w2, p32, bias if bias is not None else w2, y, K, M, OC)
+        kw = dict(BM=mp_boc, BN=32, BK=128, HAS_BIAS=(bias is not None))
+        _conv_mp_smt_kernel[(OC // mp_boc,)](*args, **kw)
+        # wave70 pattern: a freshly compiled variant can drop the first store
+        # block on this driver, so pay one extra launch the first time.
+        key = (OC, K, M, bias is not None)
+        if key not in _MP_SMT_WARMED:
+            _MP_SMT_WARMED.add(key)
+            _conv_mp_smt_kernel[(OC // mp_boc,)](*args, **kw)
+        y = y.view(1, OC, OH, OW)
+        dt = out_dtype or input.dtype
+        return y if y.dtype == dt else y.to(dt)
     boc, bm, bk = _MP_TILES
     if OC < boc:
         boc = triton.next_power_of_2(OC)
@@ -2483,6 +2551,11 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         return False
     if oc * c * kh * kw * 4 < (8 << 20):
         return False
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FORCE", "0") == "1":
+        # wave84 measurement hook only: admit every structurally valid cell so
+        # the descriptor route can be A/B'd on the cells the wave83 gate
+        # excludes (power-of-two C at small M, 2..15 px).
+        return True
     # A non-power-of-two channel count in the 1024..2048 band pays padding in
     # every streaming route: c1536 3x3 s2 6x6 -> 3x3 187.1 -> 61.5 (3.04x),
     # c1280 5x5 s2 5x5 -> 3x3 436.4 -> 119.2 (3.66x), c1920 3x3 s2 4x4 -> 2x2
