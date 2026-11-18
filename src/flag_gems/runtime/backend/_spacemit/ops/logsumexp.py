@@ -12,16 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vendor logsumexp: trailing-dim row fast path (wave18); generic elsewhere."""
+"""vendor logsumexp: trailing-dim row + dim=0 fast paths (wave18/19).
+
+f16/bf16 inputs run the same f32 kernels into an f32 scratch buffer and are
+cast back in torch - the reduce path cannot store f16 directly on this
+spine-opt build (SIGABRT, wave17 prod finding), and the cast is ~0.01 ms.
+"""
 
 import math
-import os
 
 import torch
 
 from flag_gems.ops.logsumexp import logsumexp as _generic_logsumexp
 
-from .logsumexp_fast import logsumexp_fast_enabled, logsumexp_rows_launch
+from .logsumexp_fast import (
+    logsumexp_dim0_launch,
+    logsumexp_fast_enabled,
+    logsumexp_rows_launch,
+)
+
+_FAST_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _fast_ok(inp) -> bool:
@@ -29,8 +39,12 @@ def _fast_ok(inp) -> bool:
         logsumexp_fast_enabled()
         and inp.is_contiguous()
         and inp.numel() > 0
-        and inp.dtype == torch.float32
+        and inp.dtype in _FAST_DTYPES
     )
+
+
+def _cast(out32, inp):
+    return out32 if out32.dtype == inp.dtype else out32.to(inp.dtype)
 
 
 def logsumexp(inp, dim, keepdim=False):
@@ -48,7 +62,14 @@ def logsumexp(inp, dim, keepdim=False):
         if K == 1 and N > 1:
             out_shape = list(shape)
             out_shape[d] = 1
-            out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
-            if logsumexp_rows_launch(inp, out.view(-1), M, N):
+            out32 = torch.empty(out_shape, dtype=torch.float32, device=inp.device)
+            if logsumexp_rows_launch(inp, out32.view(-1), M, N):
+                out = _cast(out32, inp)
                 return out if keepdim else out.squeeze(d)
+        elif d == 0 and inp.ndim >= 2 and N > 1:
+            out_shape = shape[1:]
+            out32 = torch.empty(out_shape, dtype=torch.float32, device=inp.device)
+            if logsumexp_dim0_launch(inp, out32.view(-1), N, K):
+                out = _cast(out32, inp)
+                return out.unsqueeze(0) if keepdim else out
     return _generic_logsumexp(inp, dim, keepdim)
