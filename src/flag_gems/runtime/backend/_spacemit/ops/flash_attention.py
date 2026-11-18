@@ -165,7 +165,7 @@ def _attn_fwd_inner(
     num_n_tiles: tl.constexpr,
     LO,
     HI,
-    ROW_ZERO: tl.constexpr,
+    ROW_MOD: tl.constexpr,
 ):
     if STAGE == 1:
         tl.static_assert(BLOCK_M >= BLOCK_N)
@@ -184,7 +184,19 @@ def _attn_fwd_inner(
         # never reads past (start_m + 1) * BLOCK_M.  Scanning KV_CTX keys for a
         # one-row decode was 99% masked work (q1 kv2048: 2048 keys scanned to
         # attend to key 0).
-        lo, hi = 0, tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
+        if ROW_MOD > 0:
+            # wave97: a packed block holds whole query groups, so every row's
+            # query position is < ROW_MOD and the block never reads past
+            # ROW_MOD keys however many rows it packs (q8 kv2048 used to scan
+            # 64 keys for 8 queries; now it scans 8).
+            # keep the bound a runtime value: folding it to a constant 1
+            # aborts spine-opt on a KV_CTX == 1 descriptor (expected
+            # tensor<?x1x32x8>, got 4x4x32x8), so clamp the old runtime
+            # expression instead of using ROW_MOD directly
+            hi = tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
+            lo, hi = 0, tl.minimum(hi, ROW_MOD)
+        else:
+            lo, hi = 0, tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
     else:
         lo, hi = 0, KV_CTX
 
@@ -199,13 +211,13 @@ def _attn_fwd_inner(
     # columns <= i; there is no KV_CTX - Q_CTX shift here.
     causal_offset = 0
     # per-row causal bound, built once per task instead of once per KV block
-    if ROW_ZERO:
-        # wave96: a packed GQA decode (q_len == 1) puts one query head per row,
-        # and every one of those rows is query position 0.  The default bound
-        # would read the packed row index as the query position and let row r
-        # see keys <= r.  Force all rows to key 0, which is exactly torch's
-        # causal mask for a one-token query.
-        row_end_2d = tl.zeros((BLOCK_M, 1), dtype=tl.int32)
+    if ROW_MOD > 0:
+        # wave96/97: a packed GQA block puts whole (head, query) groups on the
+        # M axis, so row r is query position r % nq, not row r.  nq == 1 (the
+        # decode case) collapses to all-zero, which is exactly torch's causal
+        # mask for a one-token query.  Reading the packed row index as the
+        # query position would let row r see keys <= r.
+        row_end_2d = (offs_m % ROW_MOD)[:, None] + causal_offset
     else:
         row_end_2d = offs_m[:, None] + causal_offset
 
@@ -309,7 +321,7 @@ def _attn_fwd(
     MICRO_N: tl.constexpr,
     num_ctas: tl.constexpr,
     ALT: tl.constexpr,
-    ROW_ZERO: tl.constexpr,
+    ROW_MOD: tl.constexpr,
 ):
     NUM_BLOCKS_M = tl.cdiv(Q_CTX, BLOCK_M)
     NUM_BLOCKS = NUM_BLOCKS_M * Z * H_Q
@@ -417,7 +429,7 @@ def _attn_fwd(
                 BLOCK_N // MICRO_N,
                 0,
                 0,
-                ROW_ZERO,
+                ROW_MOD,
             )
         else:
             if STAGE & 1:
@@ -445,7 +457,7 @@ def _attn_fwd(
                     BLOCK_N // MICRO_N,
                     0,
                     0,
-                    ROW_ZERO,
+                    ROW_MOD,
                 )
             if STAGE & 2:
                 acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
@@ -472,7 +484,7 @@ def _attn_fwd(
                     BLOCK_N // MICRO_N,
                     0,
                     0,
-                    ROW_ZERO,
+                    ROW_MOD,
                 )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -740,10 +752,11 @@ _PLAN_KEYS = (
     "FLAGGEMS_SPACEMIT_ATTN_NS",
     "FLAGGEMS_SPACEMIT_ATTN_ALT",
     "FLAGGEMS_SPACEMIT_ATTN_SPLIT",
+    "FLAGGEMS_SPACEMIT_ATTN_PACK_BN",
 )
 
 
-def _plan(q, k, v, is_causal, group_size):
+def _plan(q, k, v, is_causal, group_size, row_mod=0):
     """Tiles, grid, stage and split for one attention call.
 
     Pure function of the call signature; the decode path runs it on every
@@ -761,6 +774,7 @@ def _plan(q, k, v, is_causal, group_size):
         k.shape[-1],
         bool(is_causal),
         group_size,
+        row_mod,
     )
     live = any(os.environ.get(n) for n in _PLAN_KEYS) or _env_int(
         "FLAGGEMS_SPACEMIT_ATTN_HOSTFAST", 1
@@ -817,6 +831,14 @@ def _plan(q, k, v, is_causal, group_size):
         else:
             block_m = bm
             block_n = min(256, max(32, triton.next_power_of_2(kv_ctx)))
+    if row_mod > 0 and is_causal:
+        # wave97: the packed causal scan stops at nq keys, so the default
+        # 256-wide N tile spends 8x the dot on masked columns; 32 is the
+        # narrowest tile the backend accepts (BN 16 aborts, wave80)
+        pack_bn = _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK_BN", 32)
+        if pack_bn > 0:
+            block_n = min(block_n, pack_bn)
+
     num_ctas = _env_int("FLAGGEMS_SPACEMIT_ATTN_CTAS", 0)
     micro_m, micro_k, micro_n = _micros_for(q.dtype)
     # the f16 micro group is 16 rows; an 8-row outer tile (decode) uses the
@@ -834,7 +856,10 @@ def _plan(q, k, v, is_causal, group_size):
     # causal: square shapes split the KV range into a prefix and a diagonal pass
     # (STAGE 3 = both); non-square shapes keep one masked pass, but it stops at
     # the last query row of the block instead of scanning the whole KV (STAGE 7)
-    stage = 3 if (q_ctx_run == kv_ctx) else 7
+    # a packed causal block maps row -> query position itself, so it can never
+    # take the square prefix+diagonal split (that split assumes row i is query
+    # i); it always uses the masked pass, whose bound is ROW_MOD
+    stage = 3 if (q_ctx_run == kv_ctx and row_mod == 0) else 7
     if not is_causal:
         stage = 1
 
@@ -906,7 +931,7 @@ def _plan(q, k, v, is_causal, group_size):
     return plan
 
 
-def _launch(q, k, v, sm_scale, is_causal, group_size, row_zero=False):
+def _launch(q, k, v, sm_scale, is_causal, group_size, row_mod=0):
     """Mirror of Attention.forward without autograd; returns the output tensor."""
     (
         head_dim,
@@ -927,7 +952,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size, row_zero=False):
         q_ctx_run,
         split_ns,
         split_chunk,
-    ) = _plan(q, k, v, is_causal, group_size)
+    ) = _plan(q, k, v, is_causal, group_size, row_mod)
 
     if padded:
         q_run = torch.zeros(
@@ -987,7 +1012,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size, row_zero=False):
             MICRO_N=micro_n,
             num_ctas=num_ctas,
             ALT=alt,
-            ROW_ZERO=row_zero,
+            ROW_MOD=row_mod,
             num_warps=8,
             num_stages=3,
         )
@@ -1152,15 +1177,18 @@ class Attention(torch.autograd.Function):
         # A (b, H_Q, nq, d) contiguous query is (b, H_KV, GROUP_SIZE*nq, d) with
         # the packed rows being (head, query) pairs, so this is a pure re-view:
         # each packed row keeps its own score row, only K/V is shared, which is
-        # what GQA already guarantees.  Causal is safe only when nq == 1: every
-        # packed row is then query position 0, and the kernel's ROW_ZERO flag
-        # pins the causal bound to key 0 for all of them (a packed row index is
-        # NOT a query position).
+        # what GQA already guarantees.  Causal needs the kernel to know where
+        # each packed row sits on the query axis: row r is query r % nq, which
+        # ROW_MOD hands to the mask (wave97 extends this from decode-only to
+        # nq <= 16; the packed bound stays a single 32-wide KV tile).
         if (
             group_size > 1
             and q.is_contiguous()
-            and q.shape[2] * group_size <= 32
-            and (not is_causal or q.shape[2] == 1)
+            # plain packing only fills the padding rows of a short query, so it
+            # pays up to 32 rows; causal packing also collapses the KV scan to
+            # nq keys, which is worth a 64-row block (wave97)
+            and q.shape[2] * group_size <= (64 if is_causal else 32)
+            and (not is_causal or q.shape[2] <= min(16, k.shape[2]))
             and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK", 1) != 0
         ):
             b, hq, nq, hd = q.shape
@@ -1171,7 +1199,7 @@ class Attention(torch.autograd.Function):
                 float(sm_scale),
                 is_causal,
                 1,
-                row_zero=is_causal,
+                row_mod=(nq if is_causal else 0),
             )
             return out.view(b, hq, nq, hd)
 
