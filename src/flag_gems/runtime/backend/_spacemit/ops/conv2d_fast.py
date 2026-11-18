@@ -2409,6 +2409,17 @@ _MP_SMT_TILES = (128, 32, 128)
 _MP_SMT_MAXM = 64
 
 
+def _mp_smt_bk(k=None):
+    """wave86: descriptor K-block width for the im2col GEMM.
+
+    FLAGGEMS_SPACEMIT_CONV_MP_BK pins 64/128 for the A/B; 0 keeps 128.  The
+    single-group route needs K to be a multiple of it (it does not pad K); the
+    grouped route pads Kg up to one.
+    """
+    want = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_BK", "0") or 0)
+    return want if want > 0 else 128
+
+
 @triton.jit(do_not_specialize=["K", "M", "OC"])
 def _conv_mp_smt_kernel(W, X, Bias, Y, K, M, OC,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -2533,51 +2544,62 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     N, C, H, W = input.shape
     OC = weight.shape[0]
     M = OH * OW
+    NCOL = N * M
     x = input.contiguous()
-    p = torch.nn.functional.unfold(
+    cols = torch.nn.functional.unfold(
         x, kernel_size=(KH, KW), dilation=(dil_h, dil_w),
-        padding=(pad_h, pad_w), stride=(SH, SW))[0].contiguous()
-    K = p.shape[0]
+        padding=(pad_h, pad_w), stride=(SH, SW))
+    if N > 1:
+        # wave86: fold the batch into the column axis.  Every streaming route
+        # launches once per item, so a batched small-output conv re-reads the
+        # whole weight N times; one GEMM over N*M columns reads it once.
+        cols = cols.permute(1, 0, 2).reshape(cols.shape[1], NCOL).contiguous()
+    else:
+        cols = cols[0].contiguous()
+    K = cols.shape[0]
     w2 = weight.reshape(OC, K).contiguous()
-    y = torch.empty((OC, M), dtype=torch.float32, device=x.device)
+    y = torch.empty((OC, NCOL), dtype=torch.float32, device=x.device)
     # wave84: f32 cells take the descriptor path when the shape fits its
     # constraints (K a multiple of 128, OC a multiple of 32/64/128).  f16 stays
     # on the plain kernel: a f16 dot measures 0.3 GB/s here and descriptor_load
     # on f16 aborts spine-opt outright.
     mp_boc = 0
-    if (smt is not None and x.dtype == torch.float32 and K % 128 == 0
+    mp_bk = _mp_smt_bk(K)
+    if (smt is not None and x.dtype == torch.float32
+            and K % mp_bk == 0
             and M <= _MP_SMT_MAXM
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
         mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
                   else 32 if OC % 32 == 0 else 0)
     if mp_boc:
-        mpad = 32 if M <= 32 else 64
+        mpad = (32 if NCOL <= 32 else 64 if NCOL <= 64 else 128
+                if NCOL <= 128 else 256)
         p32 = torch.zeros((K, mpad), dtype=torch.float32, device=x.device)
-        p32[:, :M] = p
-        args = (w2, p32, bias if bias is not None else w2, y, K, M, OC)
-        kw = dict(BM=mp_boc, BN=32, BK=128, MPAD=mpad,
+        p32[:, :NCOL] = cols
+        args = (w2, p32, bias if bias is not None else w2, y, K, NCOL, OC)
+        kw = dict(BM=mp_boc, BN=32, BK=mp_bk, MPAD=mpad,
                   HAS_BIAS=(bias is not None))
-        grid = (triton.cdiv(M, 32), OC // mp_boc)
+        grid = (triton.cdiv(NCOL, 32), OC // mp_boc)
         _conv_mp_smt_kernel[grid](*args, **kw)
         # wave70 pattern: a freshly compiled variant can drop the first store
         # block on this driver, so pay one extra launch the first time.
-        key = (OC, K, M, bias is not None)
+        key = (OC, K, NCOL, bias is not None, mp_bk)
         if key not in _MP_SMT_WARMED:
             _MP_SMT_WARMED.add(key)
             _conv_mp_smt_kernel[grid](*args, **kw)
-        y = y.view(1, OC, OH, OW)
+        y = y.view(OC, N, M).permute(1, 0, 2).reshape(N, OC, OH, OW)
         dt = out_dtype or input.dtype
         return y if y.dtype == dt else y.to(dt)
     boc, bm, bk = _MP_TILES
     if OC < boc:
         boc = triton.next_power_of_2(OC)
-    nomask = (K % bk == 0) and (M % bm == 0) and (OC % boc == 0)
-    _conv1x1_kernel[(triton.cdiv(M, bm), triton.cdiv(OC, boc), 1)](
-        p, w2, bias if bias is not None else w2, y, K, M, OC,
-        p.stride(0), y.stride(0),
+    nomask = (K % bk == 0) and (NCOL % bm == 0) and (OC % boc == 0)
+    _conv1x1_kernel[(triton.cdiv(NCOL, bm), triton.cdiv(OC, boc), 1)](
+        cols, w2, bias if bias is not None else w2, y, K, NCOL, OC,
+        cols.stride(0), y.stride(0),
         BLOCK_OC=boc, BLOCK_M=bm, BLOCK_K=bk,
         HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=False)
-    y = y.view(1, OC, OH, OW)
+    y = y.view(OC, N, M).permute(1, 0, 2).reshape(N, OC, OH, OW)
     dt = out_dtype or input.dtype
     return y if y.dtype == dt else y.to(dt)
 
@@ -2598,23 +2620,32 @@ def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     CG = C // groups
     OCG = OC // groups
     M = OH * OW
+    NCOL = N * M
     Kg = CG * KH * KW
     x = input.contiguous()
     cols = torch.nn.functional.unfold(
         x, kernel_size=(KH, KW), dilation=(dil_h, dil_w),
-        padding=(pad_h, pad_w), stride=(SH, SW))[0].contiguous()
-    y = torch.empty((OC, M), dtype=torch.float32, device=x.device)
+        padding=(pad_h, pad_w), stride=(SH, SW))
+    if N > 1:
+        # wave86: batch folding, same as the single-group route.
+        cols = cols.permute(1, 0, 2).reshape(cols.shape[1], NCOL).contiguous()
+    else:
+        cols = cols[0].contiguous()
+    y = torch.empty((OC, NCOL), dtype=torch.float32, device=x.device)
     mp_boc = 0
-    Kp = (Kg + 127) // 128 * 128
-    if (smt is not None and x.dtype == torch.float32 and M <= _MP_SMT_MAXM
+    mp_bk = _mp_smt_bk(Kg)
+    Kp = ((Kg + mp_bk - 1) // mp_bk * mp_bk) if mp_bk else 0
+    if (smt is not None and x.dtype == torch.float32 and mp_bk
+            and M <= _MP_SMT_MAXM
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_SMT", "1") != "0"):
         mp_boc = (128 if OCG % 128 == 0 else 64 if OCG % 64 == 0
                   else 32 if OCG % 32 == 0 else 0)
     if mp_boc:
-        mpad = 32 if M <= 32 else 64
+        mpad = (32 if NCOL <= 32 else 64 if NCOL <= 64 else 128
+                if NCOL <= 128 else 256)
         p32 = torch.zeros((groups, Kp, mpad), dtype=torch.float32,
                           device=x.device)
-        p32[:, :Kg, :M] = cols.view(groups, Kg, M)
+        p32[:, :Kg, :NCOL] = cols.view(groups, Kg, NCOL)
         if Kp == Kg:
             wp = weight.reshape(OC, Kg)
             if not wp.is_contiguous():
@@ -2623,35 +2654,35 @@ def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
             wp = torch.zeros((groups, OCG, Kp), dtype=torch.float32,
                              device=x.device)
             wp[:, :, :Kg] = weight.reshape(groups, OCG, Kg)
-        args = (wp, p32, bias if bias is not None else wp, y, Kp, M, OCG)
-        kw = dict(BM=mp_boc, BN=32, BK=128, MPAD=mpad,
+        args = (wp, p32, bias if bias is not None else wp, y, Kp, NCOL, OCG)
+        kw = dict(BM=mp_boc, BN=32, BK=mp_bk, MPAD=mpad,
                   HAS_BIAS=(bias is not None))
-        grid = (triton.cdiv(M, 32), OCG // mp_boc, groups)
+        grid = (triton.cdiv(NCOL, 32), OCG // mp_boc, groups)
         _conv_mp_smt_g_kernel[grid](*args, **kw)
-        key = ("g", OC, C, Kg, M, groups, bias is not None)
+        key = ("g", OC, C, Kg, NCOL, groups, bias is not None, mp_bk)
         if key not in _MP_SMT_WARMED:
             _MP_SMT_WARMED.add(key)
             _conv_mp_smt_g_kernel[grid](*args, **kw)
-        y = y.view(1, OC, OH, OW)
+        y = y.view(OC, N, M).permute(1, 0, 2).reshape(N, OC, OH, OW)
         dt = out_dtype or input.dtype
         return y if y.dtype == dt else y.to(dt)
     # safety net: no descriptor path -> one plain-dot GEMM per group
     boc, bm, bk = _MP_TILES
     if OCG < boc:
         boc = triton.next_power_of_2(OCG)
-    nomask = (Kg % bk == 0) and (M % bm == 0) and (OCG % boc == 0)
+    nomask = (Kg % bk == 0) and (NCOL % bm == 0) and (OCG % boc == 0)
     wg = weight.reshape(OC, Kg)
-    cols3 = cols.view(groups, Kg, M)
+    cols3 = cols.view(groups, Kg, NCOL)
     for gi in range(groups):
         yg = y[gi * OCG:(gi + 1) * OCG]
         bg = (bias[gi * OCG:(gi + 1) * OCG] if bias is not None
               else wg[gi * OCG:(gi + 1) * OCG])
-        _conv1x1_kernel[(triton.cdiv(M, bm), triton.cdiv(OCG, boc), 1)](
-            cols3[gi], wg[gi * OCG:(gi + 1) * OCG], bg, yg, Kg, M, OCG,
+        _conv1x1_kernel[(triton.cdiv(NCOL, bm), triton.cdiv(OCG, boc), 1)](
+            cols3[gi], wg[gi * OCG:(gi + 1) * OCG], bg, yg, Kg, NCOL, OCG,
             cols3[gi].stride(0), yg.stride(0),
             BLOCK_OC=boc, BLOCK_M=bm, BLOCK_K=bk,
             HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=False)
-    y = y.view(1, OC, OH, OW)
+    y = y.view(OC, N, M).permute(1, 0, 2).reshape(N, OC, OH, OW)
     dt = out_dtype or input.dtype
     return y if y.dtype == dt else y.to(dt)
 
@@ -2670,7 +2701,7 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     """
     if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG", "1") == "0":
         return False
-    if n != 1 or groups < 2:
+    if n < 1 or groups < 2:
         return False
     if (kh, kw) not in _TAP_KERNELS or dil_h != dil_w:
         return False
@@ -2680,7 +2711,21 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     if cg < 16 or ocg < 32:
         return False
     m = oh * ow
-    if not (2 <= m <= 32):
+    if n > 1:
+        # wave86: batch folding as in conv_mp_applies; measured live -> fold
+        # N=4 g8 c512 3x3 s2 6->2 13.7 -> 3.5 ms.
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "256") or 256)
+        if n * m > mx:
+            return False
+        if ((n * m + 31) // 32) * 2 > 5 * n:
+            return False
+        if ocg % 32:
+            return False
+        if sh * sw > 4:
+            return False
+        return oc * cg * kh * kw * 4 >= (1 << 18)
+    mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_MAXM", "32") or 32)
+    if not (2 <= m <= mx):
         return False
     if sh * sw > 4:
         return False
@@ -2689,9 +2734,10 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     # a 5x5 output is the one band where the grouped phase kernel is already
     # tight: g8 c256 5x5 s1 5->5 (0.8 MB) measured 1.82 live against 1.94 here
     # (0.94x) - the unfold, patch and weight pad add 0.9 ms of fixed cost to a
-    # 0.68 ms kernel.  Keep those on phase_g.
-    if m >= 25 and conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw,
-                                        groups):
+    # 0.68 ms kernel.  Keep those on phase_g.  wave86: scoped to the 25..32
+    # band it was measured on; the 33..64 band is measured separately.
+    if 25 <= m <= 32 and conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh,
+                                              sw, groups):
         return False
     return True
 
@@ -2709,13 +2755,36 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
     """
     if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP", "1") == "0":
         return False
-    if n != 1 or groups != 1:
+    if groups != 1 or n < 1:
         return False
     if (kh, kw) not in _TAP_KERNELS or dil_h != dil_w:
         return False
     if not (3 <= c <= 2048) or oc < 32:
         return False
     m = oh * ow
+    if n > 1:
+        # wave86: the batch folds into the column axis, so the weight is read
+        # once for all N items instead of once per item.  Measured live -> fold
+        # on the descriptor kernel, ms: N=8 c1024 3x3 s2 4->2 160.8 -> 17.3
+        # (9.3x), N=8 c512 5x5 s2 6->2 117.8 -> 12.7 (9.3x), N=4 c2048 3x3 s2
+        # 6->3 1028.6 -> 108.4 (9.5x), N=8 c1024 3x3 s2 4->1 157.2 -> 17.9
+        # (8.8x), N=2 c1024 3x3 s1 7->7 98.9 -> 67.9 (1.46x), N=4 c512 3x3 s2
+        # 14->7 37.3 -> 20.7 (1.80x).  The column count bounds the weight
+        # re-reads (one pass per 32-column block), so the band stops where the
+        # last measured win was.
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "256") or 256)
+        if n * m > mx:
+            return False
+        # one weight pass per 32-column block against N passes on the per-item
+        # routes: measured wins are 1.5-9.8x while passes <= 2.5N (N=4 at 256
+        # columns 2.64x, N=2 at 324 columns 0.96x).
+        if ((n * m + 31) // 32) * 2 > 5 * n:
+            return False
+        if (c * kh * kw) % 128 or oc % 32:
+            return False
+        if sh * sw > 4:
+            return False
+        return oc * c * kh * kw * 4 >= (1 << 20)
     # 25 is the largest measured win (5x5 s2 9x9 -> 3x3); at M=49 the same
     # route loses on 5x5 (c1024 5x5 s1 7x7 106.3 -> 118.9) and only wins 1.16x
     # on 3x3, so the band stops at 25.
