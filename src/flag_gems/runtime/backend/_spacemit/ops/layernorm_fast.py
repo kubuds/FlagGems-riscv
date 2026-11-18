@@ -1069,6 +1069,144 @@ def _ln_bwd_narrow_kernel(
     tl.store(dBp + p * BN + cols, tl.sum(g, axis=0))
 
 
+@triton.jit
+def _ln_bwd_narrow_dot_kernel(
+    G,
+    X,
+    W,
+    Mean,
+    Rstd,
+    dX,
+    dWp,
+    dBp,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    """wave43: the same tile as _ln_bwd_narrow_kernel with dot-based reductions.
+
+    probe462/463b: on this backend a tl.sum(axis=1) over 32/64 lanes costs
+    0.15-0.28 ms per pass on a (BM,BN) tile - the whole elementwise body is
+    0.23-0.29 - and a manual reshape tree is 1.4x worse than tl.sum.  tl.dot
+    with an all-ones (BN,BN) block returns (BM,BN) with every element already
+    holding its row sum, so the apply needs neither a horizontal reduce nor a
+    broadcast: probe464 (2048,32) f32 0.530 -> 0.363, (2048,64) 0.880 -> 0.698,
+    f16 0.588 -> 0.381 / 0.971 -> 0.743, bit-identical output.
+    The column partials go through dot with (16,BM) ones; only row 0 of the
+    (16,BN) result is stored (mask), so the combine kernel is unchanged.
+    probe465 whole fused path: 1.19-1.50x over the tl.sum form at every
+    official narrow shape, f32 and f16.
+    """
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    g = tl.reshape(tl.load(G + idx).to(tl.float32), (BM, BN))
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    cols = tl.arange(0, BN)
+    if HAS_W:
+        w = tl.load(W + cols).to(tl.float32)[None, :]
+        dwh = g * w
+    else:
+        dwh = g
+    rows = p * BM + tl.arange(0, BM)
+    mu = tl.load(Mean + rows).to(tl.float32)[:, None]
+    rs = tl.load(Rstd + rows).to(tl.float32)[:, None]
+    xh = (x - mu) * rs
+    ones = tl.full((BN, BN), 1.0, tl.float32)
+    s2 = tl.dot(dwh, ones, input_precision="ieee")
+    s3 = tl.dot(dwh * xh, ones, input_precision="ieee")
+    dx = rs * (dwh - (s2 + xh * s3) / N)
+    tl.store(dX + idx, tl.reshape(dx, (BM * BN,)).to(dX.dtype.element_ty))
+    rowsel = (tl.arange(0, 16) == 0)[:, None]
+    ox = tl.full((16, BM), 1.0, tl.float32)
+    zrow = tl.zeros((16, 1), tl.int32)
+    tl.store(
+        dWp + p * BN + zrow + cols[None, :],
+        tl.dot(ox, g * xh, input_precision="ieee"),
+        mask=rowsel,
+    )
+    tl.store(
+        dBp + p * BN + zrow + cols[None, :],
+        tl.dot(ox, g, input_precision="ieee"),
+        mask=rowsel,
+    )
+
+
+@triton.jit
+def _ln_bwd_narrow_dot16_kernel(
+    G,
+    X,
+    W,
+    Mean,
+    Rstd,
+    dX,
+    dWp,
+    dBp,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    """wave43 probe469: dot body with the full (16,BN) column block stored.
+
+    The row-0 masked store in _ln_bwd_narrow_dot_kernel makes the compiler
+    write 16 identical addresses; storing the whole block and reading row 0 of
+    each block back in the combine is 3-6% faster at kernel level (2048,32
+    0.534 -> 0.514; 2048,64 1.015 -> 0.957; 4096,64 1.734 -> 1.677 f32,
+    similar f16).
+    """
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    g = tl.reshape(tl.load(G + idx).to(tl.float32), (BM, BN))
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    cols = tl.arange(0, BN)
+    if HAS_W:
+        w = tl.load(W + cols).to(tl.float32)[None, :]
+        dwh = g * w
+    else:
+        dwh = g
+    rows = p * BM + tl.arange(0, BM)
+    mu = tl.load(Mean + rows).to(tl.float32)[:, None]
+    rs = tl.load(Rstd + rows).to(tl.float32)[:, None]
+    xh = (x - mu) * rs
+    ones = tl.full((BN, BN), 1.0, tl.float32)
+    s2 = tl.dot(dwh, ones, input_precision="ieee")
+    s3 = tl.dot(dwh * xh, ones, input_precision="ieee")
+    dx = rs * (dwh - (s2 + xh * s3) / N)
+    tl.store(dX + idx, tl.reshape(dx, (BM * BN,)).to(dX.dtype.element_ty))
+    ox = tl.full((16, BM), 1.0, tl.float32)
+    acc = tl.arange(0, 16)[:, None] * BN + cols[None, :]
+    tl.store(
+        dWp + p * 16 * BN + acc,
+        tl.dot(ox, g * xh, input_precision="ieee"),
+    )
+    tl.store(
+        dBp + p * 16 * BN + acc,
+        tl.dot(ox, g, input_precision="ieee"),
+    )
+
+
+@triton.jit
+def _ln_bwd_combine16_kernel(
+    PW,
+    PB,
+    dW,
+    dB,
+    N,
+    NRB: tl.constexpr,
+    BLK: tl.constexpr,
+):
+    """Combine for _ln_bwd_narrow_dot16_kernel: row 0 of each (16,BLK) block."""
+    cols = tl.arange(0, BLK)
+    accW = tl.zeros((BLK,), dtype=tl.float32)
+    accB = tl.zeros((BLK,), dtype=tl.float32)
+    for s in range(0, NRB):
+        accW += tl.load(PW + s * 16 * N + cols)
+        accB += tl.load(PB + s * 16 * N + cols)
+    tl.store(dW + cols, accW.to(dW.dtype.element_ty), mask=cols < N)
+    tl.store(dB + cols, accB.to(dB.dtype.element_ty), mask=cols < N)
+
+
 # ---------------- wave32: 16-bit backward dx carrier ----------------
 # probe320 (same session, common vendor backward -> carrier): dx 512^2 11.22 ->
 # 0.58, 2048^2 45.95 -> 4.25, 512x4096 20.68 -> 3.35, 8192x512 163.0 -> 7.23,
@@ -1315,42 +1453,94 @@ def ln_bwd_fast(
             want_w = bool(output_mask[1]) and has_w
             want_b = bool(output_mask[2]) and b is not None
             if want_w or want_b:
-                pw = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
-                pb = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
-                dW = torch.empty_like(w) if want_w else pw[0]
-                dB = torch.empty_like(b) if want_b else pb[0]
-                with nested_dispatch(m * n):
-                    _ln_bwd_narrow_kernel[(np_t,)](
-                        g2,
-                        x2d,
-                        w if has_w else x2d,
-                        mean,
-                        rstd,
-                        in_grad.view(m, n),
-                        pw,
-                        pb,
-                        n,
-                        BM=bm_t,
-                        BN=bn_t,
-                        HAS_W=has_w,
+                # wave43: dot-based reductions need 16 lanes in every dot
+                # dimension, so only BN>=16 takes this body (4/8 lanes keep
+                # the tl.sum tile).  LN_DOT=0 forces the old body, =2 selects
+                # the full (16,BN) partial store + strided combine, which
+                # probe469 measured 3-6% faster than the row-0 masked store.
+                mode = os.environ.get("FLAGGEMS_SPACEMIT_LN_DOT", "1")
+                dW = (
+                    torch.empty_like(w)
+                    if want_w
+                    else torch.empty(n, dtype=x.dtype, device=x.device)
+                )
+                dB = (
+                    torch.empty_like(b)
+                    if want_b
+                    else torch.empty(n, dtype=x.dtype, device=x.device)
+                )
+                if mode == "2" and bn_t >= 16:
+                    pw = torch.empty(
+                        np_t, 16, n, dtype=torch.float32, device=x.device
                     )
-                    # wave40 probe429: a plain launch that follows a nested one
-                    # is not ordered against it, and the combine reads pw.  A
-                    # nested launch inside the same block is (probe429: the
-                    # (2048,32) f16 tile-then-plain-combine arrangement returned
-                    # dw 4.5e2 on the first backward of a process, same-block
-                    # nested 2.8e-2, four reps each).  Keep both launches under
-                    # one dispatcher dialogue.
-                    _ln_bwd_combine_kernel[(1,)](
-                        pw,
-                        pb,
-                        dW,
-                        dB,
-                        n,
-                        NRB=np_t,
-                        CB2=bn_t,
-                        NOMASK=True,
+                    pb = torch.empty(
+                        np_t, 16, n, dtype=torch.float32, device=x.device
                     )
+                    with nested_dispatch(m * n):
+                        _ln_bwd_narrow_dot16_kernel[(np_t,)](
+                            g2,
+                            x2d,
+                            w if has_w else x2d,
+                            mean,
+                            rstd,
+                            in_grad.view(m, n),
+                            pw,
+                            pb,
+                            n,
+                            BM=bm_t,
+                            BN=bn_t,
+                            HAS_W=has_w,
+                        )
+                        _ln_bwd_combine16_kernel[(1,)](
+                            pw,
+                            pb,
+                            dW,
+                            dB,
+                            n,
+                            NRB=np_t,
+                            BLK=bn_t,
+                        )
+                else:
+                    pw = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
+                    pb = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
+                    kern = (
+                        _ln_bwd_narrow_dot_kernel
+                        if (mode != "0" and bn_t >= 16)
+                        else _ln_bwd_narrow_kernel
+                    )
+                    with nested_dispatch(m * n):
+                        kern[(np_t,)](
+                            g2,
+                            x2d,
+                            w if has_w else x2d,
+                            mean,
+                            rstd,
+                            in_grad.view(m, n),
+                            pw,
+                            pb,
+                            n,
+                            BM=bm_t,
+                            BN=bn_t,
+                            HAS_W=has_w,
+                        )
+                        # wave40 probe429: a plain launch that follows a nested
+                        # one is not ordered against it, and the combine reads
+                        # pw.  A nested launch inside the same block is
+                        # (probe429: the (2048,32) f16 tile-then-plain-combine
+                        # arrangement returned dw 4.5e2 on the first backward
+                        # of a process, same-block nested 2.8e-2, four reps
+                        # each).  Keep both launches under one dispatcher
+                        # dialogue.
+                        _ln_bwd_combine_kernel[(1,)](
+                            pw,
+                            pb,
+                            dW,
+                            dB,
+                            n,
+                            NRB=np_t,
+                            CB2=bn_t,
+                            NOMASK=True,
+                        )
                 if not want_w:
                     dW = None
                 if not want_b:
