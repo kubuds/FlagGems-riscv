@@ -48,13 +48,26 @@ import triton.language as tl
 from ._dispatch import nested_dispatch
 
 _LN_MIN_N = 1 << 15
+# wave35 probe357: the 16-bit carrier wins from 4096 elements up - official
+# core shape (4,16,64,4) has numel 16384 and runs 0.472 ms on the common
+# kernel against 0.107 at K2 (4.4x) - while f32 at the same sizes loses
+# (M4/N4096 0.079 common vs 0.106 carrier, M1 0.042 vs 0.098), so the floor
+# is dtype aware.
+_LN_MIN_N_16 = 1 << 12
 _LN_MAX_N = 8192
+# wave35 probe362 (flag_gems.use_gems A/B): the f32 fast kernel loses to the
+# 16-bit carrier from 6144 columns on (M16/N6144 fast 0.581 vs carrier 0.379
+# at N=11264, and 0.94x at 6144), so f32 switches to the carrier above 4096.
+_F32_FAST_MAX_N = 4096
 # 16-bit carrier is a 128-lane streaming loop with a masked tail, so it does
 # not need the f32 block-size ceiling; the tests exercise N=40999.
 # wave34 probe346: (16,8,128,128) normalizes over [8,128,128] = 131072
 # columns; the generic f16 kernel takes 29.4 ms there, the carrier 2.22 ms
 # (13x), so the ceiling moves to 262144.
-_LN16_MAX_N = 1 << 18
+# wave35 probe356/357: the last official core shape (20,6,65536) is 393216
+# columns; the carrier runs it in 8.05 ms f16 (common kernel 8.5-9.4 ms), so
+# the ceiling moves to 1M.  f32 takes the split-N path below instead.
+_LN16_MAX_N = 1 << 20
 # f32 above _LN_MAX_N also uses the streaming carrier (probe346: 5.14 -> 2.58
 # ms at (16,8,128,128) f32) because the f32 fast kernel would allocate a
 # next_power_of_2(n) accumulator.
@@ -91,13 +104,25 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
     if not input.is_contiguous():
         return False
     numel = input.numel()
-    if numel < _LN_MIN_N:
-        return False
     try:
         n = _prod(normalized_shape)
     except (TypeError, ValueError):
         return False
     if n <= 0 or numel % n:
+        return False
+    m = numel // n
+    # wave35 probe362 (flag_gems.use_gems A/B): fast on vs off on the same
+    # build, 3 alternating passes - f16 (4,16,64,4) 1.22x, (16,16,128) 1.13x,
+    # (20,6,65536) 1.90x; f16 (16,16,8,48)/(16,16,8,88) are ties within the
+    # run-to-run spread (0.98/0.99), and f32 (16,16,8,48) prefers the carrier
+    # over the old f32 fast kernel (0.94x), hence _F32_FAST_MAX_N.
+    # f32 keeps the old numel floor: the fast kernel loses when a whole row
+    # fits in one 4096-element block and the op is dispatch bound.
+    if input.dtype == torch.float32:
+        if n <= 4096 and numel < (1 << 16):
+            return False
+    floor = _LN_MIN_N if input.dtype == torch.float32 else _LN_MIN_N_16
+    if numel < floor:
         return False
     # wave33: the 16-bit carrier is no longer capped at _LN_MAX_N - the
     # aligned kernel covers any N up to 65536 (official bench (16,8,128,128)
@@ -230,6 +255,15 @@ def _pick_k16(m: int, n: int) -> int:
     return min(k, max(1, m // 8))
 
 
+def _ln16_tiles(n: int):
+    """(BN, AB) for the 16-bit carrier; very wide rows prefer 256/1024."""
+    # wave35 probe357: N=393216 f16 8.05 ms at BN256/AB1024 against 8.15 at
+    # BN128/AB512 (1.2%), everything below 262144 keeps the old pair.
+    if n >= (1 << 18):
+        return 256, 1024
+    return min(_LN16_BN, triton.next_power_of_2(n)), _ln16_ab(n)
+
+
 @triton.jit
 def _ln_fwd_kernel_16(
     X,
@@ -341,6 +375,133 @@ def _ln_fwd_kernel_16m(
             tl.store(Y + base + c + idx, y.to(Y.dtype.element_ty), mask=mm2)
 
 
+# ---------------- wave35: split-N carrier for very wide f32 rows ----------------
+# Official core shape (20,6,65536) normalizes over [6,65536] = 393216 columns
+# with M=20. One row per program leaves ten programs for eight cores, so the
+# second wave runs on two cores; f32 also pays a W/B load per row (two 786 KB
+# vectors per row). Splitting the row into two column halves and applying
+# column-major (tile outer, rows inner, W/B loaded once per tile) measured
+# (probe356, same session): common 10.36 / carrier 13.8 / splitA 10.76 /
+# splitB 9.17 ms. 16-bit keeps the plain carrier (8.05 ms) - its apply pass is
+# already bandwidth bound and the extra pass only adds traffic.
+_LN_SPLIT_MIN_N = 1 << 18
+_LN_SPLIT_S = 2
+_LN_SPLIT_AB = 512
+
+
+@triton.jit
+def _ln_split_part_kernel(
+    X,
+    P1,
+    P2,
+    N,
+    SPLIT: tl.constexpr,
+    CH: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid // SPLIT
+    s = pid % SPLIT
+    base = row.to(tl.int64) * N
+    lo = s * CH
+    hi = tl.minimum(lo + CH, N)
+    cols = tl.arange(0, BN)
+    acc1 = tl.zeros([BN], dtype=tl.float32)
+    acc2 = tl.zeros([BN], dtype=tl.float32)
+    for off in range(lo, hi, BN):
+        mm = off + cols < hi
+        v = tl.load(X + base + off + cols, mask=mm, other=0.0).to(tl.float32)
+        acc1 += v
+        acc2 += v * v
+    tl.store(P1 + pid, tl.sum(acc1, axis=0))
+    tl.store(P2 + pid, tl.sum(acc2, axis=0))
+
+
+@triton.jit
+def _ln_split_combine_kernel(P1, P2, Mean, Rstd, N, eps, SPLIT: tl.constexpr):
+    row = tl.program_id(0)
+    s1 = 0.0
+    s2 = 0.0
+    for i in tl.static_range(SPLIT):
+        s1 += tl.load(P1 + row * SPLIT + i)
+        s2 += tl.load(P2 + row * SPLIT + i)
+    mu = s1 / N
+    var = s2 / N - mu * mu
+    rstd = 1.0 / tl.sqrt(var + eps)
+    tl.store(Mean + row, mu.to(Mean.dtype.element_ty))
+    tl.store(Rstd + row, rstd.to(Rstd.dtype.element_ty))
+
+
+@triton.jit
+def _ln_split_apply_kernel(
+    X,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    M,
+    N,
+    SPLIT: tl.constexpr,
+    CH: tl.constexpr,
+    AB: tl.constexpr,
+    HAS_W: tl.constexpr,
+    HAS_B: tl.constexpr,
+):
+    s = tl.program_id(0)
+    lo = s * CH
+    hi = tl.minimum(lo + CH, N)
+    idx = tl.arange(0, AB)
+    for c in range(lo, hi, AB):
+        mm = c + idx < hi
+        if HAS_W:
+            w = tl.load(W + c + idx, mask=mm, other=0.0).to(tl.float32)
+        else:
+            w = tl.zeros([AB], dtype=tl.float32)
+        if HAS_B:
+            b = tl.load(B + c + idx, mask=mm, other=0.0).to(tl.float32)
+        else:
+            b = tl.zeros([AB], dtype=tl.float32)
+        for r in range(0, M):
+            base = r.to(tl.int64) * N
+            x = tl.load(X + base + c + idx, mask=mm, other=0.0).to(tl.float32)
+            mu = tl.load(Mean + r).to(tl.float32)
+            rs = tl.load(Rstd + r).to(tl.float32)
+            y = (x - mu) * rs
+            if HAS_W:
+                y = y * w
+            if HAS_B:
+                y = y + b
+            tl.store(Y + base + c + idx, y.to(Y.dtype.element_ty), mask=mm)
+
+
+def ln_split_launch(x2d, y2d, w_arg, b_arg, mean, rstd, m, n, eps, has_w, has_b):
+    split = _LN_SPLIT_S
+    ch = (n + split - 1) // split
+    p1 = torch.empty(m * split, dtype=torch.float32, device=x2d.device)
+    p2 = torch.empty(m * split, dtype=torch.float32, device=x2d.device)
+    with nested_dispatch(m * n):
+        _ln_split_part_kernel[(m * split,)](
+            x2d, p1, p2, n, SPLIT=split, CH=ch, BN=128
+        )
+        _ln_split_combine_kernel[(m,)](p1, p2, mean, rstd, n, eps, SPLIT=split)
+        _ln_split_apply_kernel[(split,)](
+            x2d,
+            y2d,
+            w_arg,
+            b_arg,
+            mean,
+            rstd,
+            m,
+            n,
+            SPLIT=split,
+            CH=ch,
+            AB=_LN_SPLIT_AB,
+            HAS_W=has_w,
+            HAS_B=has_b,
+        )
+
+
 _LN_K_SMALL = 32  # N <= 1024 (wave13 probe109 P3: 512^2 0.404 -> 0.343)
 _LN_K_LARGE = 16  # N > 1024 (wave13 probe112 P1: 2048^2 2.86 -> 2.50,
 # 512x2048 0.79 -> 0.71 at K16)
@@ -370,10 +531,35 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     ab = _AB if n >= _AB else triton.next_power_of_2(n)
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
-    if inp.dtype != torch.float32 or n > _LN_MAX_N:
+    if inp.dtype != torch.float32 or n > _F32_FAST_MAX_N:
+        stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
+            1
+        ] * len(normalized_shape)
+        # wave35 probe356: f32 rows at or above 262144 columns run split-N
+        # (9.17 vs 10.36 ms common at (20,6,65536)); every 16-bit width keeps
+        # the single-pass carrier (8.05 ms there).
+        if (
+            inp.dtype == torch.float32
+            and n >= _LN_SPLIT_MIN_N
+            and n % _LN_SPLIT_S == 0
+            and m >= 2
+        ):
+            ln_split_launch(
+                x2d,
+                y2d,
+                w_arg,
+                b_arg,
+                mean,
+                rstd,
+                m,
+                n,
+                eps,
+                weight is not None,
+                bias is not None,
+            )
+            return y, mean.view(stats_shape), rstd.view(stats_shape)
         k16 = _pick_k16(m, n)
-        bn16 = min(_LN16_BN, triton.next_power_of_2(n))
-        ab16 = _ln16_ab(n)
+        bn16, ab16 = _ln16_tiles(n)
         aligned = (n % bn16 == 0) and (n % ab16 == 0)
         kern16 = _ln_fwd_kernel_16 if aligned else _ln_fwd_kernel_16m
         # wave31 probe314: the serialized 1-D launcher costs the 16-bit carrier

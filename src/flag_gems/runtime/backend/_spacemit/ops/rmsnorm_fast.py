@@ -226,6 +226,10 @@ _ROUTES_F32 = {
     # K8/T512 17.203 ms f16 (K2 50.3) and 32.787 f32 (K4 33.7); 1.151 at 64
     # rows, 0.180 at 1 row (all K tie there).
     65536: (8, 512),
+    # wave35 probe358: official core shape (64,64) had no route (N=64 is under
+    # the wildcard floor); K4/T64 0.111 ms against 0.121 common at 64 rows
+    # (T128 ties at 0.113).
+    64: (4, 64),
 }
 _ROUTES_F16 = {
     512: (16, 256),
@@ -249,6 +253,9 @@ _ROUTES_F16 = {
     # wave34 probe354: N=65536 K8/T512 17.203 ms at 1024 rows, 1.151 at 64,
     # 0.180 at 1 (K4/T512 ties at 64 rows, K2 is 3x slower).
     65536: (8, 512),
+    # wave35 probe358: N=64 f16 K4/T128 0.115 ms against 0.223 common at 64
+    # rows and 0.221 against 0.539 at 256 rows (T64 0.138).
+    64: (4, 128),
 }
 
 
@@ -271,6 +278,15 @@ _WILD_MAX_N = 1 << 14
 _WILD_MIN_M = 32
 
 
+def _wildcard_entry(N: int, f16: bool):
+    # wave35 probe359: above 8192 columns a wider tile wins on odd widths -
+    # N=12288 f16 21.84 (K16/T256) -> 20.37 (K8/T1024) and f32 25.85 -> 23.51
+    # (K4/T512); N=10240 agrees (9.37 -> 8.76 f16, 10.14 -> 9.78 f32).
+    if N >= 8192:
+        return (8, 1024) if f16 else (4, 512)
+    return _WILDCARD
+
+
 def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
     """True when rms_fast_launch would serve this shape (no allocation)."""
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
@@ -285,7 +301,7 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     ent = routes.get(N)
     if ent is None:
         if _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M:
-            ent = _WILDCARD
+            ent = _wildcard_entry(N, f16)
         else:
             return False
     k0, tile = ent
