@@ -370,6 +370,8 @@ mean:
   tile_n:
   - 256
   - 512
+  - 1024
+  - 2048
 
 instance_norm_loop:
 - gen: true
