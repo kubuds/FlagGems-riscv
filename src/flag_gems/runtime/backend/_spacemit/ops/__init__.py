@@ -143,6 +143,29 @@ from .unary_fast import (
     elu_,
 )
 
+# Direct-kernel binary fast paths (campaign 1012night, wave2b).
+from .binary_fast import (
+    add,
+    add_,
+    sub,
+    sub_,
+    subtract,
+    subtract_,
+    gt,
+    lt,
+    eq,
+    clamp,
+    clamp_,
+    clamp_max,
+    clamp_max_,
+    clamp_min,
+    clamp_min_,
+    clamp_tensor,
+    clamp_tensor_,
+    where_self,
+    where_self_out,
+)
+
 __all__ = [
     "_conv_depthwise2d",
     "addmm",
@@ -226,6 +249,8 @@ __all__ = [
     "clamp_tensor_",
     "clamp_max",
     "clamp_max_",
+    "clamp_min",
+    "clamp_min_",
     "exp",
     "exp_",
     "exp_out",
