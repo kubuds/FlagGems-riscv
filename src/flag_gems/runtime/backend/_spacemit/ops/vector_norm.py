@@ -38,8 +38,12 @@ from .norm_fast import (
     l0_rows_launch,
     l1_flat_launch,
     l1_rows_launch,
+    l3_flat_launch,
+    l3_rows_launch,
     linf_flat_launch,
     linf_rows_launch,
+    lneg_flat_launch,
+    lneg_rows_launch,
     norm_fast_enabled,
     norm_flat_launch,
     norm_rows_launch,
@@ -50,12 +54,16 @@ _ROW_LAUNCH = {
     "l1": l1_rows_launch,
     "linf": linf_rows_launch,
     "l0": l0_rows_launch,
+    "l3": l3_rows_launch,
+    "lneg": lneg_rows_launch,
 }
 _FLAT_LAUNCH = {
     "l2": norm_flat_launch,
     "l1": l1_flat_launch,
     "linf": linf_flat_launch,
     "l0": l0_flat_launch,
+    "l3": l3_flat_launch,
+    "lneg": lneg_flat_launch,
 }
 
 
@@ -66,8 +74,12 @@ def _mode(ord):
         return "l1"
     if ord == float("inf"):
         return "linf"
+    if ord == float("-inf"):
+        return "lneg"
     if ord == 0 or ord == 0.0:
         return "l0"
+    if ord == 3 or ord == 3.0:
+        return "l3"
     return None
 
 

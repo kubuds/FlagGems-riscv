@@ -280,6 +280,120 @@ def _l0_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
     tl.store(Out, tl.sum(acc, axis=0).to(Out.dtype.element_ty))
 
 
+@triton.jit
+def _cbrt(s):
+    """(sum |v|^3)^(1/3). exp(log/3) because Triton tensors have no __pow__
+    on this build; s == 0 -> log(0) = -inf -> exp(-inf) = 0."""
+    return tl.exp(tl.log(s) * (1.0 / 3.0))
+
+
+@triton.jit
+def _l3_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """ord=3: (sum |v|^3)^(1/3)."""
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    for i in tl.static_range(K):
+        r = pid * K + i
+        rmask = r < M
+        base = r.to(tl.int64) * N
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for off in range(0, N, BLOCK_N):
+            idx = off + cols
+            mk = (idx < N) & rmask
+            v = tl.load(X + base + idx, mask=mk, other=0.0).to(tl.float32)
+            a = tl.abs(v)
+            acc += a * a * a
+        tl.store(Out + r, _cbrt(tl.sum(acc, axis=0)).to(Out.dtype.element_ty), mask=rmask)
+
+
+@triton.jit
+def _lneg_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """ord=-inf: min |v| (torch returns +inf for an empty reduction)."""
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    for i in tl.static_range(K):
+        r = pid * K + i
+        rmask = r < M
+        base = r.to(tl.int64) * N
+        acc = tl.full([BLOCK_N], value=float("inf"), dtype=tl.float32)
+        for off in range(0, N, BLOCK_N):
+            idx = off + cols
+            mk = (idx < N) & rmask
+            v = tl.load(X + base + idx, mask=mk, other=float("inf")).to(tl.float32)
+            acc = tl.minimum(acc, tl.abs(v))
+        tl.store(Out + r, tl.min(acc, axis=0).to(Out.dtype.element_ty), mask=rmask)
+
+
+@triton.jit
+def _l3_flat_stage1(X, Mid, M, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK):
+        idx = pid.to(tl.int64) * CHUNK + off + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
+        a = tl.abs(v)
+        acc += a * a * a
+    tl.store(Mid + pid, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _l3_flat_stage2(Mid, Out, NB, BLOCK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for off in range(0, NB, BLOCK):
+        idx = off + cols
+        v = tl.load(Mid + idx, mask=idx < NB, other=0.0)
+        acc += v
+    tl.store(Out, _cbrt(tl.sum(acc, axis=0)).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _lneg_flat_stage1(X, Mid, M, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    acc = tl.full([BLOCK], value=float("inf"), dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK):
+        idx = pid.to(tl.int64) * CHUNK + off + cols
+        v = tl.load(X + idx, mask=idx < M, other=float("inf")).to(tl.float32)
+        acc = tl.minimum(acc, tl.abs(v))
+    tl.store(Mid + pid, tl.min(acc, axis=0))
+
+
+@triton.jit
+def _lneg_flat_stage2(Mid, Out, NB, BLOCK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.full([BLOCK], value=float("inf"), dtype=tl.float32)
+    for off in range(0, NB, BLOCK):
+        idx = off + cols
+        v = tl.load(Mid + idx, mask=idx < NB, other=float("inf"))
+        acc = tl.minimum(acc, v)
+    tl.store(Out, tl.min(acc, axis=0).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _l3_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
+        a = tl.abs(v)
+        acc += a * a * a
+    tl.store(Out, _cbrt(tl.sum(acc, axis=0)).to(Out.dtype.element_ty))
+
+
+@triton.jit
+def _lneg_single(X, Out, M, BLOCK: tl.constexpr, NCHUNK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    acc = tl.full([BLOCK], value=float("inf"), dtype=tl.float32)
+    for i in tl.static_range(NCHUNK):
+        idx = i * BLOCK + cols
+        v = tl.load(X + idx, mask=idx < M, other=float("inf")).to(tl.float32)
+        acc = tl.minimum(acc, tl.abs(v))
+    tl.store(Out, tl.min(acc, axis=0).to(Out.dtype.element_ty))
+
+
 def norm_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_NORM_FAST", "1") != "0"
 
@@ -316,7 +430,8 @@ def _flat_blocks(numel):
     return chunk, nblk, max(32, triton.next_power_of_2(min(nblk, 1024)))
 
 
-_SINGLE = {"l2": _l2_single, "l1": _l1_single, "linf": _linf_single, "l0": _l0_single}
+_SINGLE = {"l2": _l2_single, "l1": _l1_single, "linf": _linf_single, "l0": _l0_single,
+           "l3": _l3_single, "lneg": _lneg_single}
 
 
 def _small_single_launch(mode, x, out, numel) -> bool:
@@ -381,4 +496,42 @@ def l0_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
     _l0_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    return True
+
+
+def l3_rows_launch(x, out, M, N) -> bool:
+    if M <= 0 or N < _MIN_N:
+        return False
+    _l3_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    return True
+
+
+def lneg_rows_launch(x, out, M, N) -> bool:
+    if M <= 0 or N < _MIN_N:
+        return False
+    _lneg_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    return True
+
+
+def l3_flat_launch(x, out, numel) -> bool:
+    if numel < _MIN_N:
+        return False
+    if _small_single_launch("l3", x, out, numel):
+        return True
+    chunk, nblk, b2 = _flat_blocks(numel)
+    mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
+    _l3_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
+    _l3_flat_stage2[(1,)](mid, out, nblk, BLOCK=b2)
+    return True
+
+
+def lneg_flat_launch(x, out, numel) -> bool:
+    if numel < _MIN_N:
+        return False
+    if _small_single_launch("lneg", x, out, numel):
+        return True
+    chunk, nblk, b2 = _flat_blocks(numel)
+    mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
+    _lneg_flat_stage1[(nblk,)](x, mid, numel, CHUNK=chunk, BLOCK=_FLAT_BLOCK)
+    _lneg_flat_stage2[(1,)](mid, out, nblk, BLOCK=b2)
     return True

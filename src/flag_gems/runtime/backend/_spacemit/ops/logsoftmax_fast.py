@@ -38,12 +38,15 @@ import torch
 import triton
 import triton.language as tl
 
+from .fastmath import exp_fast as _expf
+from .fastmath import exp_flag
+
 _ROWS = 8
 _BLOCK_MAX = 256
 
 
 @triton.jit
-def _logsm_rows(Out, X, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+def _logsm_rows(Out, X, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr, FAST: tl.constexpr):
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     for i in tl.static_range(K):
@@ -62,7 +65,7 @@ def _logsm_rows(Out, X, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
             idx = off + cols
             mk = (idx < N) & rmask
             v = tl.load(X + base + idx, mask=mk, other=-float("inf")).to(tl.float32)
-            z += tl.exp(v - m_r)
+            z += _expf(v - m_r, FAST)
         lz = tl.log(tl.sum(z, axis=0))
         for off in range(0, N, BLOCK_N):
             idx = off + cols
@@ -79,5 +82,5 @@ def logsm_launch(x, out, M, N) -> bool:
     if M <= 0 or N < 64:
         return False
     block = min(_BLOCK_MAX, triton.next_power_of_2(N))
-    _logsm_rows[(triton.cdiv(M, _ROWS),)](out, x, M, N, K=_ROWS, BLOCK_N=block)
+    _logsm_rows[(triton.cdiv(M, _ROWS),)](out, x, M, N, K=_ROWS, BLOCK_N=block, FAST=exp_flag())
     return True

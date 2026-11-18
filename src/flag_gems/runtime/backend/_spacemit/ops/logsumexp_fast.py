@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wave18/19: logsumexp row + dim=0 fast paths.
+"""wave18/19/20/21: logsumexp fast paths (row, dim=0, mid-dim).
 
 The generic logsumexp keeps (TILE_N, TILE_K) / [TILE_N] masks and finishes with
 tl.sum(z * tl.exp(m - m_reduced), axis=0) - a reduce fed by computed values,
@@ -20,25 +20,36 @@ which spine-triton lowers scalar. Measured baseline (dim=1, f32):
 6.92 / 104.29 / 52.21 / 108.02 ms at 512^2 / 2048^2 / 512x4096 / 8192x512
 (0.45-0.48x torch).
 
-The row kernel keeps the max and the exp-sum in narrow vector accumulators
-(BLOCK_N lanes, one final reduce per row). probe161/169b:
-f32 1.455/12.190/5.609/19.197 ms, f16 1.218/13.471/6.345/18.491 ms - 4.4-5.8x
-faster than the generic path and 3.5-4.9x faster than torch (torch's f16
-logsumexp runs 5.3-64.7 ms).
+wave20 added the mid-dim online fold. probe183 cost breakdown on
+1024x256x128 (33.5M elems): load+sum 12.6 ms, load+max 12.6 ms, load+one exp
+61.3 ms => exp is the bottleneck at ~1.45 ns/elem (tl.exp lowers to a scalar
+libm call on this backend), and the per-row online fold pays two of them.
 
-wave19 dim=0 carrier (probe170): online logsumexp fold per (row-block x
-column-block), merged in stage 2 by the same max/rescale rule. generic ->
-fast: 27.33->4.889 (2048^2), 11.76->2.709 (512x4096), 32.90->5.420 (4096x1024),
-20.46->9.214 (8192x512); 4.2-9.6x faster than torch. Requires M >= 64 (an
-8-row 3-D case regressed to 41.8 ms vs 27.6 generic, so small-M falls back).
+wave21 therefore does two things:
+  * `_expf` - exp(x) as 2^(x*log2e) with a degree-6 polynomial and the
+    exponent assembled by integer bitcast. 1.15-1.38x faster than tl.exp and
+    it keeps NaN/inf semantics (the clamp is a select, not fmax, so NaN input
+    still yields NaN).
+  * `_lse_mid` folds in chunks of RB rows: one chunk max, one rescale and one
+    exp per element. RB=8 measured best: 1024x256x128 136.1 -> 65.2 ms (2.09x),
+    1024x64x64 18.7 -> 9.9 ms (1.89x).
+Rows path with the same exp: 512^2 1.140 -> 0.978, 2048^2 11.39 -> 9.47,
+512x4096 5.47 -> 4.30, 8192x512 16.43 -> 13.89 ms (1.17-1.27x).
 
-Kill switch: FLAGGEMS_SPACEMIT_LOGSUMEXP_FAST=0.
+Accuracy of the degree-6 poly is ~1.5e-5 relative (max abs 1-2e-4 on N(0,2)
+inputs at values of order 5); degree 7 is ~1.3e-6 but costs a clean 20% on
+some row shapes, so degree 6 is the default.
+
+Kill switches: FLAGGEMS_SPACEMIT_LOGSUMEXP_FAST=0, FLAGGEMS_SPACEMIT_LSE_POLY=0.
 """
 
 import os
 
 import triton
 import triton.language as tl
+
+from .fastmath import exp_fast as _expf
+from .fastmath import exp_flag
 
 _ROWS = 4
 _BLOCK_SMALL = 128   # N <= 1024
@@ -50,10 +61,11 @@ _DIM0_BN_LARGE = 512   # K >= 2048
 _DIM0_MIN_M = 64
 _MID_BN = 256
 _MID_BN_LARGE = 512
+_MID_RB = 8
 
 
 @triton.jit
-def _lse_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+def _lse_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr, DEG: tl.constexpr):
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     for i in tl.static_range(K):
@@ -72,7 +84,7 @@ def _lse_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
             idx = off + cols
             mk = (idx < N) & rmask
             v = tl.load(X + base + idx, mask=mk, other=-float("inf")).to(tl.float32)
-            z += tl.exp(v - m_r)
+            z += _expf(v - m_r, DEG)
         res = m_r + tl.log(tl.sum(z, axis=0))
         # all -inf row: torch returns -inf (exp(-inf - -inf) is NaN)
         res = tl.where(m_r == -float("inf"), m_r, res)
@@ -80,7 +92,7 @@ def _lse_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
 
 
 @triton.jit
-def _lse_dim0_s1(X, MidM, MidS, M, K, RB: tl.constexpr, BN: tl.constexpr):
+def _lse_dim0_s1(X, MidM, MidS, M, K, RB: tl.constexpr, BN: tl.constexpr, DEG: tl.constexpr):
     pk = tl.program_id(0)
     pr = tl.program_id(1)
     cols = pk * BN + tl.arange(0, BN)
@@ -93,14 +105,14 @@ def _lse_dim0_s1(X, MidM, MidS, M, K, RB: tl.constexpr, BN: tl.constexpr):
         v = tl.load(X + r.to(tl.int64) * K + cols, mask=rm & cmask, other=-float("inf")).to(tl.float32)
         m_new = tl.maximum(m, v)
         msafe = tl.where(m_new == -float("inf"), 0.0, m_new)
-        s = s * tl.exp(m - msafe) + tl.exp(v - msafe)
+        s = s * _expf(m - msafe, DEG) + _expf(v - msafe, DEG)
         m = m_new
     tl.store(MidM + pr * K + cols, m, mask=cmask)
     tl.store(MidS + pr * K + cols, s, mask=cmask)
 
 
 @triton.jit
-def _lse_dim0_s2(MidM, MidS, Out, NB, K, BN: tl.constexpr):
+def _lse_dim0_s2(MidM, MidS, Out, NB, K, BN: tl.constexpr, DEG: tl.constexpr):
     cols = tl.program_id(0) * BN + tl.arange(0, BN)
     cmask = cols < K
     m = tl.full([BN], value=-float("inf"), dtype=tl.float32)
@@ -110,7 +122,7 @@ def _lse_dim0_s2(MidM, MidS, Out, NB, K, BN: tl.constexpr):
         sb = tl.load(MidS + b * K + cols, mask=cmask, other=0.0)
         m_new = tl.maximum(m, mb)
         msafe = tl.where(m_new == -float("inf"), 0.0, m_new)
-        s = s * tl.exp(m - msafe) + sb * tl.exp(mb - msafe)
+        s = s * _expf(m - msafe, DEG) + sb * _expf(mb - msafe, DEG)
         m = m_new
     res = m + tl.log(s)
     res = tl.where(m == -float("inf"), m, res)
@@ -118,14 +130,11 @@ def _lse_dim0_s2(MidM, MidS, Out, NB, K, BN: tl.constexpr):
 
 
 @triton.jit
-def _lse_mid(X, Out, B, C, BN: tl.constexpr):
-    """wave20: reduce a middle dim.  X is viewed as (A, B, C) with C contiguous
-    (A = product of dims before the reduced dim), one program per (a, col block).
-
-    Online fold (max + rescaled sum), so the result is overflow-safe; the
-    unshifted `s += exp(v)` variant is 1.3-2.2x faster but overflows for
-    inputs above ~88 in f32 (probe176 measured both, rejected the naive form).
-    """
+def _lse_mid(X, Out, B, C, BN: tl.constexpr, RB: tl.constexpr, DEG: tl.constexpr):
+    """Reduce a middle dim. X is (A, B, C) with C contiguous; one program per
+    (a, column block). Chunked online fold: a chunk max over RB rows, one
+    rescale of the running sum, then one exp per element (probe183: the exp
+    count is what the per-row fold was paying double for)."""
     pa = tl.program_id(0)
     pc = tl.program_id(1)
     cols = pc * BN + tl.arange(0, BN)
@@ -133,11 +142,21 @@ def _lse_mid(X, Out, B, C, BN: tl.constexpr):
     base = pa.to(tl.int64) * (B * C)
     m = tl.full([BN], value=-float("inf"), dtype=tl.float32)
     s = tl.zeros([BN], dtype=tl.float32)
-    for b in range(0, B):
-        v = tl.load(X + base + b * C + cols, mask=cmask, other=-float("inf")).to(tl.float32)
-        m_new = tl.maximum(m, v)
+    for b0 in range(0, B, RB):
+        cm = tl.full([BN], value=-float("inf"), dtype=tl.float32)
+        for i in tl.static_range(RB):
+            b = b0 + i
+            v = tl.load(X + base + b * C + cols, mask=cmask & (b < B), other=-float("inf")).to(tl.float32)
+            cm = tl.maximum(cm, v)
+        m_new = tl.maximum(m, cm)
         msafe = tl.where(m_new == -float("inf"), 0.0, m_new)
-        s = s * tl.exp(m - msafe) + tl.exp(v - msafe)
+        s = s * _expf(m - msafe, DEG)
+        acc = tl.zeros([BN], dtype=tl.float32)
+        for i in tl.static_range(RB):
+            b = b0 + i
+            v = tl.load(X + base + b * C + cols, mask=cmask & (b < B), other=-float("inf")).to(tl.float32)
+            acc += _expf(v - msafe, DEG)
+        s += acc
         m = m_new
     res = m + tl.log(s)
     res = tl.where(m == -float("inf"), m, res)
@@ -148,13 +167,19 @@ def logsumexp_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_LOGSUMEXP_FAST", "1") != "0"
 
 
+def _poly_deg() -> int:
+    if os.environ.get("FLAGGEMS_SPACEMIT_LSE_POLY", "1") == "0":
+        return 0
+    return exp_flag()
+
+
 def logsumexp_mid_launch(x, out, A, B, C) -> bool:
     """True if the middle-dim fold (A outer x B reduced x C inner) was launched."""
     if A <= 0 or B <= 1 or C < _MIN_N:
         return False
     bn = _MID_BN_LARGE if C >= 2048 else _MID_BN
     bn = min(bn, triton.next_power_of_2(C))
-    _lse_mid[(A, triton.cdiv(C, bn))](x, out, B, C, BN=bn)
+    _lse_mid[(A, triton.cdiv(C, bn))](x, out, B, C, BN=bn, RB=_MID_RB, DEG=_poly_deg())
     return True
 
 
@@ -164,7 +189,7 @@ def logsumexp_rows_launch(x, out, M, N) -> bool:
         return False
     block = _BLOCK_SMALL if N <= 1024 else _BLOCK_LARGE
     block = min(block, triton.next_power_of_2(N))
-    _lse_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=block)
+    _lse_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=block, DEG=_poly_deg())
     return True
 
 
@@ -179,6 +204,6 @@ def logsumexp_dim0_launch(x, out, M, K) -> bool:
     ncb = triton.cdiv(K, bn)
     midm = torch.empty((nrb, K), dtype=torch.float32, device=x.device)
     mids = torch.empty((nrb, K), dtype=torch.float32, device=x.device)
-    _lse_dim0_s1[(ncb, nrb)](x, midm, mids, M, K, RB=_DIM0_RB, BN=bn)
-    _lse_dim0_s2[(ncb,)](midm, mids, out, nrb, K, BN=bn)
+    _lse_dim0_s1[(ncb, nrb)](x, midm, mids, M, K, RB=_DIM0_RB, BN=bn, DEG=_poly_deg())
+    _lse_dim0_s2[(ncb,)](midm, mids, out, nrb, K, BN=bn, DEG=_poly_deg())
     return True
