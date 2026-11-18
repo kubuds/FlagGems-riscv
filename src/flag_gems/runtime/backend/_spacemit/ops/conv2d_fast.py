@@ -2404,6 +2404,35 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
     return oc * c * kh * kw >= (1 << 18)
 
 
+_MP_BUF = {}
+_MP_MPAD_LADDER = (32, 64, 128, 256, 512, 1024, 2048)
+
+
+def _mp_mpad(ncol):
+    """wave87: column-block padding for the im2col patch matrix.
+
+    The descriptor B block is 32 wide, so the patch only has to be padded to a
+    32 multiple; the ladder keeps the block pointer's MPAD a power of two so no
+    load is masked (a masked descriptor load measured 2x on this backend).
+    """
+    for v in _MP_MPAD_LADDER:
+        if ncol <= v:
+            return v
+    return triton.next_power_of_2(ncol)
+
+
+def _mp_patch(K, mpad, dtype, device):
+    """Cached zero-padded patch matrix [K, mpad] (one buffer per size)."""
+    key = (K, mpad, dtype, device)
+    buf = _MP_BUF.get(key)
+    if buf is None:
+        if len(_MP_BUF) > 3:
+            _MP_BUF.clear()
+        buf = torch.zeros((K, mpad), dtype=dtype, device=device)
+        _MP_BUF[key] = buf
+    return buf
+
+
 _MP_TILES = (128, 32, 128)
 _MP_SMT_TILES = (128, 32, 128)
 _MP_SMT_MAXM = 64
@@ -2546,17 +2575,15 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     M = OH * OW
     NCOL = N * M
     x = input.contiguous()
-    cols = torch.nn.functional.unfold(
+    # wave86: fold the batch into the column axis.  Every streaming route
+    # launches once per item, so a batched small-output conv re-reads the whole
+    # weight N times; one GEMM over N*M columns reads it once.
+    # wave87: the unfold result stays in its native [N, K, M] order and the
+    # transpose is folded into the patch build below (one pass, not two).
+    cols3 = torch.nn.functional.unfold(
         x, kernel_size=(KH, KW), dilation=(dil_h, dil_w),
         padding=(pad_h, pad_w), stride=(SH, SW))
-    if N > 1:
-        # wave86: fold the batch into the column axis.  Every streaming route
-        # launches once per item, so a batched small-output conv re-reads the
-        # whole weight N times; one GEMM over N*M columns reads it once.
-        cols = cols.permute(1, 0, 2).reshape(cols.shape[1], NCOL).contiguous()
-    else:
-        cols = cols[0].contiguous()
-    K = cols.shape[0]
+    K = cols3.shape[1]
     w2 = weight.reshape(OC, K).contiguous()
     y = torch.empty((OC, NCOL), dtype=torch.float32, device=x.device)
     # wave84: f32 cells take the descriptor path when the shape fits its
@@ -2572,10 +2599,12 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
         mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
                   else 32 if OC % 32 == 0 else 0)
     if mp_boc:
-        mpad = (32 if NCOL <= 32 else 64 if NCOL <= 64 else 128
-                if NCOL <= 128 else 256)
-        p32 = torch.zeros((K, mpad), dtype=torch.float32, device=x.device)
-        p32[:, :NCOL] = cols
+        mpad = _mp_mpad(NCOL)
+        p32 = _mp_patch(K, mpad, torch.float32, x.device)
+        if N > 1:
+            p32[:, :NCOL].view(K, N, M).copy_(cols3.permute(1, 0, 2))
+        else:
+            p32[:, :NCOL].copy_(cols3[0])
         args = (w2, p32, bias if bias is not None else w2, y, K, NCOL, OC)
         kw = dict(BM=mp_boc, BN=32, BK=mp_bk, MPAD=mpad,
                   HAS_BIAS=(bias is not None))
@@ -2594,6 +2623,8 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     if OC < boc:
         boc = triton.next_power_of_2(OC)
     nomask = (K % bk == 0) and (NCOL % bm == 0) and (OC % boc == 0)
+    cols = (cols3.permute(1, 0, 2).reshape(K, NCOL).contiguous()
+            if N > 1 else cols3[0].contiguous())
     _conv1x1_kernel[(triton.cdiv(NCOL, bm), triton.cdiv(OC, boc), 1)](
         cols, w2, bias if bias is not None else w2, y, K, NCOL, OC,
         cols.stride(0), y.stride(0),
@@ -2641,8 +2672,7 @@ def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
         mp_boc = (128 if OCG % 128 == 0 else 64 if OCG % 64 == 0
                   else 32 if OCG % 32 == 0 else 0)
     if mp_boc:
-        mpad = (32 if NCOL <= 32 else 64 if NCOL <= 64 else 128
-                if NCOL <= 128 else 256)
+        mpad = _mp_mpad(NCOL)
         p32 = torch.zeros((groups, Kp, mpad), dtype=torch.float32,
                           device=x.device)
         p32[:, :Kg, :NCOL] = cols.view(groups, Kg, NCOL)
@@ -2714,7 +2744,8 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     if n > 1:
         # wave86: batch folding as in conv_mp_applies; measured live -> fold
         # N=4 g8 c512 3x3 s2 6->2 13.7 -> 3.5 ms.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "256") or 256)
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "2048")
+                 or 2048)
         if n * m > mx:
             return False
         if ((n * m + 31) // 32) * 2 > 5 * n:
@@ -2772,7 +2803,8 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         # 14->7 37.3 -> 20.7 (1.80x).  The column count bounds the weight
         # re-reads (one pass per 32-column block), so the band stops where the
         # last measured win was.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "256") or 256)
+        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "2048")
+                 or 2048)
         if n * m > mx:
             return False
         # one weight pass per 32-column block against N passes on the per-item
@@ -2783,6 +2815,11 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         if (c * kh * kw) % 128 or oc % 32:
             return False
         if sh * sw > 4:
+            return False
+        # wave87: the patch matrix is K*NCOL*4 bytes and the unfold holds a
+        # second copy of it, so a wide-K layer is bounded here rather than at
+        # the allocator (256 MB of patch = 512 MB live).
+        if c * kh * kw * n * m * 4 > (1 << 28):
             return False
         return oc * c * kh * kw * 4 >= (1 << 20)
     # 25 is the largest measured win (5x5 s2 9x9 -> 3x3); at M=49 the same
