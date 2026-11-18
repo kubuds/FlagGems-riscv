@@ -344,6 +344,56 @@ def _conv_tap_smt_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, SROW, MY, IW,
     tl.store(cp, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit(do_not_specialize=["OC", "OCB", "SROW", "MY", "IW", "KDIW", "DK"])
+def _conv_tap_loop_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, SROW, MY, IW,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, KDIW, DK,
+):
+    """wave71: _conv_tap_smt_kernel with a runtime tap loop.
+
+    The 25-dot 5x5 shape pays 153-158 s of first-call compile because every dot
+    is unrolled into its own descriptor_load/dot pair.  A runtime loop leaves one
+    dot in the IR, so the question is whether the loop overhead costs run time
+    and how much compile it saves.  FLAGGEMS_SPACEMIT_CONV_TAPLOOP=1 selects it.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    ap = tl.make_block_ptr(base=A, shape=[OC, C], strides=[C, 1],
+                           offsets=[pid_m * BLOCK_M, 0],
+                           block_shape=[BLOCK_M, C], order=[1, 0])
+    bp = tl.make_block_ptr(base=Bx, shape=[C, SROW], strides=[SROW, 1],
+                           offsets=[0, pid_n * BLOCK_N],
+                           block_shape=[C, BLOCK_N], order=[1, 0])
+    aa = smt.view(smt.descriptor_load(ap, (0, 0)), (0, 0), (BLOCK_M, C),
+                  (MICRO_M, MICRO_K))
+    bb = smt.view(smt.descriptor_load(bp, (0, 0)), (0, 0), (C, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(aa, bb), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    for t in range(1, KH * KW):
+        kh = t // KW
+        kw = t % KW
+        at = tl.make_block_ptr(base=A + t * OC * C, shape=[OC, C], strides=[C, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, C], order=[1, 0])
+        bt = tl.make_block_ptr(base=Bx + kh * KDIW + kw * DK, shape=[C, SROW],
+                               strides=[SROW, 1], offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[C, BLOCK_N], order=[1, 0])
+        a2 = smt.view(smt.descriptor_load(at, (0, 0)), (0, 0), (BLOCK_M, C),
+                      (MICRO_M, MICRO_K))
+        b2 = smt.view(smt.descriptor_load(bt, (0, 0)), (0, 0), (C, BLOCK_N),
+                      (MICRO_K, MICRO_N))
+        acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < OCB, other=0.0)[:, None]
+    cp = tl.make_block_ptr(base=Y, shape=[OC, MY], strides=[MY, 1],
+                           offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                           block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(cp, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.jit
 def _conv1x1_s2_kernel(X, Wm, Bs, Y, C, IH, IW, OH, OW, OC, sxn,
     BLOCK_OC: tl.constexpr, ROWS: tl.constexpr, BLOCK_OW: tl.constexpr,
@@ -572,6 +622,157 @@ def _conv2d_group_kernel(X, Wt, Bs, Y,
                  mask=(oc[:, None, None] < OC) & ((oh0 + ro)[None, :, None] < OH)
                  & ((ow0 + lo)[None, None, :] < OW))
 
+
+@triton.jit(do_not_specialize=["OC", "OCB", "MY", "PWW", "PLANE", "CSTR"])
+def _conv_tap_phase_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, MY,
+    PWW, PLANE, CSTR,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    DILH: tl.constexpr, DILW: tl.constexpr,
+):
+    """wave71: the shifted-tap GEMM for stride > 1 (and stride x dilation).
+
+    A stride-2 3x3 is the standard downsample of every CNN backbone, and it had
+    no fast route at all: TAP9, the 3x3 patch matrix and the stem all demand
+    SH == SW == 1, so it fell through to the old 32-lane tap kernel at a
+    19.9 GFLOPS roof.  The shift trick survives a stride if the input is split
+    into SH*SW phase planes first: tap (kh, kw) always samples input row
+    oh*SH + kh*DILH, whose phase is (kh*DILH) % SH and whose row inside that
+    plane is oh + (kh*DILH)//SH - both constexpr - and the same for columns.
+    Inside a plane the address is affine in m = oh*PWW + ow again, so the nine
+    dots run unmodified with a per-tap plane offset.
+
+    The plane copy is one pass over the padded image and the planes are cached
+    and zeroed once, so only the real interior is rewritten per call.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    ap = tl.make_block_ptr(base=A, shape=[OC, C], strides=[C, 1],
+                           offsets=[pid_m * BLOCK_M, 0],
+                           block_shape=[BLOCK_M, C], order=[1, 0])
+    bp = tl.make_block_ptr(base=Bx, shape=[C, PLANE], strides=[CSTR, 1],
+                           offsets=[0, pid_n * BLOCK_N],
+                           block_shape=[C, BLOCK_N], order=[1, 0])
+    aa = smt.view(smt.descriptor_load(ap, (0, 0)), (0, 0), (BLOCK_M, C),
+                  (MICRO_M, MICRO_K))
+    bb = smt.view(smt.descriptor_load(bp, (0, 0)), (0, 0), (C, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(aa, bb), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    for t in range(1, KH * KW):
+        kh = t // KW
+        kw = t % KW
+        off = ((((kh * DILH) % SH) * SW + ((kw * DILW) % SW)) * PLANE
+               + ((kh * DILH) // SH) * PWW + ((kw * DILW) // SW))
+        at = tl.make_block_ptr(base=A + t * OC * C, shape=[OC, C], strides=[C, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, C], order=[1, 0])
+        bt = tl.make_block_ptr(base=Bx + off, shape=[C, PLANE], strides=[CSTR, 1],
+                               offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[C, BLOCK_N], order=[1, 0])
+        a2 = smt.view(smt.descriptor_load(at, (0, 0)), (0, 0), (BLOCK_M, C),
+                      (MICRO_M, MICRO_K))
+        b2 = smt.view(smt.descriptor_load(bt, (0, 0)), (0, 0), (C, BLOCK_N),
+                      (MICRO_K, MICRO_N))
+        acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < OCB, other=0.0)[:, None]
+    cp = tl.make_block_ptr(base=Y, shape=[OC, MY], strides=[MY, 1],
+                           offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                           block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(cp, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+_PHS_BUF = {}
+
+
+def _tap_phase_buf(cp, np_, phh, pww, tail, dtype, device):
+    # same caching contract as _tap_flat_buf: zeroed once, interior rewritten
+    # every call, geometry in the key so two layers never share a frame
+    key = (cp, np_, phh, pww, tail, dtype, str(device))
+    buf = _PHS_BUF.get(key)
+    if buf is None:
+        if len(_PHS_BUF) >= 4:
+            _PHS_BUF.pop(next(iter(_PHS_BUF)))
+        buf = torch.zeros(cp * np_ * phh * pww + tail, dtype=dtype,
+                          device=device)
+        _PHS_BUF[key] = buf
+    return buf
+
+
+def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
+                    dil_h=1, dil_w=1, out_dtype=None):
+    """wave71: KH x KW conv at any stride (and stride x dilation) as KH*KW dots.
+
+    Each phase plane is (C, PHH, PWW) with PWW = OW + (KW-1)*DILW//SW so a tap's
+    column offset never crosses a plane row; the flat index m = oh*PWW + ow is
+    then the same affine map the stride-1 kernel uses.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    CP = max(32, triton.next_power_of_2(C))
+    OCP = ((OC + 31) // 32) * 32
+    x = input.contiguous()
+    IH, IW = H + 2 * pad_h, W + 2 * pad_w
+    roff = ((KH - 1) * dil_h) // SH
+    coff = ((KW - 1) * dil_w) // SW
+    PHH = OH + roff
+    PWW = OW + coff
+    NP = SH * SW
+    PLANE = PHH * PWW
+    CSTR = NP * PLANE
+    # m runs over the plane row width, not the output width: the tap base is
+    # an affine shift of m only inside a plane of width PWW, so the last
+    # PWW-OW columns of every row are computed and thrown away at the crop
+    MY = OH * PWW
+    bm, bn = _tap_tiles(OC, MY)
+    MYP = ((MY + bn - 1) // bn) * bn
+    at = _tap_weights(weight, CP, OCP)
+    dt = out_dtype or input.dtype
+    y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
+    grid = (triton.cdiv(OCP, bm), triton.cdiv(MYP, bn))
+    warm = _tap_first_launch((bm, bn, KH, KW, CP, x.dtype, OCP, OC, MYP, PWW,
+                              PLANE, SH, SW, dil_h, dil_w, bias is not None))
+    for n in range(N):
+        frame = _tap_flat_buf(CP, IH, IW, bn + 96, x.dtype, x.device)
+        img = frame[:CP * IH * IW].view(CP, IH, IW)
+        if pad_h or pad_w:
+            img[:C, pad_h:pad_h + H, pad_w:pad_w + W].copy_(x[n])
+        else:
+            img[:C].copy_(x[n])
+        flat = _tap_phase_buf(CP, NP, PHH, PWW, bn + 96, x.dtype, x.device)
+        planes = flat[:CP * CSTR].view(CP, NP, PHH, PWW)
+        for p in range(SH):
+            for q in range(SW):
+                # an odd padded extent leaves one phase shorter than PHH/PWW;
+                # those cells are never read by a valid output and stay zero
+                nh = min(PHH, (IH - p + SH - 1) // SH)
+                nw = min(PWW, (IW - q + SW - 1) // SW)
+                planes[:C, p * SW + q, :nh, :nw].copy_(
+                    img[:C, p::SH, q::SW][:, :nh, :nw])
+        if OCP == OC and MYP == MY and dt == torch.float32:
+            yext = y[n].view(OC, MY)
+        else:
+            yext = torch.empty((OCP, MYP), dtype=torch.float32,
+                               device=input.device)
+
+        def _launch():
+            _conv_tap_phase_kernel[grid](
+                at, flat, bias if bias is not None else at, yext, OCP,
+                OC if bias is not None else 0, CP, MYP, PWW, PLANE, CSTR,
+                BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
+                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                SH=SH, SW=SW, DILH=dil_h, DILW=dil_w)
+
+        _launch()
+        if warm and n == 0:
+            _launch()
+        if yext.data_ptr() != y[n].data_ptr():
+            yv = yext[:OC].as_strided((OC, OH, OW), (MYP, PWW, 1))
+            y[n].copy_(yv)
+    return y
 
 @triton.jit
 def _depthwise_kernel(X, Wt, Bs, Y,
@@ -1111,8 +1312,12 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     dt = out_dtype or input.dtype
     y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
     grid = (triton.cdiv(OCP, bm), triton.cdiv(MYP, bn))
+    kern = (_conv_tap_smt_kernel
+            if os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPLOOP", "1") == "0"
+            else _conv_tap_loop_kernel)
     warm = _tap_first_launch((bm, bn, KH, KW, CP, x.dtype, OCP, OC, MYP,
-                              SROW, IW, DIL, bias is not None))
+                              SROW, IW, DIL, bias is not None,
+                              kern is _conv_tap_loop_kernel))
     for n in range(N):
         # the padded frame IS the flat (C, IH*IW) operand, so the border is
         # written once (zeros) and every call only copies the interior into it:
@@ -1137,7 +1342,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
             yext = torch.empty((OCP, MYP), dtype=torch.float32,
                                device=input.device)
         def _launch():
-            _conv_tap_smt_kernel[grid](
+            kern[grid](
                 at, flat, bias if bias is not None else at, yext, OCP,
                 OC if bias is not None else 0, CP, SROW, MYP,
                 IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
@@ -1245,6 +1450,24 @@ def _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
     return y
 
 
+def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
+    """wave71: the phase-split shifted-tap class (stride > 1, stride x dilation).
+
+    Kept as one predicate so the two public entries and the route inside
+    conv2d_direct cannot drift apart: a dilated shape that passes only one of
+    them would hit the NotImplementedError guard at the bottom of the route.
+
+    sh * sw <= 4: stride 4 loses (0.79x against the old route at 112 px) because
+    the phase copy degrades to a stride-4 gather in both axes - 1 of every 4
+    elements per cache line, times 16 planes.
+    """
+    return (kh == kw and kh in (3, 5) and 3 <= c <= 512
+            and triton.next_power_of_2(c) <= 512
+            and 32 <= oc <= 512 and oh * ow >= 16 and sh * sw <= 4
+            and n * oc * oh * ow * kh * kw * c >= (1 << 20)
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
+
+
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
                   BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None,
                   dil_h=1, dil_w=1, _out_dtype=None):
@@ -1302,6 +1525,18 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             return y.to(input.dtype)
         return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
                                  out_dtype=_out_dtype)
+    # wave71: stride > 1 (and stride x dilation) rides the same shifted-tap
+    # kernel over SH*SW phase planes.  3x3/s2 is the standard downsample of
+    # every backbone and it had no fast route at all (TAP9, im2col3 and the
+    # stem all demand SH == SW == 1), so it ran on the old 32-lane tap kernel at
+    # 6.7-16 GFLOPS against 33-58 GFLOPS for the same kernel at stride 1.  The
+    # plane split makes m affine again; see _conv_tap_phase.
+    # FLAGGEMS_SPACEMIT_CONV_TAPPHS=0 pins the old route.
+    if (groups == 1 and dil_h == dil_w and (SH > 1 or SW > 1)
+            and conv_phase_applies(N, C, OC, OH, OW, KH, KW, SH, SW)):
+        return _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w,
+                               KH, KW, SH, SW, dil_h=dil_h, dil_w=dil_w,
+                               out_dtype=_out_dtype)
     # wave67: 3x3 stride-1 runs as nine whole-K smt dots on shifted bases -
     # no patch matrix, no K loop, no 32-lane split.  2.0-4.8x against the best
     # existing route on every shape measured, and exact (err 0.0) on all five:
@@ -1326,7 +1561,8 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and 32 <= OC <= 512 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
             and (KH == 3 or dil_h > 1
-                 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")):
+                 or (KH == 5
+                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))):
         return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
                                out_dtype=_out_dtype, dil_h=dil_h, dil_w=dil_w)
     if dil_h != 1 or dil_w != 1:

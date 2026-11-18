@@ -399,6 +399,7 @@ class Conv2d(torch.autograd.Function):
                     conv2d_direct,
                     conv_fast_applies,
                     conv_fast_enabled,
+                    conv_phase_applies,
                 )
 
                 if conv_fast_enabled():
@@ -451,13 +452,28 @@ class Conv2d(torch.autograd.Function):
                         and fast_ow >= 4
                         and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
                     )
-                    applies = dil_tap or dil_dwise or conv_fast_applies(
+                    # wave71: a dilated conv at stride > 1 has no route in
+                    # any stride-1 kernel; the phase planes make the tap base
+                    # affine again, so it joins through the same predicate the
+                    # route uses.
+                    dil_phase = (
+                        dilation_height == dilation_width
+                        and dilation_height > 1
+                        and groups == 1
+                        and (stride_height > 1 or stride_width > 1)
+                        and conv_phase_applies(
+                            input.shape[0], input.shape[1], weight.shape[0],
+                            fast_oh, fast_ow, kh, kw,
+                            stride_height, stride_width)
+                    )
+                    applies = (dil_tap or dil_phase or dil_dwise
+                               or conv_fast_applies(
                         input,
                         weight,
                         (stride_height, stride_width),
                         (dilation_height, dilation_width),
                         groups,
-                    )
+                    ))
                 else:
                     applies = False
                 if applies:
