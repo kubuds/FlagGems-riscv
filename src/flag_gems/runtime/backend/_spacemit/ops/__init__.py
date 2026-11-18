@@ -28,8 +28,10 @@ from .copy import copy_
 from .gelu import gelu, gelu_, gelu_backward
 from .hardsigmoid import hardsigmoid, hardsigmoid_, hardsigmoid_out
 from .layernorm import layer_norm
+from .max import max_dim
 from .mean import global_avg_pool, mean_dim
 from .mm import mm, mm_out
+from .min import min_dim
 from .mv import mv
 from .native_layer_norm import layer_norm_backward, native_layer_norm
 from .pow import (
@@ -241,7 +243,9 @@ __all__ = [
     "global_avg_pool",
     "layer_norm",
     "mean_dim",
+    "max_dim",
     "mm",
+    "min_dim",
     "mm_out",
     "mv",
     "pow_scalar",
