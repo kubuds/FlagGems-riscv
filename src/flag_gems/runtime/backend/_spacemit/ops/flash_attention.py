@@ -1297,6 +1297,23 @@ class Attention(torch.autograd.Function):
                             and q.shape[2] <= 64
                             and q.shape[2] * group_size <= 4096
                         )
+                        # wave102: past 4096 rows the ratio is flat - the scan
+                        # is set by nq, so extra rows only buy K/V reuse - and
+                        # the nq boundary moves up to 128: 8192 rows g128 q64
+                        # kv512 2.57x, g256 q32 kv512 4.07x, g128 q64 kv1024
+                        # d128 2.35x, g512 q16 3.88x, f32 g128 q64 2.88x;
+                        # 16384 rows g256 q64 2.58x, g128 q128 1.47x; 32768
+                        # rows g512 q64 2.58x, g256 q128 1.42x.  nq 128 wins
+                        # at 4096 rows too (g32 q128 1.42x) while nq 256
+                        # loses at both sizes (0.94x at 4096, 0.98x at 8192),
+                        # so this tier is group >= 32, nq <= 128, rows <=
+                        # 32768.  Plain stays out at this size (1.06x at 8192
+                        # rows).
+                        or (
+                            group_size >= 32
+                            and q.shape[2] <= 128
+                            and q.shape[2] * group_size <= 32768
+                        )
                     )
                 )
                 or (not is_causal and q.shape[2] * group_size <= 32)
