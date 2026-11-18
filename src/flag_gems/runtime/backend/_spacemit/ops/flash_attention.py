@@ -34,11 +34,14 @@ on the board (see ``notes/riscv/flagos/attention-next-2026-11-14.md``):
 
 Backend note: spine-triton sizes its packed-descriptor staging buffer for the
 kernel that is about to run but keeps whatever the previous one left there, so
-the first launch after the buffer grows returns garbage (nan at 32->64, 0.7-1.3
-maxdiff at 64->128; measured, deterministic, ``libentry`` irrelevant).  The
-launcher therefore runs the first launch of each configuration -- and any launch
-wider than the previous one in the process -- twice.  It costs one launch on
-rare transitions and disappears once the backend reallocates properly.
+the first launch after the packed footprint (BLOCK_SIZE_K, BLOCK_M, BLOCK_N)
+changes returns garbage (nan at 32->64 and at a 64-tile -> 128-tile switch,
+0.7-1.3 maxdiff at 64->128; measured, deterministic, ``libentry`` irrelevant).
+The buffer shrinks again for a narrower kernel, so the same kernel launched
+again after a narrower one breaks a second time.  The launcher therefore runs the
+first launch of each configuration, and any launch whose footprint differs from
+the previous one, twice.  It costs one launch on those transitions and
+disappears once the backend reallocates properly.
 
 Variants folded in:
 
@@ -50,11 +53,24 @@ Variants folded in:
   1.07-1.18x.  Only enabled when ``NUM_BLOCKS % num_ctas == 0`` so the
   permutation stays an exact bijection (a partial trailing pair would duplicate
   one task and drop another).
+* dtype-tiered outer block: f16/bf16 uses 128/128 once the query is at least
+  256 rows and the KV at least 256 (causal: 512), and 64/64 otherwise.  A wide
+  tile halves the block count and wastes half of it on short queries (causal
+  tail 64x64 0.48x, decode 0.59x) while winning 1.03-1.17x on the long ones.
+* the grid is halved when the block count is at most 32 so every program gets
+  two tasks, which the front/back alternation then balances (1x1x1024 1.06x,
+  f32 1x4x256 1.18x); larger grids keep 16 programs.
+* the KV bound mask is skipped when ``BLOCK_N`` divides ``KV_CTX``: the compare
+  plus select over the BLOCK_M x BLOCK_N score tile was 1.07-1.20x of pure
+  overhead on the large cells.
+* Q is packed once per task instead of once per stage pass (bit-exact, 0.1-0.4%
+  on causal shapes).
 
 Environment knobs (perf experiments only; defaults are the shipped choice):
 ``FLAGGEMS_SPACEMIT_ATTN_FAST=0`` forces the generic path,
-``..._ATTN_BM`` / ``..._ATTN_BN`` / ``..._ATTN_CTAS`` override the launch,
-``..._ATTN_ALT=0`` disables the causal task alternation.
+``..._ATTN_BM`` / ``..._ATTN_BN`` / ``..._ATTN_CTAS`` override the launch (0 or
+unset means the tiered default), ``..._ATTN_ALT=0`` disables the causal task
+alternation.
 """
 
 import math
@@ -75,15 +91,19 @@ _MICROS_F32 = (8, 32, 32)
 _SUPPORTED_HEAD_DIM = (32, 64, 128)
 
 # spine-triton leaves the packed-descriptor staging buffer sized for whichever
-# kernel ran first: the first launch of a kernel whose BLOCK_SIZE_K is larger
-# than anything launched before in this process reads stale staging data and
-# returns garbage (observed: nan at 32->64, 0.7-1.3 maxdiff at 64->128; the
-# second launch of the same kernel is exact, and a cold process that starts at
-# 128 is exact).  Track the launched configurations and run the first use of
-# each one twice; the second launch overwrites the buffers with real numbers.
-# Re-check when spine-triton grows its staging buffers; then this can go.
+# kernel ran last: the first launch of a kernel whose packed footprint
+# (BLOCK_SIZE_K, BLOCK_M, BLOCK_N) is larger than the previous one reads stale
+# staging data and returns garbage (observed: nan at 32->64 and at a 64-tile ->
+# 128-tile switch, 0.7-1.3 maxdiff at 64->128; the second launch of the same
+# kernel is exact, and a cold process that starts at 128 is exact).  The buffer
+# also shrinks again when a narrower kernel runs, so 128-tile -> 64-tile ->
+# 128-tile breaks a second time; comparing against the footprint of the previous
+# launch (in either direction) covers both.  Every launch of a new footprint is
+# therefore run twice; the second launch overwrites the staging with real
+# numbers.  Re-check when spine-triton resizes its staging buffers; then this
+# can go.
 _WARMED = set()
-_LAST_BLOCK_K = None
+_LAST_FOOTPRINT = None
 
 
 
@@ -108,7 +128,7 @@ def _attn_fwd_inner(
     acc,
     l_i_2d,
     m_i_2d,
-    Q_block_ptr,
+    q,
     K_block_ptr,
     V_block_ptr,
     start_m,
@@ -140,8 +160,8 @@ def _attn_fwd_inner(
     K_block_ptr = tl.advance(K_block_ptr, (lo, 0))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 
-    q_desc = smt.descriptor_load(Q_block_ptr, (0, 0))
-    q = smt.view(q_desc, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (MICRO_M, MICRO_K))
+    # q arrives already packed: causal splits the KV range into a prefix pass
+    # and a diagonal pass, and the old code re-loaded + re-packed Q in each.
 
     # torch's is_causal mask is upper-left aligned when Q_CTX != KV_CTX (its
     # math path builds tril(nq, nk) with diagonal 0), so row i attends to
@@ -163,11 +183,19 @@ def _attn_fwd_inner(
         # is BLOCK_N, so max/exp/sum are single axis=1 reductions
         qk_rows = smt.view(qk, (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
 
-        mask_n = (start_n + offs_n) < KV_CTX
-        mask_2d = mask_n[None, :]
-        if (STAGE == 2) or (STAGE == 4):
-            mask_2d = mask_2d & (row_end_2d >= (start_n + offs_n)[None, :])
-        qk_rows = tl.where(mask_2d, qk_rows, -1.0e6)
+        # drop the KV bound whenever BLOCK_N divides KV_CTX: the compare plus
+        # select over the BLOCK_M x BLOCK_N score tile is then pure overhead
+        if KV_CTX % BLOCK_N == 0:
+            if (STAGE == 2) or (STAGE == 4):
+                qk_rows = tl.where(
+                    row_end_2d >= (start_n + offs_n)[None, :], qk_rows, -1.0e6
+                )
+        else:
+            mask_n = (start_n + offs_n) < KV_CTX
+            mask_2d = mask_n[None, :]
+            if (STAGE == 2) or (STAGE == 4):
+                mask_2d = mask_2d & (row_end_2d >= (start_n + offs_n)[None, :])
+            qk_rows = tl.where(mask_2d, qk_rows, -1.0e6)
 
         row_max = tl.max(qk_rows, axis=1)
         m_i_flat = tl.reshape(m_i_2d, (BLOCK_M,))
@@ -286,6 +314,10 @@ def _attn_fwd(
             block_shape=(BLOCK_M, BLOCK_SIZE_K),
             order=(1, 0),
         )
+        # pack Q once per task: the causal path splits the KV range in two and
+        # both passes need the same packed block
+        q_desc = smt.descriptor_load(Q_block_ptr, (0, 0))
+        q = smt.view(q_desc, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (MICRO_M, MICRO_K))
         K_block_ptr = tl.make_block_ptr(
             base=K + k_offset,
             shape=(KV_CTX, HEAD_DIM),
@@ -325,7 +357,7 @@ def _attn_fwd(
                 acc_4d,
                 l_i_2d,
                 m_i_2d,
-                Q_block_ptr,
+                q,
                 K_block_ptr,
                 V_block_ptr,
                 task_m_idx,
@@ -350,7 +382,7 @@ def _attn_fwd(
                     acc_4d,
                     l_i_2d,
                     m_i_2d,
-                    Q_block_ptr,
+                    q,
                     K_block_ptr,
                     V_block_ptr,
                     task_m_idx,
@@ -374,7 +406,7 @@ def _attn_fwd(
                     acc_4d,
                     l_i_2d,
                     m_i_2d,
-                    Q_block_ptr,
+                    q,
                     K_block_ptr,
                     V_block_ptr,
                     task_m_idx,
@@ -417,9 +449,28 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     q_ctx, kv_ctx = q.shape[2], k.shape[2]
     h_q, h_kv = q.shape[1], k.shape[1]
 
-    block_m = _env_int("FLAGGEMS_SPACEMIT_ATTN_BM", 64)
-    block_n = _env_int("FLAGGEMS_SPACEMIT_ATTN_BN", 64)
-    num_ctas = _env_int("FLAGGEMS_SPACEMIT_ATTN_CTAS", 16)
+    # dtype-tiered outer block: f16/bf16 likes 128/128 on shapes with at least
+    # two query blocks of 128, but a 128-wide block halves the block count and
+    # wastes half the tile when the query is shorter (tail 64x64 is 0.48x,
+    # decode 0.59x), so those stay at 64/64.
+    block_m = _env_int("FLAGGEMS_SPACEMIT_ATTN_BM", 0)
+    block_n = _env_int("FLAGGEMS_SPACEMIT_ATTN_BN", 0)
+    if block_m <= 0 or block_n <= 0:
+        # decode: q_len <= 32 pads up to a 32-row tile instead of 64 and runs
+        # 1.5-1.87x faster (q48 would still pad to 64, so the gate is 32)
+        # causal 256 keeps 64/64: two query blocks leave too little work per
+        # program for a 128-wide tile (0.99x), while causal 512 gains 1.15x.
+        wide = (
+            q.dtype in (torch.float16, torch.bfloat16)
+            and q_ctx >= 256
+            and kv_ctx >= 256
+            and (not is_causal or kv_ctx >= 512)
+        )
+        if q_ctx <= 32:
+            block_m = block_n = 32
+        else:
+            block_m = block_n = 128 if wide else 64
+    num_ctas = _env_int("FLAGGEMS_SPACEMIT_ATTN_CTAS", 0)
     micro_m, micro_k, micro_n = _micros_for(q.dtype)
 
     # a Q block shorter than BLOCK_M makes the Q descriptor a 1 x ? tensor and
@@ -456,6 +507,12 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         stage = 1
 
     num_blocks = triton.cdiv(q_ctx_run, block_m) * q.shape[0] * h_q
+    if num_ctas <= 0:
+        # give every program two tasks when the grid is small: with the causal
+        # front/back alternation that pairs one cheap and one expensive block in
+        # the same program (1x1x1024 1.06x, f32 1x4x256 1.18x), and any grid
+        # that already covers 8 cores twice keeps 16.
+        num_ctas = 16 if num_blocks > 32 else max(1, num_blocks // 2)
     num_ctas = max(1, min(num_ctas, num_blocks))
     alt = (
         stage != 1
@@ -510,7 +567,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         )
 
     _run()
-    global _LAST_BLOCK_K
+    global _LAST_FOOTPRINT
     key = (
         block_size_k,
         stage,
@@ -522,18 +579,19 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         num_ctas,
         alt,
     )
-    # two triggers: a new configuration, and any launch that is wider than the
-    # previous one in this process (the buffer shrinks again when a narrower
-    # kernel runs, so 64 -> 32 -> 64 breaks twice)
-    grew = _LAST_BLOCK_K is not None and block_size_k > _LAST_BLOCK_K
-    if (key not in _WARMED or grew) and _env_int(
+    # two triggers: a configuration that has never run, and a launch whose packed
+    # footprint differs from the previous launch in this process in either
+    # direction (128-tile -> 64-tile -> 128-tile breaks a second time)
+    foot = (block_size_k, block_m, block_n)
+    foot_changed = _LAST_FOOTPRINT is not None and foot != _LAST_FOOTPRINT
+    if (key not in _WARMED or foot_changed) and _env_int(
         "FLAGGEMS_SPACEMIT_ATTN_WARMUP", 1
     ) != 0:
-        # see _WARMED: the first launch after the staging buffer grew reads
+        # see _WARMED: the first launch after the staging footprint changed reads
         # stale data, the second one is exact
         _run()
     _WARMED.add(key)
-    _LAST_BLOCK_K = block_size_k
+    _LAST_FOOTPRINT = foot
     if padded:
         return o_run[:, :, :q_ctx].contiguous()
     return o_run
