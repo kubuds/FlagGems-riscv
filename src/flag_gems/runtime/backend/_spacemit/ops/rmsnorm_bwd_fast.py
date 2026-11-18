@@ -174,20 +174,30 @@ def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
     #     and not stale buffers (fresh data per rep still wrong).  Second and
     #     later backwards are exact, which is what a first-execution timing
     #     window around the tile-then-combine pair looks like - and this driver
-    #     has no callable barrier (synchronize() is `pass`), so the 16-bit gate
-    #     stays closed until the launcher offers one or the combine can be made
-    #     independent of pw.
+    #     has no callable barrier (synchronize() is `pass`), so wave41 kept the
+    #     16-bit gate closed.
+    # (3) wave42 closes it by removing the edge instead of ordering it: the
+    #     16-bit path uses _rmsb_dw_direct, which recomputes dW from x/dy/inv in
+    #     one program and never reads pw.  STORE_PW=False then keeps the tile
+    #     from paying for the column sums at all.  Cold-process battery (one
+    #     autograd backward per fresh interpreter) is exact for f16 and bf16 at
+    #     (2048,32)/(4096,32)/(8192,32)/(4096,8); kill switch
+    #     FLAGGEMS_SPACEMIT_RMSB_TILE16=0.
     return (
-        f32
-        and n <= _RMSB_TILE_MAX_N
+        n <= _RMSB_TILE_MAX_N
         and n == triton.next_power_of_2(n)
         and m >= 8
         and _rmsb_tile_bm(m, n) > 0
+        and (
+            f32
+            or os.environ.get("FLAGGEMS_SPACEMIT_RMSB_TILE16", "1") != "0"
+        )
     )
 
 
 @triton.jit
-def _rmsb_dx_tile(X, DY, W, INV, DX, PW, N, BM: tl.constexpr, BN: tl.constexpr):
+def _rmsb_dx_tile(X, DY, W, INV, DX, PW, N, BM: tl.constexpr, BN: tl.constexpr,
+                  STORE_PW: tl.constexpr):
     p = tl.program_id(0)
     idx = p * BM * BN + tl.arange(0, BM * BN)
     x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
@@ -199,7 +209,33 @@ def _rmsb_dx_tile(X, DY, W, INV, DX, PW, N, BM: tl.constexpr, BN: tl.constexpr):
     c = tl.sum(x * dwh, axis=1)[:, None]
     dxv = r * dwh - x * (r * r * r * c / N)
     tl.store(DX + idx, tl.reshape(dxv, (BM * BN,)).to(DX.dtype.element_ty))
-    tl.store(PW + p * BN + tl.arange(0, BN), tl.sum((x * r) * d, axis=0))
+    if STORE_PW:
+        tl.store(PW + p * BN + tl.arange(0, BN), tl.sum((x * r) * d, axis=0))
+
+
+@triton.jit
+def _rmsb_dw_direct(X, DY, INV, DW, M, N, R: tl.constexpr, BN: tl.constexpr):
+    """wave42: dW from x/dy/inv only, no dependence on the dx tile's pw.
+
+    wave40/41: the dw combine reads the tile's per-program partials, and on a
+    cold process the first autograd backward reads them before the tile's
+    stores land (16-bit dw 2.2-2.4e3 against |dw| ~130, dx exact; second and
+    later backwards exact).  The driver has no fence (synchronize() is `pass`),
+    so the fix is to remove the edge instead of ordering it: one program walks
+    the rows in (R x BN) tiles and writes dW itself.  Costs one extra read of
+    x/dy (0.13 ms at (2048,32) f16) and no partials buffer at all.
+    """
+    pc = tl.program_id(0)
+    cols = pc * BN + tl.arange(0, BN)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for r0 in range(0, M, R):
+        rows = r0 + tl.arange(0, R)
+        off = rows[:, None] * N + cols[None, :]
+        xv = tl.load(X + off).to(tl.float32)
+        dv = tl.load(DY + off).to(tl.float32)
+        rv = tl.load(INV + rows).to(tl.float32)[:, None]
+        acc += tl.sum((xv * rv) * dv, axis=0)
+    tl.store(DW + cols, acc.to(DW.dtype.element_ty))
 
 
 def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
@@ -325,13 +361,28 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
         # .synchronize() is `pass` on this driver.
         bm = _rmsb_tile_bm(m, n)
         prb = m // bm
-        pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
-        cb = min(2048, triton.next_power_of_2(n))
         dw = torch.empty(n, dtype=x.dtype, device=x.device)
+        if x.dtype == torch.float32:
+            pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
+            cb = min(2048, triton.next_power_of_2(n))
+            with nested_dispatch(m * n):
+                with torch_device_fn.device(x.device):
+                    _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n,
+                                          BM=bm, BN=n, STORE_PW=True)
+                    _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
+            return dx, dw
+        # wave42: 16-bit dW is recomputed from x/dy/inv by a single program, so
+        # the fold has no input the tile writes.  That removes the first-
+        # autograd-backward race wave41 could not close (this driver's
+        # synchronize() is `pass`), at the cost of one extra read of x/dy.
+        r = 128
+        while r > 8 and m % r:
+            r //= 2
         with nested_dispatch(m * n):
             with torch_device_fn.device(x.device):
-                _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n, BM=bm, BN=n)
-                _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
+                _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, dx, n,
+                                      BM=bm, BN=n, STORE_PW=False)
+                _rmsb_dw_direct[(1,)](x, dy, inv, dw, m, n, R=r, BN=n)
         return dx, dw
     k, tile, bn = _routes(n, m, x.dtype != torch.float32)
     while k > 1 and m % k:

@@ -980,6 +980,13 @@ def _dx_tile_bm(m: int, bn: int) -> int:
             cap //= 2
         return cap if m % cap == 0 else 0
     cap = 1024 if bn <= 8 else 512
+    if bn >= 16:
+        # wave42 probe453: at (2048,32) a 512-row tile leaves four programs on
+        # eight cores and the launch-to-launch idle costs 1.35x - f32 1.135 ->
+        # 0.724 and f16 1.279 -> 0.792 ms with BM=256 (eight programs).  Below
+        # 16 lanes the tile is launch bound instead, so the cap stays put
+        # (wave38: (4096,4) prefers a single 1024-row program).
+        cap = min(cap, max(64, m // 8))
     bm = cap
     while bm > 16 and m % bm:
         bm //= 2
