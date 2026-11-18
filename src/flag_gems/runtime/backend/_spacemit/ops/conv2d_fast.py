@@ -1,4 +1,19 @@
-# wave56 candidate: conv2d for the K3 backend.
+# wave57 candidate: conv2d for the K3 backend.
+#
+# On top of wave56 (ROWS per program, BLOCK_OW following OW, depthwise kernel,
+# NOMASK at ROWS == 1):
+#   - grouped conv (1 < groups < C) is covered: each group is an independent
+#     (CG -> OCG) convolution whose channel slabs sit back to back in x, w and
+#     y, so it runs as one wave56 launch per group on a strided slice.  No
+#     kernel change.  1.5-2.8x against the vendor path on 784 px/group and up,
+#     and the gate keeps the small groups (196-256 px) on the vendor path
+#     because there the dispatch dominates (0.72-0.76x).
+#   - BLOCK_OC=128 whenever OC >= 128: bit-exact (it only changes which program
+#     owns an output channel) and 1.08-1.15x on (1,128,28,28) and
+#     (1,256,14,14).
+#   - the tile picker never returns dot N < 32 (ROWS*BLOCK_OW), which aborted
+#     spine-opt in LowerMMT4DPattern on 16-wide tiles at ROWS=1, and a 16-wide
+#     tile always takes BLOCK_OC=64 (the 32x16 dot aborts).
 #
 # On top of wave55 (prepacked (KH,KW,OC,C) weights, stride support, tile rule):
 #   - ROWS: one program computes ROWS consecutive output rows, stacked along
@@ -43,7 +58,17 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     oc, _, kh, kw = w.shape
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
-        return False
+        # wave57: grouped conv runs as g independent (c/g -> oc/g) problems,
+        # one launch each, so it needs enough area per group to amortise the
+        # dispatch: (1,256,14,14) g8 (196 px/group) measured 0.76x and
+        # (1,32,16,16) g2 (256 px) 0.72x, while 784 px/group and up wins 1.5x+.
+        if c % groups or oc % groups:
+            return False
+        if (c // groups) < 8 or (oc // groups) < 16:
+            return False
+        sh0, sw0 = (stride, stride) if isinstance(stride, int) else stride
+        if groups > 8 or (h // sh0) * (ww // sw0) < 512:
+            return False
     macs = n * oc * h * ww * (kh * kw) * (c // groups)
     # depthwise has a much lower launch floor: the vendor path pads 1 input
     # channel to 16 and copies the whole tensor, so even a 512x7x7 depthwise
@@ -175,7 +200,18 @@ def _depthwise_kernel(X, Wt, Bs, Y,
 
 def _pick_tiles(n, oh, ow, oc, stride=(1, 1)):
     bow = max(16, min(64, triton.next_power_of_2(ow)))
-    boc = 64 if oc >= 64 else 32 if oc >= 32 else 16
+    # wave57 probe950: BLOCK_OC=128 is a free 1.08-1.15x whenever OC >= 128 -
+    # (1,128,28,28) 13.39 -> 11.77, (1,256,14,14) 13.87 -> 12.78 - and it stays
+    # bit-exact because it only changes which program owns an output channel.
+    # BLOCK_C stays 32: 64/128 both rewrite the K accumulation order (not
+    # bit-exact) and are 1.1-1.5x slower.
+    boc = 128 if oc >= 128 else 64 if oc >= 64 else 32 if oc >= 32 else 16
+    # wave57 probe952: BLOCK_OW=16 with BLOCK_OC=32 aborts spine-opt inside
+    # MMT4D (the same assertion wave56 saw at OW=14), and a grouped conv with
+    # 32 channels per group lands there.  A 16-wide tile always takes the
+    # 64-row output block instead.
+    if bow == 16 and boc < 64:
+        boc = 64
     # wave56 sweep (7 shapes x 16 tile combinations): every winner sits at
     # 8-28 programs, i.e. 1-3.5 waves of the 8 cores, so the rule grows ROWS
     # while the grid stays above one wave.  The two exceptions the sweep found:
@@ -186,9 +222,15 @@ def _pick_tiles(n, oh, ow, oc, stride=(1, 1)):
     #     at w32); with BLOCK_OC=32 the 32x16 dot trips a spine-opt MMT4D
     #     assertion.
     max_rows = 8
-    rows = 1
+    rows = 0
     for r in (8, 4, 2):
         if r > max_rows:
+            continue
+        # wave57 probe951: the dot's N is ROWS*BLOCK_OW, and a 16-wide tile at
+        # ROWS=1 (N=16, half an f32 vector register) trips the same MMT4D
+        # assertion from the other side - (1,256,14,14) g8 and (1,32,16,16) g2
+        # both aborted until the picker stopped returning N < 32.
+        if r * bow < 32:
             continue
         grid = n * triton.cdiv(oh, r) * triton.cdiv(ow, bow) * triton.cdiv(oc, boc)
         if grid < 8:
@@ -197,6 +239,8 @@ def _pick_tiles(n, oh, ow, oc, stride=(1, 1)):
             continue
         rows = r
         break
+    if not rows:
+        rows = max(1, 32 // bow)
     return bow, boc, rows
 
 
@@ -229,34 +273,18 @@ def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, 
     return y
 
 
-def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
-                  BLOCK_OW=None, BLOCK_OC=None, ROWS=None):
-    N, C, H, W = input.shape
-    OC, _, KH, KW = weight.shape
-    if groups == C == OC:
-        return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW)
-    if groups != 1:
-        raise NotImplementedError("grouped conv (1 < groups < C) stays on the vendor path")
-    x = input.contiguous()
-    if pad_h or pad_w:
-        x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
-        H, W = x.shape[2], x.shape[3]
-    if C < 16:
-        # keep the dot's K lanes useful: at C=3 (the 7x7 stem) the kernel would
-        # run 3 real lanes of 32; the vendor path padded to 16 before its dot
-        # and wave55 measured the stem on that padded tensor
-        pad_c = 16 - C
-        x = F.pad(x, (0, 0, 0, 0, 0, pad_c))
-        weight = F.pad(weight, (0, 0, 0, 0, 0, pad_c))
-        C = 16
-    wp = weight.permute(2, 3, 0, 1).contiguous()   # (KH, KW, OC, C)
+def _conv_launch(x, weight, bias, y, OH, OW, SH, SW, BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C):
+    """One conv launch over a contiguous (N, C, H, W) slab."""
+    N, C, H, W = x.shape
+    OC, CG, KH, KW = weight.shape
+    wp = weight.permute(2, 3, 0, 1).contiguous()   # (KH, KW, OC, CG)
     bow_pick, boc_pick, rows_pick = _pick_tiles(N, OH, OW, OC, stride=(SH, SW))
     BLOCK_OW = BLOCK_OW or bow_pick
     BLOCK_OC = BLOCK_OC or boc_pick
     ROWS = ROWS or rows_pick
-    BLOCK_C = 32
-    nomask = (ROWS == 1) and (BLOCK_OW >= 32) and (C % BLOCK_C == 0) and (OW % BLOCK_OW == 0) and (OC % BLOCK_OC == 0)
-    y = torch.empty((N, OC, OH, OW), dtype=x.dtype, device=x.device)
+    BLOCK_C = BLOCK_C or 32
+    nomask = ((ROWS == 1) and (BLOCK_OW >= 32)
+              and (CG % BLOCK_C == 0) and (OW % BLOCK_OW == 0) and (OC % BLOCK_OC == 0))
     grid = (N * triton.cdiv(OH, ROWS) * triton.cdiv(OW, BLOCK_OW) * triton.cdiv(OC, BLOCK_OC),)
     _conv2d_direct_kernel[grid](
         x, wp, bias if bias is not None else x, y,
@@ -268,4 +296,45 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         BLOCK_OW=BLOCK_OW, BLOCK_OC=BLOCK_OC, BLOCK_C=BLOCK_C,
         ROWS=ROWS, NOMASK=nomask,
     )
+    return y
+
+
+def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
+                  BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None):
+    N, C, H, W = input.shape
+    OC, CG, KH, KW = weight.shape
+    if groups == C == OC:
+        return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW)
+    if C != CG * groups or OC % groups:
+        raise NotImplementedError("channel counts do not divide by groups")
+    x = input.contiguous()
+    if pad_h or pad_w:
+        x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
+        H, W = x.shape[2], x.shape[3]
+    if C < 16:
+        if groups > 1:
+            raise NotImplementedError("grouped conv with fewer than 16 channels")
+        # keep the dot's K lanes useful: at C=3 (the 7x7 stem) the kernel would
+        # run 3 real lanes of 32; the vendor path padded to 16 before its dot
+        # and wave55 measured the stem on that padded tensor
+        pad_c = 16 - C
+        x = F.pad(x, (0, 0, 0, 0, 0, pad_c))
+        weight = F.pad(weight, (0, 0, 0, 0, 0, pad_c))
+        C = 16
+        CG = 16
+    y = torch.empty((N, OC, OH, OW), dtype=x.dtype, device=x.device)
+    if groups == 1:
+        return _conv_launch(x, weight, bias, y, OH, OW, SH, SW, BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C)
+    # wave57: 1 < groups < C - the last conv case without coverage.  Each group
+    # is an independent (CG -> OCG) convolution whose channel slabs sit back to
+    # back in x, weight and y, so it is one wave56 launch per group on a strided
+    # slice; the kernel itself is untouched.  (Folding the group into the batch
+    # axis instead reads the wrong weight rows past group 0 - probe952.)
+    OCG = OC // groups
+    xv = x.view(N, groups, CG, H, W)
+    wv = weight.view(groups, OCG, CG, KH, KW)
+    for gi in range(groups):
+        bg = bias[gi * OCG:(gi + 1) * OCG] if bias is not None else None
+        _conv_launch(xv[:, gi], wv[gi], bg, y[:, gi * OCG:(gi + 1) * OCG],
+                     OH, OW, SH, SW, BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C)
     return y
