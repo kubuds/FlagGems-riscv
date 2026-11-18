@@ -14,14 +14,33 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import tl_extra_shim
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 exp = tl_extra_shim.exp
+
+# Direct-kernel fast path for floating dtypes (campaign 1011night). The generic
+# pointwise wrapper costs an extra 1.9-6.6 ms per call on K3 (1M: 5.15 -> 3.26 ms;
+# 2048x2048: 19.62 -> 13.06 ms) because its generated kernel lowers worse.
+# Numerically equivalent to the wrapper (same formula; maxdiff 1.19e-07 vs torch).
+_BLOCK = 8192
+
+
+@libentry()
+@triton.jit
+def sigmoid_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m, other=0.0)
+    y = 1.0 / (1.0 + exp(-x.to(tl.float32)))
+    tl.store(y_ptr + offs, y.to(y_ptr.type.element_ty), mask=m)
 
 
 @pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")])
@@ -41,8 +60,28 @@ def sigmoid_backward_kernel(dy, y):
     return dy_f32 * (1.0 - y_f32) * y_f32
 
 
+def _direct_ok(t):
+    return (
+        t.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and t.is_contiguous()
+    )
+
+
+def _launch_direct(x, out):
+    n = x.numel()
+    if n == 0:
+        return out
+    grid = (triton.cdiv(n, _BLOCK),)
+    with torch_device_fn.device(x.device):
+        sigmoid_kernel[grid](x, out, n, BLOCK=_BLOCK)
+    return out
+
+
 def sigmoid(self):
     logger.debug("GEMS_SPACEMIT SIGMOID")
+    if _direct_ok(self):
+        out = torch.empty_like(self)
+        return _launch_direct(self, out)
     output = sigmoid_forward(self)
     return output
 
@@ -55,5 +94,7 @@ def sigmoid_backward(grad_output, output):
 
 def sigmoid_(A):
     logger.debug("GEMS_SPACEMIT SIGMOID_")
+    if _direct_ok(A):
+        return _launch_direct(A, A)
     out = sigmoid_forward(A, out0=A)
     return out

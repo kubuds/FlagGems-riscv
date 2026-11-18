@@ -35,8 +35,8 @@ from .pow import (
     pow_tensor_tensor_,
 )
 from .rsqrt import rsqrt, rsqrt_
-from .sigmoid import sigmoid
-from .silu import silu
+from .sigmoid import sigmoid, sigmoid_
+from .silu import silu, silu_
 from .softmax import softmax
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 
@@ -68,7 +68,9 @@ __all__ = [
     "rsqrt_",
     "scaled_dot_product_attention",
     "sigmoid",
+    "sigmoid_",
     "silu",
+    "silu_",
     "softmax",
     "thnn_conv2d",
     "where_scalar_other",
