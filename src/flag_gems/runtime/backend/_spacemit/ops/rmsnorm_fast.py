@@ -117,11 +117,22 @@ _RMS_TILE_N = 64
 _RMS_TILE_MIN_M = 256
 
 
-def _rms_tile_bm(m: int) -> int:
-    bm = 128
+def _rms_tile_bm(m: int, bn: int = _RMS_TILE_N, f16: bool = False) -> int:
+    """wave50 probe819: ~8K elements per program (16K on 16-bit), <= m//8 rows.
+
+    The wave38 form was a flat 128 rows whenever M divided it, which leaves 4
+    programs at M=512 (0.261 ms against 0.203 at BM=64) and, at N=128, 256 rows
+    from the wave49 band picker's "ties to the larger BM" rule - that one costs
+    1.41x at (2048,128) f32 (0.928 against 0.656) and 1.39x at (4096,128).
+    Measured optima: N=64 f32 -> BM 128 at M>=1024, 64 at 512; N=128 f32 -> 64;
+    16-bit prefers one size up (N=128 f16 128, N=64 f16 256).
+    """
+    elems = 16384 if f16 else 8192
+    bm = min(elems // bn, max(32, m // 8), 256)
+    bm = 1 << max(5, bm.bit_length() - 1)
     while bm > 32 and m % bm:
         bm //= 2
-    return bm if m % bm == 0 else 0
+    return bm if m % bm == 0 and m >= 2 * bm else 0
 
 
 # ---------------- wave39: narrow-row tile (N <= 32) ----------------
@@ -528,13 +539,18 @@ def _wildcard_entry(N: int, f16: bool):
     return _WILDCARD
 
 
-def _rms_band_pick(m: int, n: int):
-    """(BM, kernel, BN) for the 33..255 band, or (0, None, 0) (wave49)."""
+def _rms_band_pick(m: int, n: int, f16: bool = False):
+    """(BM, kernel, BN) for the 33..255 band, or (0, None, 0) (wave49/50)."""
+    if n == triton.next_power_of_2(n):
+        # wave50 probe819: powers of two take the element-count tile whenever
+        # that BM divides M - at N=128 the wave49 "larger BM" tie-break was
+        # 1.4x slower than BM=64 on f32.
+        bm2 = _rms_tile_bm(m, n, f16)
+        if bm2:
+            return bm2, _rms_tile, n
     if rms_band_rowmask_enabled() and m >= 256:
         bm = _rms_band_bm2(m, n)
         if bm:
-            if n == triton.next_power_of_2(n) and m % bm == 0:
-                return bm, _rms_tile, n
             return bm, _rms_tile_mm, triton.next_power_of_2(n)
     if n == triton.next_power_of_2(n):
         bm = _rms_narrow_bm(m, n)
@@ -555,7 +571,7 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
         if rms_band_rowmask_enabled() and M >= 256 and _rms_band_bm2(M, N):
             return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M:
-        if _rms_tile_bm(M) >= 32:
+        if _rms_tile_bm(M, N, f16) >= 32:
             return True
     # wave48: the masked tile covers every width in 33..255; only the two
     # powers of two in the band keep the unmasked kernel.  probe619: below 256
@@ -564,7 +580,7 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
     # wave49: _rms_band_pick adds the row-masked kernel above 256 rows, which
     # lifts the BM|M constraint (and with it every odd row count).
     if _RMS_TILE_MAX_N < N <= _RMS_BAND_MAX_N and M >= 8:
-        bm, _, _ = _rms_band_pick(M, N)
+        bm, _, _ = _rms_band_pick(M, N, f16)
         if bm and M >= 2 * bm:
             return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
@@ -609,7 +625,7 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
                             (x, w, y, inv, N, eps, bm, bn))
             return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M:
-        bm = _rms_tile_bm(M)
+        bm = _rms_tile_bm(M, N, f16)
         if bm >= 32:
             # wave38: one pass over the tile; nesting is what makes it win
             # above 32K elements (probe402).
@@ -622,7 +638,7 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
         # counts (1000/3000/4095) keep a 32..256-row tile instead of BM=8 or
         # the generic kernel.  Powers of two stay on the unmasked kernel when
         # BM divides M.
-        bm, kern, bn = _rms_band_pick(M, N)
+        bm, kern, bn = _rms_band_pick(M, N, f16)
         # wave47: never a single-program tile (wave38: 40% at (256,32)).  The
         # official (64,64) row is exactly that case - bm lands on M and one
         # program serves 4096 elements, measured 0.286 -> 0.300 ms.

@@ -147,12 +147,85 @@ def rmsb_fast_enabled() -> bool:
 # but the routed route is better), so the tile gate is power-of-two N <= 32.
 _RMSB_TILE_MAX_N = 32
 
+# ---------------- wave50: row-masked tile for the whole 33..255 band ---------
+# probe801: the backward has the same hole the forward had in wave47/48 - the
+# dx route table starts at 64 and the wave34 wildcard starts at N=256, so every
+# 33..63 width and every non-pow2 width in 65..255 ran the generic FlagGems
+# backward.  Extending the wildcard down to 33 (probe801, op level, f32/f16):
+#   (1024,33) 3.28/4.54 -> 2.85/3.07, (2048,63) 6.22/8.43 -> 4.91/5.99,
+#   (2048,96) 7.31/8.34 -> 5.34/6.68, (2048,160) 10.01/10.43 -> 5.35/6.40,
+#   (4096,255) 23.63/25.03 -> 12.91/14.38, (1000,96) 3.96/7.82 -> 2.70/3.15.
+# The routed kernel still reads every row twice (sum pass, apply pass) and pays
+# a per-row loop; the one-pass tile that wave39 built for N<=32 does dx and the
+# dw partials from the same registers.  This wave makes that tile masked so it
+# can serve any width up to 255, with the forward's wave-model BM picker.
+_RMSB_BAND_MAX_N = 255
+# wave50 probe810/812/813: the masked tile's sweet spot is a 4K-element block
+# (BM 64 at BN=64, BM 32 at BN=128) and it loses badly once the row is 256
+# lanes wide - a (16..32, 256) tile costs 2.4-4.5 ms at (2048,160) against
+# 1.65-1.70 for the routed dx kernel at K8/T512.  So the tile takes 33..127 and
+# the routed dx takes 128..255, where K8 (f32) / K16 (f16) beat the wave34
+# wildcard's K4 by 1.4-1.9x.
+_RMSB_BAND_TILE_MAX_N = 127
+_RMSB_BAND_MIN_N = 128
+_RMSB_MASK_MIN_M = 256
+_WARMED = set()
+
+
+def _rmsb_band_bm(m: int, bn: int) -> int:
+    """Row-masked picker for 33..127 (wave50): one 4K-element block per program."""
+    bm = max(8, min(256, 4096 // bn))
+    if bm * bn > 32768:
+        bm = max(8, 32768 // bn)
+    if m < 2 * bm:
+        bm = 1 << (max(8, m // 2).bit_length() - 1)
+    return bm if bm and m >= 2 * bm else 0
+
+
+def _rmsb_band_k(m: int, f16: bool) -> int:
+    """Rows/program for the routed dx kernel in 128..255 (probe811)."""
+    k = 4
+    if m >= 256:
+        k = 16 if f16 else 8
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
 
 def _rmsb_tile_bm(m: int, bn: int) -> int:
-    bm = min(1024, max(64, 8192 // bn), max(64, m // 2))
+    bm = min(512, max(64, 8192 // bn), max(64, m // 2))
+    # wave50: this could return a non-power-of-two BM (500 at (1000,32)), and
+    # the tile's flat tl.arange(0, BM*BN) then raises CompilationError.  Snap
+    # down first, exactly like the forward's _rms_narrow_bm fix.
+    bm = 1 << (bm.bit_length() - 1)
     while bm > 8 and m % bm:
         bm //= 2
     return bm if m % bm == 0 else 0
+
+
+def _rmsb_tile_plan(n: int, m: int, f32: bool = True):
+    """(BM, masked, BN) for the one-pass tile, or None (wave50)."""
+    if n < 1 or n > _RMSB_BAND_TILE_MAX_N or m < 8:
+        return None
+    if n == triton.next_power_of_2(n):
+        bm = _rmsb_tile_bm(m, n)
+        # wave49's forward rule: keep the unmasked tile while its BM still
+        # gives a sensible program count; above 512 rows/program the row mask
+        # is worth its 1-2%.  wave50 probe817: below 32 rows/program the
+        # unmasked tile is launch bound instead - (3000,32) ran 375 eight-row
+        # programs at 1.58 ms against 0.60 for the masked tile at BM=128.
+        if bm and 32 <= bm <= 512:
+            return bm, False, n
+    bn = triton.next_power_of_2(n)
+    if m < _RMSB_MASK_MIN_M:
+        return None
+    bm = _rmsb_band_bm(m, bn)
+    return (bm, True, bn) if bm else None
+
+
+def _rmsb_band_ok(n: int, m: int) -> bool:
+    """True when the 128..255 routed-dx band serves this shape (wave50)."""
+    return _RMSB_BAND_MIN_N <= n <= _RMSB_BAND_MAX_N and m >= 8
 
 
 def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
@@ -184,15 +257,68 @@ def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
     #     (2048,32)/(4096,32)/(8192,32)/(4096,8); kill switch
     #     FLAGGEMS_SPACEMIT_RMSB_TILE16=0.
     return (
-        n <= _RMSB_TILE_MAX_N
-        and n == triton.next_power_of_2(n)
-        and m >= 8
-        and _rmsb_tile_bm(m, n) > 0
+        _rmsb_tile_plan(n, m, f32) is not None
         and (
             f32
             or os.environ.get("FLAGGEMS_SPACEMIT_RMSB_TILE16", "1") != "0"
         )
     )
+
+
+@triton.jit
+def _rmsb_dx_tile_m(X, DY, W, INV, DX, PW, M, N, BM: tl.constexpr,
+                    BN: tl.constexpr, STORE_PW: tl.constexpr):
+    """wave50: row+column masked one-pass tile, so BM need not divide M and BN
+    need not equal N.  Same body as _rmsb_dx_tile; the only addition is the
+    (rows < M) & (cols < N) mask and the N stride between rows."""
+    p = tl.program_id(0)
+    rows = p * BM + tl.arange(0, BM)
+    rm = rows < M
+    cols = tl.arange(0, BN)
+    cm = cols < N
+    off = rows[:, None] * N + cols[None, :]
+    mask = rm[:, None] & cm[None, :]
+    x = tl.load(X + off, mask=mask, other=0.0).to(tl.float32)
+    d = tl.load(DY + off, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W + cols, mask=cm, other=0.0).to(tl.float32)[None, :]
+    r = tl.load(INV + rows, mask=rm, other=0.0).to(tl.float32)[:, None]
+    dwh = d * w
+    c = tl.sum(x * dwh, axis=1)[:, None]
+    dxv = r * dwh - x * (r * r * r * c / N)
+    tl.store(DX + off, dxv.to(DX.dtype.element_ty), mask=mask)
+    if STORE_PW:
+        tl.store(PW + p * BN + cols, tl.sum((x * r) * d, axis=0), mask=cm)
+
+
+@triton.jit
+def _rmsb_dw_direct_m(X, DY, INV, DW, M, N, R: tl.constexpr, BN: tl.constexpr):
+    """wave42's direct dW, masked for the 33..255 band (wave50)."""
+    pc = tl.program_id(0)
+    cols = pc * BN + tl.arange(0, BN)
+    cm = cols < N
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for r0 in range(0, M, R):
+        rows = r0 + tl.arange(0, R)
+        rm = rows < M
+        off = rows[:, None] * N + cols[None, :]
+        mask = rm[:, None] & cm[None, :]
+        xv = tl.load(X + off, mask=mask, other=0.0).to(tl.float32)
+        dv = tl.load(DY + off, mask=mask, other=0.0).to(tl.float32)
+        rv = tl.load(INV + rows, mask=rm, other=0.0).to(tl.float32)[:, None]
+        acc += tl.sum((xv * rv) * dv, axis=0)
+    tl.store(DW + cols, acc.to(DW.dtype.element_ty), mask=cm)
+
+
+@triton.jit
+def _rmsb_dw_comb_bn(PW, DW, N, NRB, BN: tl.constexpr):
+    """wave50: combine partials whose row stride is BN (>= N), not N."""
+    pc = tl.program_id(0)
+    cols = pc * BN + tl.arange(0, BN)
+    cm = cols < N
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for s in range(0, NRB):
+        acc += tl.load(PW + s * BN + cols, mask=cm, other=0.0)
+    tl.store(DW + cols, acc.to(DW.dtype.element_ty), mask=cm)
 
 
 @triton.jit
@@ -255,7 +381,9 @@ def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
         return False
     if _rmsb_tile_ok(n, x.numel() // n, x.dtype == torch.float32):
         return inv_rms is not None and inv_rms.numel() >= x.numel() // n
-    if _routes(n, x.numel() // n, x.dtype != torch.float32) is None:
+    if _routes(n, x.numel() // n, x.dtype != torch.float32) is None and not _rmsb_band_ok(
+        n, x.numel() // n
+    ):
         return False
     if inv_rms is None or inv_rms.numel() < x.numel() // n:
         return False
@@ -347,11 +475,32 @@ def _rmsb_dw_comb(PW, DW, N, NRB, BN: tl.constexpr, NOMASK: tl.constexpr):
         tl.store(DW + cols, acc.to(DW.dtype.element_ty), mask=cmask)
 
 
-def rmsb_fast(x, dy, inv_rms, weight, n, m):
+def _first_launch_warm(key) -> bool:
+    """wave50: True on the first launch of a variant in this process.
+
+    probe824/825: the very first autograd backward of a fresh process at
+    (777,16) f32 returned dx 2.9 / dw 31.8 while the same kernel, same tensors
+    and same inv were exact on every later call and exact when called directly
+    (probe821/822) - dy and inv verified bit-equal inside the call, and only
+    program 0's rows were wrong.  The driver has no fence
+    (torch_device_fn.synchronize() is `pass`), so the first execution of a
+    freshly compiled variant can read a producer that has not landed.  A second
+    launch of the same grid overwrites the bad tile; it costs one extra launch
+    per (variant, dtype) per process, which the compile on that same call
+    dominates anyway.
+    """
+    if key in _WARMED:
+        return False
+    _WARMED.add(key)
+    return True
+
+
+def _rmsb_fast_once(x, dy, inv_rms, weight, n, m):
     """Launch the fast backward; returns (dx, dw). Caller must have checked ok()."""
     dx = torch.empty_like(x)
     inv = inv_rms.contiguous().reshape(-1)
-    if _rmsb_tile_ok(n, m, x.dtype == torch.float32):
+    plan = _rmsb_tile_plan(n, m, x.dtype == torch.float32)
+    if plan is not None:
         # wave39: one pass over a narrow tile does dx and the dw partials.
         # wave40 probe429: the tile and the combine must sit in the same nested
         # block - a plain launch that follows a nested one is not ordered
@@ -359,17 +508,50 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
         # tile's stores landed (dw 4.5e2 against |dw| 105 at (2048,32) f16).
         # The sync that wave39 added here did nothing: torch_device_fn
         # .synchronize() is `pass` on this driver.
-        bm = _rmsb_tile_bm(m, n)
-        prb = m // bm
+        bm, masked, bn = plan
+        prb = triton.cdiv(m, bm)
         dw = torch.empty(n, dtype=x.dtype, device=x.device)
-        if x.dtype == torch.float32:
-            pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
-            cb = min(2048, triton.next_power_of_2(n))
+        if masked and n > _RMSB_TILE_MAX_N:
+            # wave50 probe808: in the 33..255 band the tile's own column reduce
+            # (`tl.sum((x*r)*d, axis=0)` for the pw partials) costs 1.1 ms at
+            # (2048,160) on top of a 2.7 ms dx body, while the parallel
+            # _rmsb_dw_fold does the same job in 0.88 ms - and it shrinks the
+            # element block from 1024 lanes (wave34's wildcard block) to the
+            # band's own power of two.  So the tile writes dx only and dW comes
+            # from the fold.  All three launches stay in one nested block: a
+            # plain launch after a nested one is not ordered against it on this
+            # driver (wave40 probe429), and the tile is 2.2x faster nested.
+            fb = min(256, bn)
+            fprb = triton.cdiv(m, _DW_RB)
+            pw = torch.empty((fprb, n), dtype=torch.float32, device=x.device)
             with nested_dispatch(m * n):
                 with torch_device_fn.device(x.device):
-                    _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n,
-                                          BM=bm, BN=n, STORE_PW=True)
-                    _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
+                    _rmsb_dx_tile_m[(prb,)](x, dy, weight, inv, dx, dx, m, n,
+                                            BM=bm, BN=bn, STORE_PW=False)
+                    _rmsb_dw_fold[(triton.cdiv(n, fb), fprb)](
+                        x, dy, inv, pw, m, n, _DW_RB, fb, (n % fb) == 0
+                    )
+                    _rmsb_dw_comb[(triton.cdiv(n, 2048),)](
+                        pw, dw, n, fprb, 2048, (n % 2048) == 0
+                    )
+            return dx, dw
+        if x.dtype == torch.float32:
+            pw = torch.empty((prb, bn), dtype=torch.float32, device=x.device)
+            cb = min(2048, bn)
+            with nested_dispatch(m * n):
+                with torch_device_fn.device(x.device):
+                    if masked:
+                        _rmsb_dx_tile_m[(prb,)](x, dy, weight, inv, dx, pw, m,
+                                                 n, BM=bm, BN=bn, STORE_PW=True)
+                        _rmsb_dw_comb_bn[(triton.cdiv(bn, cb),)](
+                            pw, dw, n, prb, cb
+                        )
+                    else:
+                        _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n,
+                                              BM=bm, BN=n, STORE_PW=True)
+                        _rmsb_dw_comb_bn[(triton.cdiv(n, cb),)](
+                            pw, dw, n, prb, cb
+                        )
             return dx, dw
         # wave42: 16-bit dW is recomputed from x/dy/inv by a single program, so
         # the fold has no input the tile writes.  That removes the first-
@@ -380,9 +562,37 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
             r //= 2
         with nested_dispatch(m * n):
             with torch_device_fn.device(x.device):
-                _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, dx, n,
-                                      BM=bm, BN=n, STORE_PW=False)
-                _rmsb_dw_direct[(1,)](x, dy, inv, dw, m, n, R=r, BN=n)
+                if masked:
+                    _rmsb_dx_tile_m[(prb,)](x, dy, weight, inv, dx, dx, m, n,
+                                            BM=bm, BN=bn, STORE_PW=False)
+                    _rmsb_dw_direct_m[(1,)](x, dy, inv, dw, m, n, R=r, BN=bn)
+                else:
+                    _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, dx, n,
+                                          BM=bm, BN=n, STORE_PW=False)
+                    _rmsb_dw_direct[(1,)](x, dy, inv, dw, m, n, R=r, BN=n)
+        return dx, dw
+    if _rmsb_band_ok(n, m):
+        # wave50 probe810/812/813: above 127 columns the masked tile is not
+        # competitive (a 256-lane row costs more than the extra read the routed
+        # kernel pays), so 128..255 keep the routed dx kernel - with K8 (f32) /
+        # K16 (f16) instead of the wildcard's K4, which is 1.4-1.9x on every
+        # measured row - and a 256-column dW fold.
+        k = _rmsb_band_k(m, x.dtype != torch.float32)
+        fb = 256
+        fprb = triton.cdiv(m, _DW_RB)
+        dw = torch.empty(n, dtype=x.dtype, device=x.device)
+        pw = torch.empty((fprb, n), dtype=torch.float32, device=x.device)
+        with nested_dispatch(m * n):
+            with torch_device_fn.device(x.device):
+                _rmsb_dx[(triton.cdiv(m, k),)](
+                    x, dy, weight, inv, dx, n, k, 512, False
+                )
+                _rmsb_dw_fold[(triton.cdiv(n, fb), fprb)](
+                    x, dy, inv, pw, m, n, _DW_RB, fb, (n % fb) == 0
+                )
+                _rmsb_dw_comb[(triton.cdiv(n, 2048),)](
+                    pw, dw, n, fprb, 2048, (n % 2048) == 0
+                )
         return dx, dw
     k, tile, bn = _routes(n, m, x.dtype != torch.float32)
     while k > 1 and m % k:
@@ -411,3 +621,16 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
         cb = min(2048, triton.next_power_of_2(n))
         _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, (n % cb) == 0)
     return dx, dw
+
+
+def rmsb_fast(x, dy, inv_rms, weight, n, m):
+    """Entry point: the wave50 first-launch guard wraps _rmsb_fast_once."""
+    plan = _rmsb_tile_plan(n, m, x.dtype == torch.float32)
+    if plan is None and not _rmsb_band_ok(n, m):
+        return _rmsb_fast_once(x, dy, inv_rms, weight, n, m)
+    key = ("rmsb", n, m, plan, x.dtype)
+    warm = _first_launch_warm(key)
+    out = _rmsb_fast_once(x, dy, inv_rms, weight, n, m)
+    if warm:
+        out = _rmsb_fast_once(x, dy, inv_rms, weight, n, m)
+    return out
