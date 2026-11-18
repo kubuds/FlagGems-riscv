@@ -1308,11 +1308,15 @@ class Attention(torch.autograd.Function):
                         # loses at both sizes (0.94x at 4096, 0.98x at 8192),
                         # so this tier is group >= 32, nq <= 128, rows <=
                         # 32768.  Plain stays out at this size (1.06x at 8192
-                        # rows).
+                        # rows).  wave103 measured the next doubling: 65536
+                        # rows g1024 q64 kv512 2.59x, g512 q128 kv512 1.42x,
+                        # f32 g512 q128 1.88x, and the 32768 tier still reads
+                        # 1.47x (g256 q128) / 2.38x (g512 q64 kv1024 d128), so
+                        # the cap moves to 65536; 131072 is unmeasured.
                         or (
                             group_size >= 32
                             and q.shape[2] <= 128
-                            and q.shape[2] * group_size <= 32768
+                            and q.shape[2] * group_size <= 65536
                         )
                     )
                 )
