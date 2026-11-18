@@ -57,6 +57,12 @@ Variants folded in:
   256 rows and the KV at least 256 (causal: 512), and 64/64 otherwise.  A wide
   tile halves the block count and wastes half of it on short queries (causal
   tail 64x64 0.48x, decode 0.59x) while winning 1.03-1.17x on the long ones.
+* the M tile also follows the query length for decode/short prompts (8/16/32
+  rows at q <= 8/16/32): a 32-row tile with one real row spends 31/32 of both
+  dots on padding, so 2.5-4.1x on decode and 1.8-2.7x on q16-32.  On
+  non-square shapes the N tile is 256 (1.06-1.26x, fewer tile iterations);
+  square shapes keep BM == BN because the causal prefix pass cannot overrun
+  its KV range without a mask.
 * the grid is halved when the block count is at most 32 so every program gets
   two tasks, which the front/back alternation then balances (1x1x1024 1.06x,
   f32 1x4x256 1.18x); larger grids keep 16 programs.
@@ -456,9 +462,13 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     block_m = _env_int("FLAGGEMS_SPACEMIT_ATTN_BM", 0)
     block_n = _env_int("FLAGGEMS_SPACEMIT_ATTN_BN", 0)
     if block_m <= 0 or block_n <= 0:
-        # decode: q_len <= 32 pads up to a 32-row tile instead of 64 and runs
-        # 1.5-1.87x faster (q48 would still pad to 64, so the gate is 32)
-        # causal 256 keeps 64/64: two query blocks leave too little work per
+        # outer M tile follows the query length: the kernel computes the whole
+        # BLOCK_M x BLOCK_N score tile whatever the query holds, so a 32-row
+        # tile with one real row (decode) spends 31/32 of both dots on padding.
+        # 8/16/32 by query length is 2.5-4.1x over the old 32/32 on decode and
+        # short prompts (q1 kv512 d64 4.67 -> 1.14 ms, q1 kv2048 d128 22.8 ->
+        # 4.4 ms); q48 would still pad to 64, so the last tier is 32.
+        # causal 256 keeps 64: two query blocks leave too little work per
         # program for a 128-wide tile (0.99x), while causal 512 gains 1.15x.
         wide = (
             q.dtype in (torch.float16, torch.bfloat16)
@@ -466,12 +476,33 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
             and kv_ctx >= 256
             and (not is_causal or kv_ctx >= 512)
         )
-        if q_ctx <= 32:
-            block_m = block_n = 32
+        if q_ctx <= 8:
+            bm = 8
+        elif q_ctx <= 16:
+            bm = 16
+        elif q_ctx <= 32:
+            bm = 32
         else:
-            block_m = block_n = 128 if wide else 64
+            bm = 128 if wide else 64
+        # N tile: the old tier always ran BM == BN.  Scanned apart, a 256-wide
+        # score tile is worth 1.06-1.26x on non-square shapes (q64 kv512 1.14x,
+        # q128 kv512 d128 1.26x, q256 kv512 1.19x) and 1.09-1.26x on plain
+        # short prompts, while square plain is neutral to 0.99x and square
+        # causal cannot use BM < BN: the prefix pass (STAGE 1) carries no KV
+        # bound mask, so its range has to be a whole number of N tiles.
+        if max(q_ctx, bm) == kv_ctx:
+            bm = max(bm, 32)
+            block_m = bm
+            block_n = bm
+        else:
+            block_m = bm
+            block_n = min(256, max(32, triton.next_power_of_2(kv_ctx)))
     num_ctas = _env_int("FLAGGEMS_SPACEMIT_ATTN_CTAS", 0)
     micro_m, micro_k, micro_n = _micros_for(q.dtype)
+    # the f16 micro group is 16 rows; an 8-row outer tile (decode) uses the
+    # 8-row micro tile instead, which the backend accepts for f16 as well
+    if block_m < micro_m:
+        micro_m = block_m
 
     # a Q block shorter than BLOCK_M makes the Q descriptor a 1 x ? tensor and
     # the smt.view into micro tiles fails to lower (decode: q_len 1).  Pad the
@@ -581,15 +612,22 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
     )
     # two triggers: a configuration that has never run, and a launch whose packed
     # footprint differs from the previous launch in this process in either
-    # direction (128-tile -> 64-tile -> 128-tile breaks a second time)
+    # direction (128-tile -> 64-tile -> 128-tile breaks a second time).  When the
+    # K tile widens the first launch has been seen to stay wrong even after one
+    # repeat (one unreproduced 2.8 maxdiff in an A/B run, 56/56 transition pairs
+    # clean afterwards), so that path gets a third launch; it costs one launch on
+    # a head-dim change only.
     foot = (block_size_k, block_m, block_n)
     foot_changed = _LAST_FOOTPRINT is not None and foot != _LAST_FOOTPRINT
+    widen = _LAST_FOOTPRINT is not None and foot[0] > _LAST_FOOTPRINT[0]
     if (key not in _WARMED or foot_changed) and _env_int(
         "FLAGGEMS_SPACEMIT_ATTN_WARMUP", 1
     ) != 0:
         # see _WARMED: the first launch after the staging footprint changed reads
         # stale data, the second one is exact
         _run()
+        if widen:
+            _run()
     _WARMED.add(key)
     _LAST_FOOTPRINT = foot
     if padded:
