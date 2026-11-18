@@ -219,7 +219,7 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
                               conv_fast_enabled, conv_phase_applies)
 
     dil_tap = (dil_h == dil_w and dil_h > 1 and groups == 1
-               and KH == KW and KH in (3, 5) and str_h == 1 and str_w == 1
+               and KH == KW and KH in (3, 5, 7) and str_h == 1 and str_w == 1
                and 3 <= C <= 512 and 32 <= OC <= 512 and OH * OW >= 16
                and (KH == 3 or dil_h > 1
                     or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")

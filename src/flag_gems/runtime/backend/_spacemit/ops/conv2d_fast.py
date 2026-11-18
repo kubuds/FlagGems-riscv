@@ -727,7 +727,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # an affine shift of m only inside a plane of width PWW, so the last
     # PWW-OW columns of every row are computed and thrown away at the crop
     MY = OH * PWW
-    bm, bn = _tap_tiles(OC, MY)
+    bm, bn = _tap_tiles(OC, MY, CP)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -1183,6 +1183,9 @@ def _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w, out_dtype=None):
 # across calls.  The weight copy is KH*KW*OC*C floats; at (1,512,7,7) it is
 # 9.4 MB, which is 1-2 ms if rebuilt every forward, so it is cached (see
 # _tap_weights for what a safe key looks like).
+_TAP_KERNELS = ((1, 3), (3, 1), (1, 5), (5, 1), (1, 7), (7, 1),
+                (3, 3), (5, 5), (7, 7))
+
 _TAP_W = {}
 _TAP_BUF = {}
 # wave70: per-(binary, shape) first-launch guard, the rmsb_fast wave50/53
@@ -1250,7 +1253,7 @@ def _tap_flat_buf(c, ih, iw, tail, dtype, device):
     return buf
 
 
-def _tap_tiles(oc, my):
+def _tap_tiles(oc, my, c=None):
     """Tile pick for the shifted-tap GEMM (wave68, probe1500/1505/1507/1508).
 
     BLOCK_N=128 once the column extent is at least 128 columns: 2.93 vs 3.00
@@ -1268,6 +1271,11 @@ def _tap_tiles(oc, my):
     bn = 128 if my >= 128 else 64
     tiles32 = ((oc + 31) // 32) * ((my + bn - 1) // bn)
     bm = 64 if (tiles32 <= 16 and my <= 256) else 32
+    if c is not None and c > 512:
+        # wave72: the A block is bm*c*4 bytes of TCM (96 KB); at c=1024 the
+        # 32/64-row tiles need 128-256 KB and the launch aborts with
+        # "tls memory pool alloc failed", while bm=16 needs 64 KB and runs.
+        bm = 16
     return bm, bn
 
 
@@ -1306,7 +1314,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     IH, IW = H + 2 * pad_h, W + 2 * pad_w
     SROW = IH * IW
     MY = OH * IW
-    bm, bn = _tap_tiles(OC, MY)
+    bm, bn = _tap_tiles(OC, MY, CP)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -1459,11 +1467,20 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
 
     sh * sw <= 4: stride 4 loses (0.79x against the old route at 112 px) because
     the phase copy degrades to a stride-4 gather in both axes - 1 of every 4
-    elements per cache line, times 16 planes.
+    elements per cache line, times 16 planes.  wave72: stride 3 is the one
+    exception - 9 planes at a 1-in-3 gather still beat the old tap kernel by
+    1.60-2.65x (and official by 2.4-7.3x), measured on 3x3/5x5 at 28-112 px.
+    wave72 also opens KH=KW=7: the 7x7 class had no route at all for C > 8
+    (the 32-lane tap kernel aborts at 112 px with "tls memory pool alloc
+    failed" and official measures 0.54-8.5 s), and the 49-dot phase kernel is
+    exact and 2.74-2.99x faster than the aborted route, 20-43x than official.
     """
-    return (kh == kw and kh in (3, 5) and 3 <= c <= 512
-            and triton.next_power_of_2(c) <= 512
-            and 32 <= oc <= 512 and oh * ow >= 16 and sh * sw <= 4
+    cp = triton.next_power_of_2(c)
+    wide = cp <= 1024 and kh * kw <= 9      # wave72: bm=16 tier, 3x3 only
+    return (kh == kw and kh in (3, 5, 7) and 3 <= c <= 1024
+            and (cp <= 512 or wide)
+            and 32 <= oc <= 512 and oh * ow >= 16
+            and (sh * sw <= 4 or (sh == sw == 3))
             and n * oc * oh * ow * kh * kw * c >= (1 << 20)
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
 
@@ -1537,6 +1554,13 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         return _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w,
                                KH, KW, SH, SW, dil_h=dil_h, dil_w=dil_w,
                                out_dtype=_out_dtype)
+    # wave72: the shifted-tap route also covers the asymmetric kernels
+    # (1x3/3x1/1x5/5x1/1x7/7x1, 1.83-3.67x over the tap kernel and 4.2-15.5x
+    # over official, exact) and KH=KW=7.  The 7x7 class matters most: for C > 8
+    # it had no working fast route - the 32-lane tap kernel aborts the process
+    # at (1,64,112,112) with "tls memory pool alloc failed", and official
+    # measures 0.54-8.5 s against 10.9-152.9 ms here (8.9-55.5x, rel 0.0).
+    # FLAGGEMS_SPACEMIT_CONV_TAP49=0 / CONV_TAPX=0 pin the old route per class.
     # wave67: 3x3 stride-1 runs as nine whole-K smt dots on shifted bases -
     # no patch matrix, no K loop, no 32-lane split.  2.0-4.8x against the best
     # existing route on every shape measured, and exact (err 0.0) on all five:
@@ -1555,12 +1579,17 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # 277-282 ms against 13.3-16.0 on this kernel), so it turns on by itself;
     # the non-dilated 5x5 stays opt-in because the tap kernel is a working
     # alternative there and the 25-dot compile is 158 s.
-    if (groups == 1 and KH == KW and KH in (3, 5) and SH == 1 and SW == 1
-            and dil_h == dil_w and 3 <= C <= 512
-            and triton.next_power_of_2(C) <= 512
+    if (groups == 1 and (KH, KW) in _TAP_KERNELS and SH == 1 and SW == 1
+            and dil_h == dil_w and 3 <= C <= 1024
+            and (triton.next_power_of_2(C) <= 512
+                 or (triton.next_power_of_2(C) <= 1024 and KH * KW <= 9))
             and 32 <= OC <= 512 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
             and (KH == 3 or dil_h > 1
+                 or (KH == 7 and KW == 7
+                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP49", "1") != "0")
+                 or (KH != KW
+                     and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPX", "1") != "0")
                  or (KH == 5
                      and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))):
         return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
