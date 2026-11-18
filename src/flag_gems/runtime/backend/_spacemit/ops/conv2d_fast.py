@@ -274,7 +274,14 @@ def _conv1x1_smt2_kernel(A1, A2, B, Bias, Y, M, N, K1: tl.constexpr,
     tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit
+# wave70: do_not_specialize on every runtime geometry argument.  Triton keys a
+# kernel binary on each int's divisibility (equal_to_1 / %16), so the same tap
+# code was recompiled for every dilation (KDIW 120/180/240 are three keys) and
+# every output shape - measured 157.8-159.4 s for each of the four 5x5
+# dilations, i.e. 10.5 minutes for one layer family.  With these marked, d1-d4
+# and every shape share one binary (probe2108: d1 54.6 s first call, d2 0.00 s,
+# steady 2.51 vs 2.51 ms at C=96 3x3 - no speed cost).
+@triton.jit(do_not_specialize=["OC", "OCB", "SROW", "MY", "IW", "KDIW", "DK"])
 def _conv_tap_smt_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, SROW, MY, IW,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr,
@@ -573,6 +580,7 @@ def _depthwise_kernel(X, Wt, Bs, Y,
     swc,
     syn, syoc, syoh, syow,
     SH: tl.constexpr, SW: tl.constexpr,
+    DILH: tl.constexpr, DILW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr,
     BLOCK_OW: tl.constexpr, BLOCK_C: tl.constexpr,
@@ -591,9 +599,9 @@ def _depthwise_kernel(X, Wt, Bs, Y,
     cc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     acc = tl.zeros((BLOCK_C, BLOCK_OW), dtype=tl.float32)
     for kh in tl.static_range(KH):
-        ih = oh * SH + kh
+        ih = oh * SH + kh * DILH
         for kw in tl.static_range(KW):
-            iw = ow0 * SW + kw
+            iw = ow0 * SW + kw * DILW
             xp = (X + pid_n * sxn + ih * sxh + cc[:, None] * sxc
                   + (iw + lo[None, :] * SW) * sxw)
             if NOMASK:
@@ -976,6 +984,20 @@ def _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w, out_dtype=None):
 # _tap_weights for what a safe key looks like).
 _TAP_W = {}
 _TAP_BUF = {}
+# wave70: per-(binary, shape) first-launch guard, the rmsb_fast wave50/53
+# pattern.  The driver has no fence and a freshly compiled variant can drop the
+# first store block; the two garbage returns wave69 saw at CP=256/14x14 (rel
+# 0.971 / 0.89, then clean on every repeat) are that class.  One extra launch
+# per shape per process, on a call that already paid the compile.
+_TAP_WARMED = set()
+
+
+def _tap_first_launch(key) -> bool:
+    if key in _TAP_WARMED:
+        return False
+    _TAP_WARMED.add(key)
+    return True
+
 
 
 def _tap_weights(weight, cpad=None, ocpad=None):
@@ -1089,6 +1111,8 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     dt = out_dtype or input.dtype
     y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
     grid = (triton.cdiv(OCP, bm), triton.cdiv(MYP, bn))
+    warm = _tap_first_launch((bm, bn, KH, KW, CP, x.dtype, OCP, OC, MYP,
+                              SROW, IW, DIL, bias is not None))
     for n in range(N):
         # the padded frame IS the flat (C, IH*IW) operand, so the border is
         # written once (zeros) and every call only copies the interior into it:
@@ -1112,12 +1136,20 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
         else:
             yext = torch.empty((OCP, MYP), dtype=torch.float32,
                                device=input.device)
-        _conv_tap_smt_kernel[grid](
-            at, flat, bias if bias is not None else at, yext, OCP,
-            OC if bias is not None else 0, CP, SROW, MYP,
-            IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
-            MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
-            KDIW=DIL * IW, DK=DIL)
+        def _launch():
+            _conv_tap_smt_kernel[grid](
+                at, flat, bias if bias is not None else at, yext, OCP,
+                OC if bias is not None else 0, CP, SROW, MYP,
+                IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
+                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                KDIW=DIL * IW, DK=DIL)
+
+        _launch()
+        if warm and n == 0:
+            # wave70 wave50/53 guard: a freshly compiled variant can drop the
+            # first store block (no fence on this driver); the second launch
+            # overwrites it.  ~2.6 ms once per shape, against a 54 s compile.
+            _launch()
         if yext.data_ptr() != y[n].data_ptr():
             # as_strided, not view: yext rows are MYP wide and a sliced view
             # cannot be reshaped without a copy
@@ -1127,7 +1159,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
 
 
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
-                      BLOCK_OW=None, BLOCK_C=None):
+                      BLOCK_OW=None, BLOCK_C=None, dil_h=1, dil_w=1):
     N, _, H, W = input.shape
     x = input.contiguous()
     if pad_h or pad_w:
@@ -1149,7 +1181,8 @@ def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, 
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         wc.stride(0),
         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
-        SH=SH, SW=SW, HAS_BIAS=(bias is not None), KH=KH, KW=KW,
+        SH=SH, SW=SW, DILH=dil_h, DILW=dil_w,
+        HAS_BIAS=(bias is not None), KH=KH, KW=KW,
         BLOCK_OW=block_ow, BLOCK_C=block_c, NOMASK=nomask,
     )
     return y
@@ -1234,7 +1267,8 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                                   else input.dtype))
             return y if y.dtype == input.dtype else y.to(input.dtype)
     if groups == C == OC:
-        return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW)
+        return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW,
+                                 C, KH, KW, dil_h=dil_h, dil_w=dil_w)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
     # wave60: 1x1 stride-1 pad-0 conv is a GEMM in NCHW already - route it
@@ -1282,13 +1316,17 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # wave69: the same kernel takes a dilation - the tap base is
     # kh*DIL*IW + kw*DIL, still an affine shift of m, so 3x3/5x5 dilated
     # stride-1 convs (DeepLab-style) leave the vendor im2col path.
+    # wave70: a dilated 5x5 has no other fast route (official im2col measures
+    # 277-282 ms against 13.3-16.0 on this kernel), so it turns on by itself;
+    # the non-dilated 5x5 stays opt-in because the tap kernel is a working
+    # alternative there and the 25-dot compile is 158 s.
     if (groups == 1 and KH == KW and KH in (3, 5) and SH == 1 and SW == 1
             and dil_h == dil_w and 3 <= C <= 512
             and triton.next_power_of_2(C) <= 512
             and 32 <= OC <= 512 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
-            and (KH == 3 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25",
-                                           "0") == "1")):
+            and (KH == 3 or dil_h > 1
+                 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")):
         return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
                                out_dtype=_out_dtype, dil_h=dil_h, dil_w=dil_w)
     if dil_h != 1 or dil_w != 1:

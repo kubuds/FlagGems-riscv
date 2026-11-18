@@ -429,6 +429,7 @@ class Conv2d(torch.autograd.Function):
                         and groups == 1
                         and kh == kw
                         and (kh == 3
+                             or dilation_height > 1
                              or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")
                         and stride_height == 1
                         and stride_width == 1
@@ -437,7 +438,20 @@ class Conv2d(torch.autograd.Function):
                         and fast_oh * fast_ow >= 16
                         and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
                     )
-                    applies = dil_tap or conv_fast_applies(
+                    # wave70: dilated depthwise is a second class with no fast
+                    # route: conv_fast_applies() rejects dilation and dil_tap
+                    # wants groups == 1, so it lands on the im2col kernel after
+                    # the K>=16 channel padding - 30-39x slower than the
+                    # depthwise kernel with the same dilation as a tap offset.
+                    dil_dwise = (
+                        groups == input.shape[1] == weight.shape[0]
+                        and (dilation_height != 1 or dilation_width != 1)
+                        and input.shape[0] * weight.shape[0] * fast_oh * fast_ow
+                        * kh * kw >= (1 << 14)
+                        and fast_ow >= 4
+                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
+                    )
+                    applies = dil_tap or dil_dwise or conv_fast_applies(
                         input,
                         weight,
                         (stride_height, stride_width),

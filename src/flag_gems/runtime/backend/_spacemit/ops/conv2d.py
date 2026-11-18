@@ -220,10 +220,19 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     dil_tap = (dil_h == dil_w and dil_h > 1 and groups == 1
                and KH == KW and KH in (3, 5) and str_h == 1 and str_w == 1
                and 3 <= C <= 512 and 32 <= OC <= 512 and OH * OW >= 16
-               and (KH == 3 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25",
-                                              "0") == "1")
+               and (KH == 3 or dil_h > 1
+                    or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")
                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0")
-    if conv_fast_enabled() and (dil_tap
+    # wave70: dilated depthwise has no fast route at all - conv_fast_applies()
+    # rejects dilation, so it falls to the official im2col+bmm path, which at
+    # (1,64,56,56) 5x5 d2 measures ~280 ms.  The depthwise kernel only needed
+    # the tap offset to carry the dilation (kh*DILH / kw*DILW); both strides and
+    # any square or non-square dilation stay expressible.  Floor as the f32
+    # depthwise gate.
+    dil_dwise = (groups == C == OC and (dil_h != 1 or dil_w != 1)
+                 and N * OC * OH * OW * KH * KW >= (1 << 14) and OW >= 4
+                 and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0")
+    if conv_fast_enabled() and (dil_tap or dil_dwise
                                 or conv_fast_applies(input, weight, stride, dilation, groups)):
         return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW,
                              SH=str_h, SW=str_w, groups=groups,
