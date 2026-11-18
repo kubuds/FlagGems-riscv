@@ -262,3 +262,14 @@ true_divide_ = _wrap(_c_true_divide_)
 true_divide_out = _wrap(_c_true_divide_out)
 div_mode = _wrap(_c_div_mode)
 div_mode_ = _wrap(_c_div_mode_)
+
+# --- elu --------------------------------------------------------------------
+from flag_gems.ops.elu import (  # noqa: E402
+    elu as _c_elu,
+    elu_ as _c_elu_,
+    elu_backward as _c_elu_backward,
+)
+
+elu = _wrap(_c_elu)
+elu_ = _wrap(_c_elu_)
+elu_backward = _wrap(_c_elu_backward)

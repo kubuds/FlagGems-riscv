@@ -109,10 +109,39 @@ from .elemwise_nested import (
     true_divide_out,
     div_mode,
     div_mode_,
+    elu,
+    elu_,
+    elu_backward,
 )
 
 # Direct-kernel mul fast path (campaign 1012pm), incl. multiply aliases.
 from .mul import mul, mul_, multiply, multiply_
+
+# Direct-kernel unary fast paths (campaign 1012night, wave2). These load AFTER
+# elemwise_nested so the fast versions win for the shared names; their
+# fallback (small / non-contiguous / other dtypes) calls the elemwise_nested
+# wrappers, i.e. the previously shipped behaviour.
+from .unary_fast import (
+    abs,
+    abs_,
+    absolute,
+    absolute_,
+    neg,
+    neg_,
+    negative,
+    negative_,
+    relu,
+    relu_,
+    square,
+    square_,
+    square_out,
+    trunc,
+    trunc_,
+    sign,
+    sign_out,
+    elu,
+    elu_,
+)
 
 __all__ = [
     "_conv_depthwise2d",
@@ -221,6 +250,11 @@ __all__ = [
     "ceil_out",
     "trunc",
     "trunc_",
+    "sign",
+    "sign_out",
+    "elu",
+    "elu_",
+    "elu_backward",
     "true_divide",
     "true_divide_",
     "true_divide_out",
