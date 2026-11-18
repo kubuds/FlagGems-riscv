@@ -112,6 +112,20 @@ def mean_dim_kernel(X, Mean, M, N, TILE_N: tl.constexpr):
     tl.store(Mean, mean)
 
 
+@libentry()
+@triton.jit
+def mean_dim_kernel_plain(X, Mean, N, TILE_N: tl.constexpr):
+    # campaign 1011am: plain-pointer row kernel; no block_ptr, fixed TILE_N.
+    row = tl.program_id(0)
+    base = X + row * N
+    acc = 0.0
+    for c in range(0, N // TILE_N):
+        offs = c * TILE_N + tl.arange(0, TILE_N)
+        a = tl.load(base + offs)
+        acc += tl.sum(a)
+    tl.store(Mean + row, acc / N)
+
+
 def mean_dim(x, dim, keepdim=False, *, dtype=None):
     logger.debug("GEMS_SPACEMIT MEAN_DIM")
 
@@ -134,7 +148,14 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     out = torch.empty(shape, dtype=dtype, device=x.device)
     grid = (M,)
     with torch_device_fn.device(x.device):
-        mean_dim_kernel[grid](x, out, M, N)
+        if x.is_contiguous() and N >= 2048 and N % 2048 == 0:
+            # campaign 1011am: 2048-wide tiles keep tl.sum on the vectorized
+            # side of the length-2048 cliff. Measured 1.2-1.3x over the
+            # block_ptr loop on long-row shapes; short rows (N <= 1024) stay
+            # on the old path (plain was slower there).
+            mean_dim_kernel_plain[grid](x, out, N, TILE_N=2048)
+        else:
+            mean_dim_kernel[grid](x, out, M, N)
     if not keepdim:
         out = out.squeeze(dim)
     return out
