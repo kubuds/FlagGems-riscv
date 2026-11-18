@@ -49,6 +49,52 @@ def rms_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_RMS_FAST", "1") != "0"
 
 
+# ---------------- wave47: cached CompiledKernel launcher ----------------
+# probe601/606: at the official (64,64) row the op spent 0.252 ms against
+# torch's 0.127, and the kernel launched through the JIT alone was 0.116 ms
+# while the same kernel through a cached CompiledKernel was 0.064 ms - the
+# empty-launch floor on this board.  JITFunction.run re-binds every argument,
+# rebuilds the specialization key and looks the kernel up on each call, which
+# is 50 us of pure host tax on every launch.  Ported verbatim from the wave44
+# layer_norm launcher; any failure falls back to the ordinary launch for the
+# rest of the process.
+_KCACHE = {}
+_LAUNCH = {"ok": True, "stream": None}
+
+
+def _align(*ts) -> tuple:
+    return tuple(t.data_ptr() & 15 == 0 for t in ts)
+
+
+def _launch(kern, key, grid, args):
+    ent = _KCACHE.get(key)
+    if ent is None:
+        ck = kern.warmup(*args, grid=grid)
+        _KCACHE[key] = ck
+        kern[grid](*args)
+        return
+    if ent is False or not _LAUNCH["ok"]:
+        kern[grid](*args)
+        return
+    if len(grid) == 1:
+        grid = (grid[0], 1, 1)
+    try:
+        # wave47: ent[grid] runs the CompiledKernel's own runner - it still
+        # skips JITFunction.run's argument re-binding, specialization-key
+        # rebuild and cache lookup.  Two traps measured on this build:
+        #  - the runner indexes grid[1]/grid[2], so a 1-D grid raises
+        #    IndexError; the fallback then costs more than the JIT (that alone
+        #    made the official (64,64) row 0.278 -> 0.342 ms in the first A/B);
+        #  - calling ent.run(...) positionally (the wave44 form) corrupts the
+        #    heap as soon as a different dtype compiles afterwards.
+        # probe609: jit 0.1095 / ent[grid] 0.0745 / raw .run 0.0616 ms on the
+        # (64,64) kernel, so this form keeps most of the win without either.
+        ent[grid](*args)
+    except Exception:
+        _LAUNCH["ok"] = False
+        kern[grid](*args)
+
+
 # ------------------- wave38: single-pass tile for N=64 -------------------
 # probe401/402: the routed kernel reads a row twice (sum chain, then apply).
 # At 64 columns the whole tile fits in registers, so one pass suffices: load x,
@@ -84,6 +130,15 @@ def _rms_tile_bm(m: int) -> int:
 # 64-row floor and at least two programs (a single-program tile at (256,32)
 # cost 40% and at (1024,16) 54%).
 _RMS_TILE_MAX_N = 32
+
+# ---------------- wave47: widen the tile to N = 128 ----------------
+# probe602: N in 65..255 has NO route at all (the table starts at 64 with the
+# wildcard floor at 256), so those widths run the generic FlagGems kernel.  At
+# (2048,128) f32 that is 2.8-4.1 ms against 0.66-0.96 ms for the wave38 tile
+# (BM = 8192/BN = 64), i.e. 3-4x, and f16 the same.  128 is the only power of
+# two in that hole, so only it can use the unmasked tile; the rest stay on the
+# generic path until a masked variant is measured.
+_RMS_WIDE_TILE_MAX_N = 128
 
 
 def _rms_narrow_bm(m: int, bn: int) -> int:
@@ -366,6 +421,15 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
             return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M and _rms_tile_bm(M):
         return True
+    # wave47: 65..128 tile (only 128 is a power of two, the rest stay generic)
+    if (
+        _RMS_TILE_MAX_N < N <= _RMS_WIDE_TILE_MAX_N
+        and N == triton.next_power_of_2(N)
+        and M >= 8
+    ):
+        bm = _rms_narrow_bm(M, N)
+        if bm and M >= 2 * bm:
+            return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     cap = None if f16 else _RMS_F32_MAX_M.get(N)
     if cap is not None and M > cap:
@@ -377,11 +441,14 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
 
 def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
+    al = _align(x, w, y, inv)
     if N <= _RMS_TILE_MAX_N and N == triton.next_power_of_2(N) and M >= 8:
         bm = _rms_narrow_bm(M, N)
         if bm:
+            # wave47: cached launch (was 50 us of JIT re-binding per call).
             with nested_dispatch(M * N):
-                _rms_tile[(M // bm,)](x, w, y, inv, N, eps, BM=bm, BN=N)
+                _launch(_rms_tile, ("tile", N, bm, al), (M // bm,),
+                        (x, w, y, inv, N, eps, bm, N))
             return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M:
         bm = _rms_tile_bm(M)
@@ -389,7 +456,20 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
             # wave38: one pass over the tile; nesting is what makes it win
             # above 32K elements (probe402).
             with nested_dispatch(M * N):
-                _rms_tile[(M // bm,)](x, w, y, inv, N, eps, BM=bm, BN=N)
+                _launch(_rms_tile, ("tile", N, bm, al), (M // bm,),
+                        (x, w, y, inv, N, eps, bm, N))
+            return True
+    if _RMS_TILE_MAX_N < N <= _RMS_WIDE_TILE_MAX_N and M >= 8:
+        bm = _rms_narrow_bm(M, N) if N == triton.next_power_of_2(N) else 0
+        # wave47: never a single-program tile (wave38: 40% at (256,32)).  The
+        # official (64,64) row is exactly that case - bm lands on M and one
+        # program serves 4096 elements, measured 0.286 -> 0.300 ms.
+        if bm and M < 2 * bm:
+            bm = 0
+        if bm:
+            with nested_dispatch(M * N):
+                _launch(_rms_tile, ("tile", N, bm, al), (M // bm,),
+                        (x, w, y, inv, N, eps, bm, N))
             return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     cap = None if f16 else _RMS_F32_MAX_M.get(N)
@@ -404,25 +484,28 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     k0, tile = ent
     if M < 2 * k0:
         row = _rms_row16 if f16 else _rms_row
-        row[(M,)](x, w, y, inv, N, eps, tile)
+        _launch(row, ("row", N, tile, f16, al), (M,),
+                (x, w, y, inv, N, eps, tile))
         return True
     if M % k0 == 0:
         kern = _rms_mmk16 if f16 else _rms_mmk
         grid = M // k0
 
-        def _launch():
-            kern[(grid,)](x, w, y, inv, N, eps, k0, tile)
+        def _launch_one():
+            _launch(kern, ("mmk", N, k0, tile, f16, al), (grid,),
+                    (x, w, y, inv, N, eps, k0, tile))
     else:
         # wave13: masked multirow keeps K rows/program for odd M instead of
         # halving K down to 1 (probe110: 2.1-2.5x on odd-M shapes).
         kern = _rms_mmk16_m if f16 else _rms_mmk_m
         grid = triton.cdiv(M, k0)
 
-        def _launch():
-            kern[(grid,)](x, w, y, inv, M, N, eps, k0, tile)
+        def _launch_one():
+            _launch(kern, ("mmkm", N, k0, tile, f16, al, M), (grid,),
+                    (x, w, y, inv, M, N, eps, k0, tile))
     if k0 >= 4:
         with nested_dispatch(M * N):
-            _launch()
+            _launch_one()
     else:
-        _launch()
+        _launch_one()
     return True
