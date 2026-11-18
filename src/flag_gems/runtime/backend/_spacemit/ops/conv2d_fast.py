@@ -147,8 +147,17 @@ def _fast_applies_shapes(n, c, h, ww, oc, kh, kw, xd, wd, sh, sw, dh, dw,
     # conv per image there: 28.1 ms at B=1 and 888 ms at B=32 for C512 OC1024,
     # against 2.6 ms of GEMM.  Every width floor below is about tiling a row;
     # there is no row, so this class bypasses them and takes the batch fold.
-    if (groups == 1 and kh == 1 and kw == 1 and sh == 1 and sw == 1
-            and h == 1 and ww == 1 and n >= 1 and c >= 16 and oc >= 1):
+    # wave102: grouped 1x1 heads take the same route (one GEMM per group, or a
+    # single descriptor launch when the group width is a power of two); the
+    # vendor path cannot compile this shape at all, so routing it here is also
+    # the availability fix.  1-pixel depthwise (groups == C == OC) comes here
+    # too and falls through to _depthwise_direct, which is exact at OH=OW=1.
+    if (kh == 1 and kw == 1 and sh == 1 and sw == 1
+            and h == 1 and ww == 1 and n >= 1 and c >= 16 and oc >= 1
+            and (groups == 1
+                 or groups == c == oc
+                 or (groups < c and c % groups == 0 and oc % groups == 0
+                     and (c // groups) >= 16))):
         return True
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
@@ -500,6 +509,61 @@ def _conv1x1_px_kernel(X, Wm, Bs, Y, C, N, OC,
     else:
         tl.store(Y + oc[:, None] + n[None, :] * OC, acc.to(Y.dtype.element_ty),
                  mask=(oc[:, None] < OC) & (n[None, :] < N))
+
+
+@triton.jit
+def _conv1x1_px_kchunk_kernel(A, B, Bias, Y, M, N, K: tl.constexpr,
+    KCH: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """wave102: the 1-pixel GEMM when K is not one descriptor block.
+
+    wave101's route needs C to be a power of two because the descriptor block
+    shape is one K block.  This kernel sweeps K in KCH-wide descriptor slabs
+    off the same (M, K) weight, so any C that is a multiple of KCH works and
+    C > 1024 is just more iterations (KCH is capped at 1024, the TCM budget
+    _conv1x1_smt_kernel already runs at).  The first dot is assigned, later
+    dots are added to the same accumulator (wave64: accumulating the first dot
+    into a zeros tile is not the same recipe).
+
+    The offset slab is a strided block (rows are K apart), which the backend
+    lowers fine; the loop must be tl.static_range - a runtime range puts the
+    block pointer inside an scf.for and spine-opt rejects it with "operand #0
+    does not dominate this use" (probe w102).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    a_ptr = tl.make_block_ptr(base=A, shape=[M, K], strides=[K, 1],
+                              offsets=[pid_m * BLOCK_M, 0],
+                              block_shape=[BLOCK_M, KCH], order=[1, 0])
+    b_ptr = tl.make_block_ptr(base=B, shape=[K, N], strides=[N, 1],
+                              offsets=[0, pid_n * BLOCK_N],
+                              block_shape=[KCH, BLOCK_N], order=[1, 0])
+    a = smt.view(smt.descriptor_load(a_ptr, (0, 0)), (0, 0),
+                 (BLOCK_M, KCH), (MICRO_M, MICRO_K))
+    b = smt.view(smt.descriptor_load(b_ptr, (0, 0)), (0, 0),
+                 (KCH, BLOCK_N), (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(a, b), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    for k0 in tl.static_range(KCH, K, KCH):
+        a2_ptr = tl.make_block_ptr(base=A, shape=[M, K], strides=[K, 1],
+                                   offsets=[pid_m * BLOCK_M, k0],
+                                   block_shape=[BLOCK_M, KCH], order=[1, 0])
+        b2_ptr = tl.make_block_ptr(base=B, shape=[K, N], strides=[N, 1],
+                                   offsets=[k0, pid_n * BLOCK_N],
+                                   block_shape=[KCH, BLOCK_N], order=[1, 0])
+        a2 = smt.view(smt.descriptor_load(a2_ptr, (0, 0)), (0, 0),
+                      (BLOCK_M, KCH), (MICRO_M, MICRO_K))
+        b2 = smt.view(smt.descriptor_load(b2_ptr, (0, 0)), (0, 0),
+                      (KCH, BLOCK_N), (MICRO_K, MICRO_N))
+        acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < M, other=0.0)[:, None]
+    c_ptr = tl.make_block_ptr(base=Y, shape=[M, N], strides=[N, 1],
+                              offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                              block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -1739,45 +1803,145 @@ def _pick_px1_tiles(C, N, OC):
     return boc, bn, bk
 
 
-def _conv1x1_px(input, weight, bias):
-    """wave101: 1-pixel 1x1 conv as one batch-folded GEMM (see the kernel).
+_PX1_WARMED = set()
 
-    Two routes.  The smt descriptor path (the mm recipe) is 2-4x faster than
-    tl.load + tl.dot here: one descriptor load sweeps the whole K, and at
-    C512 OC1024 f16 it measured 0.50 ms against 4.93 ms on the plain kernel
-    and 892 ms on the vendor entry.  It needs C 32-aligned (K is one block),
-    OC a multiple of 64 (the A descriptor has no row bound), C <= 1024 (the
-    A block is BLOCK_M x C in TCM) and C a power of two (the descriptor block
-    shape is one K block); everything else takes the masked plain kernel,
-    which is still 180x over the vendor and compiles for C 96/160/320 (measured
-    0.33-2.36 ms).  The batch is padded
-    up to the 32-wide N tile because the B descriptor has no column bound
-    either.  Both operands are transposed once on the host: NCHW with one
-    pixel is (N, C), and the GEMM wants (C, N).
+
+def _px1_launch(key, launch):
+    """wave102: run a freshly compiled px1 variant twice.
+
+    Same driver hole the gemv route documents (wave70): a variant that has just
+    compiled can drop its first store block, and the wave102 battery caught one
+    such first call (C=640 f32 read back wrong once, exact on every later
+    call).  One extra launch on a call that already paid the compile is cheaper
+    than a wrong answer.
+    """
+    launch()
+    if key not in _PX1_WARMED:
+        _PX1_WARMED.add(key)
+        launch()
+
+
+def _px1_kchunk(C):
+    """wave102: widest power-of-two K slab (<= 1024) that divides C.
+
+    0 means this C cannot ride a descriptor route: the gate is C 32-aligned,
+    so every aligned C has a divisor >= 32, while 8/16-aligned C (e.g. C=1000,
+    C=1500) falls back to the masked plain kernel.
+    """
+    if C < 32 or C % 32:
+        return 0
+    kch = 1024
+    while C % kch:
+        kch //= 2
+    return kch
+
+
+def _conv1x1_px(input, weight, bias, groups=1):
+    """wave101/102: 1-pixel 1x1 conv as one batch-folded GEMM (see _conv1x1_px_kernel).
+
+    The smt descriptor routes are 2-4x faster than tl.load + tl.dot here: one
+    descriptor load sweeps a whole K slab, and at C512 OC1024 f16 the single
+    descriptor route measured 0.50 ms against 4.93 ms on the plain kernel and
+    892 ms on the vendor entry.  Route A (C a power of two <= 1024) is one
+    descriptor; route B (wave102, C 32-aligned) sweeps C in the widest
+    power-of-two slab that divides it, so C=96 is 3x32, C=160 5x32, C=320
+    5x64, C=1536 3x512 and C=2048 2x1024 - no padding, no per-call weight
+    split; route C (wave102, groups > 1) is one per-group descriptor GEMM,
+    since NCHW with one pixel is already group-major.  All of them need
+    OC a multiple of 64 (the A descriptor has no row bound) and pad the batch
+    up to the 32-wide N tile because the B descriptor has no column bound.
+    Everything else takes the masked plain kernel, which is still 180x over
+    the vendor and compiles for C 96/160/320 (measured 0.33-2.36 ms).
+    Both operands are transposed once on the host: NCHW with one pixel is
+    (N, C), and the GEMM wants (C, N).
     """
     N, C, _, _ = input.shape
     OC = weight.shape[0]
     x = input.reshape(N, C)
-    w2 = weight.reshape(OC, C).contiguous()
-    if (smt is not None and C % 32 == 0 and C <= 1024 and OC % 64 == 0
-            and (C & (C - 1)) == 0
-            and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1SMT", "1") != "0"):
-        bn = 32
-        npad = (N + bn - 1) // bn * bn
+    w2 = weight.reshape(OC, C // groups).contiguous()
+    smt_on = (smt is not None
+              and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1SMT", "1") != "0")
+    bn = 32
+    npad = (N + bn - 1) // bn * bn
+    micro = (16, 32, 8) if x.dtype == torch.float16 else (8, 64, 32)
+    if groups > 1:
+        CG, OCG = C // groups, OC // groups
+        if not (smt_on and CG % 32 == 0 and CG <= 1024
+                and (CG & (CG - 1)) == 0 and OCG % 64 == 0):
+            # wave102: a grouped pointwise head still must not fall back to the
+            # vendor path - its fused im2col+bmm kernel does not compile at
+            # 1 pixel (smt global_mbarrier).  One plain GEMM per group.
+            y = torch.empty((N, OC), dtype=input.dtype, device=input.device)
+            for g in range(groups):
+                wg = w2[g * OCG:(g + 1) * OCG].contiguous()
+                # the plain kernel reads its NCHW (N, C) buffer as (C, N)
+                # column-major (X + c + n*C), so this slice must stay in (N, CG)
+                # layout - materializing the transpose here reads garbage.
+                xg = x[:, g * CG:(g + 1) * CG].contiguous()
+                bg = bias[g * OCG:(g + 1) * OCG] if bias is not None else xg
+                # 32 is the narrowest tile this backend lowers for both axes;
+                # BLOCK_K=16 aborts in MMT4D lowering (same wall dense_g hit at
+                # C=48), so a group width that is not 32-aligned takes a masked
+                # 32-wide K tile instead.
+                boc = 64 if OCG >= 64 else 32
+                bng = 32
+                bk = 32
+                nomask = (CG % bk == 0) and (N % bng == 0) and (OCG % boc == 0)
+                yg = torch.empty((N, OCG), dtype=input.dtype, device=input.device)
+                _conv1x1_px_kernel[(triton.cdiv(OCG, boc), triton.cdiv(N, bng))](
+                    xg, wg, bg, yg, CG, N, OCG,
+                    BLOCK_OC=boc, BLOCK_N=bng, BLOCK_K=bk,
+                    HAS_BIAS=(bias is not None), NOMASK=nomask,
+                )
+                y[:, g * OCG:(g + 1) * OCG] = yg
+            return y.view(N, OC, 1, 1)
         if npad != N:
             xt = torch.zeros((C, npad), dtype=x.dtype, device=x.device)
             xt[:, :N] = x.t()
         else:
             xt = x.t().contiguous()
         yt = torch.empty((OC, npad), dtype=x.dtype, device=x.device)
-        micro = (16, 32, 8) if x.dtype == torch.float16 else (8, 64, 32)
-        _conv1x1_smt_kernel[(OC // 64, npad // bn)](
-            w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
-            BLOCK_M=64, BLOCK_N=bn,
-            MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
-            HAS_BIAS=(bias is not None),
+        _px1_launch(
+            ("g", groups, OC, C, npad, x.dtype, bias is not None),
+            lambda: _conv1x1_g_smt_kernel[(OCG // 64, npad // bn, groups)](
+                w2, xt, bias if bias is not None else w2, yt, OCG, npad, CG,
+                OCG * CG, CG * npad, OCG * npad, OCG,
+                BLOCK_M=64, BLOCK_N=bn,
+                MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
+                HAS_BIAS=(bias is not None),
+            ),
         )
         return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
+    if smt_on and OC % 64 == 0 and C >= 32:
+        if npad != N:
+            xt = torch.zeros((C, npad), dtype=x.dtype, device=x.device)
+            xt[:, :N] = x.t()
+        else:
+            xt = x.t().contiguous()
+        yt = torch.empty((OC, npad), dtype=x.dtype, device=x.device)
+        if (C & (C - 1)) == 0 and C <= 1024:
+            _px1_launch(
+                ("one", OC, C, npad, x.dtype, bias is not None),
+                lambda: _conv1x1_smt_kernel[(OC // 64, npad // bn)](
+                    w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
+                    BLOCK_M=64, BLOCK_N=bn,
+                    MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
+                    HAS_BIAS=(bias is not None),
+                ),
+            )
+            return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
+        kch = _px1_kchunk(C)
+        if kch:
+            _px1_launch(
+                ("kchunk", OC, C, kch, npad, x.dtype, bias is not None),
+                lambda: _conv1x1_px_kchunk_kernel[(OC // 64, npad // bn)](
+                    w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
+                    KCH=kch, BLOCK_M=64, BLOCK_N=bn,
+                    MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
+                    HAS_BIAS=(bias is not None),
+                ),
+            )
+            return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
     y = torch.empty((N, OC), dtype=input.dtype, device=input.device)
     boc, bn, bk = _pick_px1_tiles(C, N, OC)
     nomask = (C % bk == 0) and (N % bn == 0) and (OC % boc == 0)
@@ -3465,15 +3629,20 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # wave101: a 1-pixel image through a 1x1 weight is a (OC, C) @ (C, N) GEMM
     # over the batch.  The vendor entry has no batch fold: it runs one conv per
     # image at 27.8 ms (C512 OC1024), whatever the batch size, and the tap /
-    # phase routes cannot tile a row that does not exist.  FLAGGEMS_SPACEMIT_
-    # CONV_PX1=0 pins the old routes for A/B.  Kept above the half-precision
-    # carrier: f16 stays f16 here (the dot accumulates in f32).
-    if (groups == 1 and KH == 1 and KW == 1 and OH == 1 and OW == 1
+    # phase routes cannot tile a row that does not exist.  wave102 extends the
+    # route to grouped weights (one per-group GEMM) and to any 32-aligned C
+    # (K swept in descriptor slabs).  FLAGGEMS_SPACEMIT_CONV_PX1=0 pins the old
+    # routes for A/B.  Kept above the half-precision carrier: f16 stays f16
+    # here (the dot accumulates in f32).
+    if (KH == 1 and KW == 1 and OH == 1 and OW == 1
             and pad_h == 0 and pad_w == 0 and SH == 1 and SW == 1
             and C >= 16 and N >= 1 and input.dtype == weight.dtype
             and input.dtype in (torch.float16, torch.float32)
+            and groups < C and C % groups == 0 and OC % groups == 0
             and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1", "1") != "0"):
-        return _conv1x1_px(input, weight, bias)
+        y = _conv1x1_px(input, weight, bias, groups)
+        if y is not None:
+            return y
     if input.dtype != torch.float32:
         # wave83: the f16/bf16 1-pixel cell is a row-stream gemv on the stored
         # weights; the carrier below would first convert the whole weight to
