@@ -77,6 +77,10 @@ Variants folded in:
   the very shapes where the one-program scan was fixed-cost bound
   (q128 kv1024 d128 7.2 -> 4.1 ms, q1 kv8192 d128 4.1 -> 2.8 ms).  Two splits
   is the measured optimum; four and eight lose to bandwidth and prologue cost.
+* non-square causal shapes stop scanning at the last query row of the tile
+  instead of walking the whole KV axis (torch aligns the mask upper-left, so
+  row i never reads column > i): q32 kv3000 20.5 -> 2.2 ms, q128 kv1024
+  14.5 -> 4.2 ms, q1 kv2048 1.59 -> 0.68 ms, bit-identical to the full scan.
 
 Environment knobs (perf experiments only; defaults are the shipped choice):
 ``FLAGGEMS_SPACEMIT_ATTN_FAST=0`` forces the generic path,
@@ -173,6 +177,13 @@ def _attn_fwd_inner(
         # explicit [LO, HI) range: the KV-split pass hands each program one
         # chunk of the KV axis (STAGE 5 plain, 6 causal)
         lo, hi = LO, HI
+    elif STAGE == 7:
+        # non-square causal: torch aligns the mask upper-left, so row i only
+        # attends columns <= i and a block of rows starting at start_m*BLOCK_M
+        # never reads past (start_m + 1) * BLOCK_M.  Scanning KV_CTX keys for a
+        # one-row decode was 99% masked work (q1 kv2048: 2048 keys scanned to
+        # attend to key 0).
+        lo, hi = 0, tl.minimum((start_m + 1) * BLOCK_M, KV_CTX)
     else:
         lo, hi = 0, KV_CTX
 
@@ -205,14 +216,14 @@ def _attn_fwd_inner(
         # drop the KV bound whenever BLOCK_N divides KV_CTX: the compare plus
         # select over the BLOCK_M x BLOCK_N score tile is then pure overhead
         if KV_CTX % BLOCK_N == 0:
-            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6):
+            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6) or (STAGE == 7):
                 qk_rows = tl.where(
                     row_end_2d >= (start_n + offs_n)[None, :], qk_rows, -1.0e6
                 )
         else:
             mask_n = (start_n + offs_n) < KV_CTX
             mask_2d = mask_n[None, :]
-            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6):
+            if (STAGE == 2) or (STAGE == 4) or (STAGE == 6) or (STAGE == 7):
                 mask_2d = mask_2d & (row_end_2d >= (start_n + offs_n)[None, :])
             qk_rows = tl.where(mask_2d, qk_rows, -1.0e6)
 
@@ -371,7 +382,7 @@ def _attn_fwd(
             [num_m_tiles, num_k_tiles, MICRO_M, MICRO_N], dtype=tl.float32
         )
 
-        if STAGE == 4:
+        if STAGE == 4 or STAGE == 7:
             acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
                 acc_4d,
                 l_i_2d,
@@ -384,7 +395,7 @@ def _attn_fwd(
                 BLOCK_M,
                 BLOCK_SIZE_K,
                 BLOCK_N,
-                4,
+                4 if STAGE == 4 else 7,
                 offs_m,
                 offs_n,
                 Q_CTX,
@@ -771,7 +782,10 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
         device=q.device,
     )
 
-    stage = 3 if (q_ctx_run == kv_ctx) else 4
+    # causal: square shapes split the KV range into a prefix and a diagonal pass
+    # (STAGE 3 = both); non-square shapes keep one masked pass, but it stops at
+    # the last query row of the block instead of scanning the whole KV (STAGE 7)
+    stage = 3 if (q_ctx_run == kv_ctx) else 7
     if not is_causal:
         stage = 1
 
