@@ -208,8 +208,9 @@ from .log_fast import log, log10, log10_, log10_out, log2, log2_, log_
 # sum + multi-row sum_dim; see sum_fast.py for measured numbers.
 from .sum import sum, sum_dim, sum_dim_out, sum_out
 
-# rms_norm forward fast path (campaign 1015am, wave6); backward stays on the
-# generic kernels. See rmsnorm_fast.py.
+# rms_norm fast paths: forward (campaign 1015am, wave6) and backward
+# (campaign 1016am, wave9) direct kernels. See rmsnorm_fast.py /
+# rmsnorm_bwd_fast.py.
 from .rms_norm import rms_norm
 
 # var/std/var_mean fast paths + aten.var.dim positional-signature fix

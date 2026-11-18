@@ -1055,7 +1055,12 @@ _FULL_CONFIG = (
     ("resize_as_", resize_as_),
     ("resolve_conj", resolve_conj),
     ("resolve_neg", resolve_neg),
-    ("rms_norm", rms_norm),
+    # wave9 (campaign 1016am): aten::rms_norm carries no Autograd kernel on
+    # this spine-torch build (probe85b: 'an autograd kernel was not
+    # registered' warning on every backward; grads did flow via the
+    # custom-Function node). Register the vendor impl (RmsNorm.apply) under
+    # the Autograd key as well — same pattern as var/_coalesced_/ctc_loss.
+    ("rms_norm", rms_norm, None, (AUTOGRAD_DISPATCH_KEY,)),
     ("rnn_relu.input", rnn_relu),
     ("roll", roll),
     ("rot90", rot90),

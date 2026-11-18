@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""spacemit vendor override: rms_norm (wave6).
+"""spacemit vendor override: rms_norm (wave6 fwd, wave9 bwd).
 
-Only the forward is accelerated (f32, contiguous, N in {512, 2048, 4096});
-the backward keeps using the generic kernels unchanged (autograd Function
-subclass, backward inherited). Anything not covered falls back to the generic
-forward.
+Forward: fast direct kernels (f32, contiguous, N in {512, 2048, 4096}) —
+rmsnorm_fast.py. Backward: wave9 direct kernels (dx two-loop multirow +
+dw row-fold + combine) — rmsnorm_bwd_fast.py. Anything not covered falls
+back to the generic kernels.
 
-Kill switch: FLAGGEMS_SPACEMIT_RMS_FAST=0.
+Kill switches: FLAGGEMS_SPACEMIT_RMS_FAST=0 (fwd) / FLAGGEMS_SPACEMIT_RMSB_FAST=0 (bwd).
 """
 
 import logging
@@ -28,9 +28,15 @@ import math
 import torch
 
 from flag_gems.ops.rms_norm import RmsNorm as _BaseRmsNorm
+from flag_gems.ops.rms_norm import rms_norm_backward as _orig_backward
 from flag_gems.ops.rms_norm import rms_norm_forward as _orig_forward
 from flag_gems.runtime import torch_device_fn
 
+from .rmsnorm_bwd_fast import (
+    rmsb_fast as _rmsb_fast,
+    rmsb_fast_enabled as _rmsb_fast_enabled,
+    rmsb_fast_ok as _rmsb_fast_ok,
+)
 from .rmsnorm_fast import rms_fast_enabled, rms_fast_launch
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,21 @@ class RmsNorm(_BaseRmsNorm):
         ctx.normalized_shape = normalized_shape
         ctx.eps = eps
         return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, inv_rms, weight = ctx.saved_tensors
+        if _rmsb_fast_enabled() and _rmsb_fast_ok(x, dy, inv_rms, weight):
+            n = weight.numel()
+            m = x.numel() // n
+            logger.debug("GEMS_SPACEMIT RMS_NORM BACKWARD (fast override)")
+            dx, dw = _rmsb_fast(x, dy.contiguous(), inv_rms, weight, n, m)
+            return dx, None, dw, None
+        logger.debug("GEMS_SPACEMIT RMS_NORM BACKWARD (legacy)")
+        dx, dw = _orig_backward(
+            dy, x, inv_rms, ctx.normalized_shape, weight, ctx.eps
+        )
+        return dx, None, dw, None
 
 
 def rms_norm(x, normalized_shape, weight, eps=1e-5):
