@@ -2327,15 +2327,16 @@ def _conv1px_gemv_kernel(W, V, Bias, Y, K, BK: tl.constexpr,
     kfull = (K // BK) * BK
     for k0 in range(0, kfull, BK):
         kk = k0 + tl.arange(0, BK)
-        acc += tl.load(W + row * K + kk) * tl.load(V + kk)
+        acc += (tl.load(W + row * K + kk).to(tl.float32)
+                * tl.load(V + kk).to(tl.float32))
     if kfull < K:
         kk = kfull + tl.arange(0, BK)
         m = kk < K
-        acc += tl.load(W + row * K + kk, mask=m, other=0.0) * tl.load(
-            V + kk, mask=m, other=0.0)
+        acc += (tl.load(W + row * K + kk, mask=m, other=0.0).to(tl.float32)
+                * tl.load(V + kk, mask=m, other=0.0).to(tl.float32))
     s = tl.sum(acc, 0)
     if HAS_BIAS:
-        s += tl.load(Bias + row)
+        s += tl.load(Bias + row).to(tl.float32)
     tl.store(Y + row, s)
 
 
@@ -2402,6 +2403,97 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
     return oc * c * kh * kw >= (1 << 18)
 
 
+_MP_TILES = (128, 32, 128)
+
+
+def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
+                  dil_h, dil_w, out_dtype=None):
+    """wave83: 2..64 output pixels as one im2col GEMM over the whole weight.
+
+    Between the 1-pixel cell (the row-stream gemv above) and the normal sizes
+    there is a band where every streaming route pays its fixed cost per pixel:
+    the phase kernel moves the weight at 0.6-1.9 GB/s, and when the input is
+    narrower than the fast gate's 4-pixel floor the cell lands on the vendor
+    im2col path at 393-419 ms.  The patch matrix is only K*M elements (2.5 MB
+    at C=1024 5x5 with M=25) so building it costs 0.2-0.4 ms, and one tl.dot
+    GEMM over [OC, K] then costs oc*k*4/1.4 GB/s.
+
+    Measured live -> here, ms (interleaved arms, 6 rounds): c1024 5x5 s2
+    9x9 -> 3x3 181.0 -> 77.0 (2.35x), c1024 3x3 s1 3x3 -> 3x3 419.3 -> 27.4
+    (15.3x, vendor path owned that cell), c1024 3x3 s2 3x3 -> 2x2 393.3 ->
+    27.2 (14.5x), c2048 3x3 s2 6x6 -> 3x3 274.4 -> 112.4 (2.44x), c2048 5x5
+    s2 4x4 -> 2x2 741.0 -> 294.5 (2.52x, and the vendor arm there is wrong:
+    rel 8.5e-01 against 7.8e-07 here), c1024 3x3 s1 4x4 -> 4x4 45.5 -> 27.8
+    (1.63x).  It loses on the cells the phase kernel already streams well:
+    c1024 3x3 s2 4x4 -> 2x2 19.7 vs 27.2, c512 3x3 s2 4x4 -> 2x2 5.9 vs 7.3,
+    c1024 5x5 s2 4x4 -> 2x2 53.0 vs 73.9 - hence the gate below.
+
+    FLAGGEMS_SPACEMIT_CONV_MP=0 pins the old route for A/B.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    M = OH * OW
+    x = input.contiguous()
+    p = torch.nn.functional.unfold(
+        x, kernel_size=(KH, KW), dilation=(dil_h, dil_w),
+        padding=(pad_h, pad_w), stride=(SH, SW))[0].contiguous()
+    K = p.shape[0]
+    w2 = weight.reshape(OC, K).contiguous()
+    y = torch.empty((OC, M), dtype=torch.float32, device=x.device)
+    boc, bm, bk = _MP_TILES
+    if OC < boc:
+        boc = triton.next_power_of_2(OC)
+    nomask = (K % bk == 0) and (M % bm == 0) and (OC % boc == 0)
+    _conv1x1_kernel[(triton.cdiv(M, bm), triton.cdiv(OC, boc), 1)](
+        p, w2, bias if bias is not None else w2, y, K, M, OC,
+        p.stride(0), y.stride(0),
+        BLOCK_OC=boc, BLOCK_M=bm, BLOCK_K=bk,
+        HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=False)
+    y = y.view(1, OC, OH, OW)
+    dt = out_dtype or input.dtype
+    return y if y.dtype == dt else y.to(dt)
+
+
+def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
+                    groups=1) -> bool:
+    """wave83: the small-output band that pays per-pixel fixed costs.
+
+    Three measured entry points into the im2col GEMM route: many pixels for a
+    tiny output (M >= 16 - the GEMM amortises the weight over M columns),
+    a channel count the streaming routes cannot handle at all (C >= 2048), or
+    an input narrower than the fast gate's 4-pixel floor (those cells fall to
+    the vendor im2col path, 393-8689 ms).  Everything the phase kernel already
+    streams well stays where it is (the losses above are why).
+    """
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP", "1") == "0":
+        return False
+    if n != 1 or groups != 1:
+        return False
+    if (kh, kw) not in _TAP_KERNELS or dil_h != dil_w:
+        return False
+    if not (3 <= c <= 2048) or oc < 32:
+        return False
+    m = oh * ow
+    # 25 is the largest measured win (5x5 s2 9x9 -> 3x3); at M=49 the same
+    # route loses on 5x5 (c1024 5x5 s1 7x7 106.3 -> 118.9) and only wins 1.16x
+    # on 3x3, so the band stops at 25.
+    if not (2 <= m <= 25):
+        return False
+    if sh * sw > 4:
+        return False
+    if oc * c * kh * kw * 4 < (8 << 20):
+        return False
+    # A non-power-of-two channel count in the 1024..2048 band pays padding in
+    # every streaming route: c1536 3x3 s2 6x6 -> 3x3 187.1 -> 61.5 (3.04x),
+    # c1280 5x5 s2 5x5 -> 3x3 436.4 -> 119.2 (3.66x), c1920 3x3 s2 4x4 -> 2x2
+    # 216.7 -> 100.4 (2.16x), c1536 5x5 s2 5x5 -> 3x3 526.6 -> 166.7 (3.16x).
+    # The power-of-two cell at the same shape loses (c1024 5x5 s2 5x5 -> 3x3
+    # 59.9 vs 74.7), so the clause is exactly the non-power-of-two class.
+    if c >= 1024 and (c & (c - 1)) != 0:
+        return True
+    return m >= 16 or c >= 2048 or w < 4
+
+
 def conv_1x1_dense_applies(n, c, oc, oh, ow, sh, sw, h, w, kh, kw, pad_h,
                            pad_w, groups) -> bool:
     """wave82: the routing form of dense_g_1x1_applies for the public entries.
@@ -2422,6 +2514,15 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     N, C, H, W = input.shape
     OC, CG, KH, KW = weight.shape
     if input.dtype != torch.float32:
+        # wave83: the f16/bf16 1-pixel cell is a row-stream gemv on the stored
+        # weights; the carrier below would first convert the whole weight to
+        # f32 (37.7 MB at c1024 3x3), which is then the dominant cost (23.4 ms
+        # on the f16 cell against 3.4 ms of actual stream).  The kernel loads
+        # and accumulates in f32 either way, so only the stored bytes change.
+        if (weight.dtype == input.dtype
+                and conv_1px_applies(N, C, OC, OH, OW, KH, KW, groups)):
+            return _conv_1px_gemv(input, weight, bias, pad_h, pad_w, KH, KW,
+                                  dil_h, dil_w, out_dtype=input.dtype)
         # wave65 carrier: half precision never enters the f32 kernels.  For
         # bf16 this is the only working route in the wheel (the vendor conv
         # aborts in spine-opt), and for the f16 stem it is 25x faster than the
@@ -2447,6 +2548,13 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     if conv_1px_applies(N, C, OC, OH, OW, KH, KW, groups):
         return _conv_1px_gemv(input, weight, bias, pad_h, pad_w, KH, KW,
                               dil_h, dil_w, out_dtype=_out_dtype)
+    # wave83: 2..64 output pixels as one im2col GEMM (see conv_mp_applies for
+    # the measured band: the phase kernel pays its fixed cost per pixel and the
+    # vendor path owns the narrower-than-4-input cells at 393-8689 ms).
+    if conv_mp_applies(N, C, OC, OH, OW, KH, KW, SH, SW, H, W,
+                       dil_h, dil_w, groups):
+        return _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
+                             SH, SW, dil_h, dil_w, out_dtype=_out_dtype)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
     # wave81: CG below the lane floor goes dense (block-diagonal weight, one

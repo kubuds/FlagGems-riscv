@@ -401,6 +401,7 @@ class Conv2d(torch.autograd.Function):
                     conv_fast_enabled,
                     conv_1px_applies,
                     conv_1x1_dense_applies,
+                    conv_mp_applies,
                     conv_phase_applies,
                     conv_phase_g_applies,
                     tap_shift_applies,
@@ -495,11 +496,20 @@ class Conv2d(torch.autograd.Function):
                     # route reads the whole weight for one element) and the new
                     # row-stream gemv reads it at 6-9 GB/s against the phase
                     # kernel's 113 MB/s.
+                    # wave83: 2..64 output pixels as one im2col GEMM (the
+                    # phase kernel pays its fixed cost per pixel; cells with an
+                    # input narrower than 4 fall to the vendor path).
                     applies = (dil_tap or dil_phase or dil_phase_g or dil_dwise
                                or conv_1px_applies(
                                    input.shape[0], input.shape[1],
                                    weight.shape[0], fast_oh, fast_ow, kh, kw,
                                    groups)
+                               or conv_mp_applies(
+                                   input.shape[0], input.shape[1],
+                                   weight.shape[0], fast_oh, fast_ow, kh, kw,
+                                   stride_height, stride_width,
+                                   input.shape[2], input.shape[3],
+                                   dilation_height, dilation_width, groups)
                                or conv_1x1_dense_applies(
                                    input.shape[0], input.shape[1],
                                    weight.shape[0], fast_oh, fast_ow,

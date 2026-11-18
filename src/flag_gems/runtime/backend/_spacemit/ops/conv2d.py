@@ -217,7 +217,8 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     # FLAGGEMS_SPACEMIT_CONV_DIL=0 keeps the vendor path.
     from .conv2d_fast import (conv2d_direct, conv_fast_applies,
                               conv_fast_enabled, conv_phase_applies,
-                              conv_1px_applies, conv_1x1_dense_applies)
+                              conv_1px_applies, conv_1x1_dense_applies,
+                              conv_mp_applies)
 
     dil_tap = (dil_h == dil_w and dil_h > 1 and groups == 1
                and KH == KW and KH in (3, 5, 7) and str_h == 1 and str_w == 1
@@ -241,6 +242,9 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     if conv_fast_enabled() and (dil_tap or dil_phase or dil_dwise
                                 or conv_1px_applies(N, C, OC, OH, OW, KH, KW,
                                                     groups)
+                                or conv_mp_applies(N, C, OC, OH, OW, KH, KW,
+                                                   str_h, str_w, H, W,
+                                                   dil_h, dil_w, groups)
                                 or conv_1x1_dense_applies(N, C, OC, OH, OW,
                                                           str_h, str_w, H, W,
                                                           KH, KW, pad_h, pad_w,
