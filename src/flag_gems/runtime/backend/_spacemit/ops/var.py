@@ -63,7 +63,7 @@ from .var_fast import (
 logger = logging.getLogger(__name__)
 
 _FAST_MIN_NUMEL = 65536
-_FAST_DTYPES = (torch.float32, torch.float16)
+_FAST_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _trailing_target(x, dim):
@@ -198,7 +198,10 @@ def _flat_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
     if res is None:
         return None
     if dim is None:
-        shape = ()
+        # wave30: torch.var(x, keepdim=True) without dim returns one element per
+        # dimension (shape (1,)*ndim), not a scalar - this is what the accuracy
+        # suite's test_accuracy_var[dtype0-True-0-*] cases caught.
+        shape = (1,) * x.ndim if keepdim else ()
     else:
         dims = [dim] if isinstance(dim, int) else list(dim)
         d = dims[0] % x.ndim

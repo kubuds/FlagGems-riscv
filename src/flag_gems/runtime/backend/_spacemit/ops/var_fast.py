@@ -167,11 +167,11 @@ def var_dim_mmk_launch(
             break
     if k is None:
         return False
-    f16 = x.dtype == torch.float16
+    is16 = x.dtype in (torch.float16, torch.bfloat16)
     # wave12: nest gate — every probed route except N=512 wins (probe104/105:
-    # 1.16-1.69x; N=512 loses 0.55-0.62). f16 stays plain (untested form).
+    # 1.16-1.69x; N=512 loses 0.55-0.62). 16-bit stays plain (untested form).
     nest = (
-        not f16
+        not is16
         and k >= 2
         and N in _NEST_ROUTES
         and os.environ.get("FLAGGEMS_SPACEMIT_VAR_NEST", "1") != "0"
@@ -182,14 +182,14 @@ def var_dim_mmk_launch(
                 x, var_out, mean_out, N, float(corr),
                 K=k, W=w1, SB=sb, NS1=ns1,
                 OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
-                LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
+                LOOP1=is16, W2=(_F16_W2.get(N, 256) if is16 else 0),
             )
     else:
         _var_mmk[(M // k,)](
             x, var_out, mean_out, N, float(corr),
             K=k, W=w1, SB=sb, NS1=ns1,
             OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
-            LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
+            LOOP1=is16, W2=(_F16_W2.get(N, 256) if is16 else 0),
         )
     return True
 
@@ -350,11 +350,11 @@ def var_flat_launch(x, corr, want_mean=False, sqrt=False):
     midn = triton.cdiv(n, block)
     if midn > _FLAT_HOST_MAX:
         return None
-    f16 = x.dtype == torch.float16
-    sb = _FLAT_SB_F16 if f16 else _FLAT_SB
+    is16 = x.dtype in (torch.float16, torch.bfloat16)
+    sb = _FLAT_SB_F16 if is16 else _FLAT_SB
     mid = torch.empty(midn, dtype=torch.float32, device=x.device)
     with torch_device_fn.device(x.device):
-        if f16:
+        if is16:
             _var_flat_sum_k1l[(midn,)](x, mid, n, block, sb)
         else:
             _var_flat_sum_k1d[(midn,)](x, mid, n, block)

@@ -52,10 +52,12 @@ def sum_fast_enabled() -> bool:
 
 # ---------------- flat two-stage ----------------
 @triton.jit
-def _sum_flat_k1(inp, mid, M, BLOCK: tl.constexpr):
+def _sum_flat_k1(inp, mid, M, BLOCK: tl.constexpr, IS16: tl.constexpr):
     pid = tl.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
     v = tl.load(inp + off, mask=off < M, other=0.0)
+    if IS16:
+        v = v.to(tl.float32)
     tl.store(mid + pid, tl.sum(v, axis=0))
 
 
@@ -67,10 +69,12 @@ def _sum_flat_k2(mid, out, MIDN, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _sum_flat_single(inp, out, M, BLOCK: tl.constexpr):
+def _sum_flat_single(inp, out, M, BLOCK: tl.constexpr, IS16: tl.constexpr):
     # wave8: midn == 1 fast case (tiny/small M) - one launch, extent >= 32.
     off = tl.arange(0, BLOCK)
     v = tl.load(inp + off, mask=off < M, other=0.0)
+    if IS16:
+        v = v.to(tl.float32)
     tl.store(out, tl.sum(v, axis=0))
 
 
@@ -87,22 +91,108 @@ def _flat_block(M: int) -> int:
 
 
 def sum_flat_launch(x, out, M):
-    """Two-stage flat sum into out (scalar tensor). x must be f32/contiguous.
+    """Two-stage flat sum into out (scalar f32 tensor). x contiguous, f32/16-bit.
 
     wave8: covers ALL M now (small numels used to fall to the generic
     sqrt-rule kernel whose stage-2 extent is <= 16 for M <= ~512 and for
     M == 65536 exactly -> tl.sum extent<32 NaN). Stage-2 reduce extent is
-    floored at 32 and midn==1 short-circuits to a single launch."""
+    floored at 32 and midn==1 short-circuits to a single launch.
+
+    wave30: 16-bit inputs take the chunk-accumulate carrier (_sum_flat_k1_16);
+    the f32 path below is byte-for-byte the wave8 one.
+    """
+    if x.dtype != torch.float32:
+        _sum_flat_16(x, out, M)
+        return
     block = _flat_block(M)
     midn = triton.cdiv(M, block)
+    is16 = x.dtype != torch.float32
     if midn == 1:
-        _sum_flat_single[(1,)](x, out, M, block)
+        _sum_flat_single[(1,)](x, out, M, block, is16)
         return
     mid = torch.empty(midn, dtype=torch.float32, device=x.device)
-    _sum_flat_k1[(midn,)](x, mid, M, block)
+    _sum_flat_k1[(midn,)](x, mid, M, block, is16)
     blk2 = triton.next_power_of_2(midn)
     if blk2 < 32:
         blk2 = 32  # wave8: extent<32 NaN floor (covers the old M=65536 edge)
+    _sum_flat_k2[(1,)](mid, out, midn, blk2)
+
+
+# ---------------- wave30: 16-bit carriers for sum / mean ----------------
+# probe297/298: a 16-bit row sum built as "tl.load + .to(f32) + tl.sum(N)" runs
+# 7-9x slower than the same shapes on f32 (2048^2 f16 13.9 ms in the shipped
+# _sum_dim_mmk2048). Two things fix it: the accumulate loop must be a runtime
+# `range(0, N, BN)` (a fully unrolled tl.static_range spills), and 8-16 rows
+# per program amortize the per-row setup. Same structure as norm_fast._l2_rows,
+# which is why the norm carrier was already fast on 16-bit.
+_SUM16_BN = 128
+_SUM16_CHUNK = 8192
+
+
+@triton.jit
+def _sum_rows_16(X, Out, M, N, K: tl.constexpr, BN: tl.constexpr, MASKED: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BN)
+    for i in tl.static_range(K):
+        r = pid * K + i
+        rmask = r < M
+        base = r.to(tl.int64) * N
+        acc = tl.zeros([BN], dtype=tl.float32)
+        for off in range(0, N, BN):
+            idx = off + cols
+            if MASKED:
+                acc += tl.load(X + base + idx, mask=(idx < N) & rmask, other=0.0).to(tl.float32)
+            else:
+                acc += tl.load(X + base + idx).to(tl.float32)
+        if MASKED:
+            tl.store(Out + r, tl.sum(acc, axis=0), mask=rmask)
+        else:
+            tl.store(Out + r, tl.sum(acc, axis=0))
+
+
+def _rows16_k(M: int) -> int:
+    for cand in (16, 8, 4, 2):
+        if M % cand == 0:
+            return cand
+    return 1
+
+
+def sum_rows16_launch(x, out_flat, M, N) -> bool:
+    """16-bit row sum into an f32 buffer (out_flat is f32, shape (M,))."""
+    if x.dtype == torch.float32 or M <= 0 or N < 64:
+        return False
+    k = _rows16_k(M)
+    bn = min(_SUM16_BN, triton.next_power_of_2(N))
+    # probe300/301: the per-element mask costs 25-45% on these kernels (the
+    # divisible shapes were never measured with it before); only pay it when
+    # the row block or the row count actually exceeds the tensor.
+    masked = (N % bn) != 0 or (M % k) != 0
+    _sum_rows_16[(triton.cdiv(M, k),)](x, out_flat, M, N, K=k, BN=bn, MASKED=masked)
+    return True
+
+
+@triton.jit
+def _sum_flat_k1_16(inp, mid, M, CHUNK: tl.constexpr, BN: tl.constexpr, MASKED: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * CHUNK
+    cols = tl.arange(0, BN)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for off in range(0, CHUNK, BN):
+        idx = base + off + cols
+        if MASKED:
+            acc += tl.load(inp + idx, mask=idx < M, other=0.0).to(tl.float32)
+        else:
+            acc += tl.load(inp + idx).to(tl.float32)
+    tl.store(mid + pid, tl.sum(acc, axis=0))
+
+
+def _sum_flat_16(x, out, M):
+    chunk = _SUM16_CHUNK
+    midn = max(1, triton.cdiv(M, chunk))
+    mid = torch.empty(midn, dtype=torch.float32, device=x.device)
+    _sum_flat_k1_16[(midn,)](x, mid, M, CHUNK=chunk, BN=_SUM16_BN * 2,
+                             MASKED=(M % chunk) != 0)
+    blk2 = max(32, triton.next_power_of_2(midn))
     _sum_flat_k2[(1,)](mid, out, midn, blk2)
 
 
@@ -112,7 +202,7 @@ def _sum_dim_mmk512(X, Out, N, K: tl.constexpr):
     p = tl.program_id(0)
     for i in tl.static_range(K):
         r = p * K + i
-        xv = tl.load(X + r * N + tl.arange(0, 512))
+        xv = tl.load(X + r * N + tl.arange(0, 512)).to(tl.float32)
         tl.store(Out + r, tl.sum(xv, axis=0))
 
 
@@ -121,7 +211,7 @@ def _sum_dim_mmk1024(X, Out, N, K: tl.constexpr):
     p = tl.program_id(0)
     for i in tl.static_range(K):
         r = p * K + i
-        xv = tl.load(X + r * N + tl.arange(0, 1024))
+        xv = tl.load(X + r * N + tl.arange(0, 1024)).to(tl.float32)
         tl.store(Out + r, tl.sum(xv, axis=0))
 
 
@@ -130,7 +220,7 @@ def _sum_dim_mmk2048(X, Out, N, K: tl.constexpr):
     p = tl.program_id(0)
     for i in tl.static_range(K):
         r = p * K + i
-        xv = tl.load(X + r * N + tl.arange(0, 2048))
+        xv = tl.load(X + r * N + tl.arange(0, 2048)).to(tl.float32)
         tl.store(Out + r, tl.sum(xv, axis=0))
 
 
@@ -145,7 +235,7 @@ def _sum_dim_mmk_chunked(
         acc = 0.0
         for c in tl.static_range(NCHUNK):
             offs = c * BLOCK + tl.arange(0, BLOCK)
-            xv = tl.load(X + r * N + offs)
+            xv = tl.load(X + r * N + offs).to(tl.float32)
             acc += tl.sum(xv, axis=0)
         tl.store(Out + r, acc)
 
@@ -160,6 +250,10 @@ _SUM_MMK = {
 
 def sum_dim_mmk_launch(x, out_flat, M, N) -> bool:
     """Launch the multi-row kernel if (N, M) fit; return True if handled."""
+    if x.dtype != torch.float32:
+        # wave30: one 16-bit carrier covers every N (the per-width table below
+        # is tuned for the f32 tl.sum lowering and loses 7-9x on 16-bit).
+        return sum_rows16_launch(x, out_flat, M, N)
     ent = _SUM_MMK.get(N)
     if ent is not None:
         kern, k = ent
@@ -208,7 +302,7 @@ def _sum_dim0_fold(X, Mid, M, N, RB: tl.constexpr, BN: tl.constexpr):
     r_end = tl.minimum((pr + 1) * RB, M)
     acc = tl.zeros((BN,), dtype=tl.float32)
     for r in range(pr * RB, r_end):
-        acc += tl.load(X + r * N + cols, mask=cmask, other=0.0)
+        acc += tl.load(X + r * N + cols, mask=cmask, other=0.0).to(tl.float32)
     tl.store(Mid + pr * N + cols, acc, mask=cmask)
 
 

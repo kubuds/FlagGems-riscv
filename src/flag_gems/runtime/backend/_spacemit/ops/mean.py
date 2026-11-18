@@ -25,6 +25,7 @@ from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as tle
 
 from .mean_fast import mean_mmk_enabled, mean_mmk_launch
+from .sum_fast import sum_flat_launch, sum_rows16_launch
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,20 @@ def mean(inp, *, dtype=None):
     M = inp.numel()
     if dtype is None:
         dtype = inp.dtype
+    # wave30: 16-bit inputs ride the flat sum carrier (f32 accumulator) and are
+    # divided in f32 before the cast - the legacy sqrt-rule path kept f16
+    # partials and ran at 5.7 ms per 1M elements (probe295).
+    if (
+        inp.is_contiguous()
+        and inp.dtype in (torch.float16, torch.bfloat16)
+        and M >= 65536
+        and mean_mmk_enabled()
+    ):
+        acc = torch.empty([], dtype=torch.float32, device=inp.device)
+        with torch_device_fn.device(inp.device):
+            sum_flat_launch(inp, acc, M)
+        res = acc / M
+        return res if dtype == torch.float32 else res.to(dtype)
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
     mid_size = triton.cdiv(M, block_size)
     block_mid = triton.next_power_of_2(mid_size)
@@ -178,6 +193,33 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
         N *= shape[i]
         shape[i] = 1
     M = x.numel() // N
+    # wave30: 16-bit mean_dim rides the sum row carrier (f32 accumulator) and
+    # divides by N in f32. The f16 rows stay on the wave5 _MMK kernels: their
+    # raw-f16 tl.sum runs at 5.3 GB/s (1.50 ms at 2048^2) while the widening
+    # carrier costs 3.0 ms there; bf16 has no native reduce and falls to 13.6 ms
+    # on _MMK, so bf16 takes the carrier. M == 1 (flat reduce through
+    # mean_dim(dim=[0])) always takes the flat carrier, f16 included.
+    if (
+        x.dtype in (torch.float16, torch.bfloat16)
+        and x.is_contiguous()
+        and x.numel() >= 65536
+        and mean_mmk_enabled()
+    ):
+        acc = torch.empty(shape, dtype=torch.float32, device=x.device)
+        with torch_device_fn.device(x.device):
+            if M == 1:
+                sum_flat_launch(x, acc.reshape(1), x.numel())
+                handled = True
+            else:
+                handled = x.dtype == torch.bfloat16 and sum_rows16_launch(
+                    x, acc.reshape(M), M, N
+                )
+            if handled:
+                acc = acc / N
+                out = acc if dtype == torch.float32 else acc.to(dtype)
+                if not keepdim:
+                    out = out.squeeze(dim)
+                return out
     out = torch.empty(shape, dtype=dtype, device=x.device)
     grid = (M,)
     with torch_device_fn.device(x.device):
