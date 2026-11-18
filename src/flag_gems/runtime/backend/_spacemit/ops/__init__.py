@@ -24,7 +24,7 @@ from .copy import copy_
 # from .conv2d import conv2d
 # from .thnn_conv2d import thnn_conv2d
 # from .conv_depthwise2d import _conv_depthwise2d
-# from .flash_attention import flash_attention, scaled_dot_product_attention
+from .flash_attention import flash_attention, scaled_dot_product_attention
 from .gelu import gelu, gelu_, gelu_backward
 from .hardsigmoid import hardsigmoid, hardsigmoid_, hardsigmoid_out
 from .layernorm import layer_norm
