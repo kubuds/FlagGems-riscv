@@ -1,5 +1,10 @@
 # wave57 candidate: conv2d for the K3 backend.
 #
+# wave60 adds the 1x1 stride-1 route: in NCHW that convolution is already a
+# (OC,C) @ (C,H*W) GEMM with an NCHW result, so it runs through a plain dot
+# kernel at 43-53 GFLOPS instead of the tap kernel's 12-15.  Everything below
+# is the tap path, which still serves every other kernel size.
+#
 # On top of wave56 (ROWS per program, BLOCK_OW following OW, depthwise kernel,
 # NOMASK at ROWS == 1):
 #   - grouped conv (1 < groups < C) is covered: each group is an independent
@@ -93,6 +98,53 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     if ww < (4 if dwise else 8):
         return False
     return True
+
+
+@triton.jit
+def _conv1x1_kernel(X, Wm, Bs, Y, C, M, OC, sxn, syn,
+    BLOCK_OC: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, NOMASK: tl.constexpr, SWAP: tl.constexpr,
+):
+    """wave60: 1x1 stride-1 conv as the GEMM it already is in NCHW.
+
+    y[oc, m] = sum_c w[oc, c] * x[c, m], m = h*W + w over the (C, M) slab, so
+    both operands are already in the layout a GEMM wants and the result is
+    already NCHW.  No im2col, no transpose, no tap loop: one dot per K block
+    instead of one K=32 dot per (kh, kw, c-block).
+    """
+    if SWAP:
+        pid_oc = tl.program_id(0)
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = tl.program_id(0)
+        pid_oc = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    acc = tl.zeros((BLOCK_OC, BLOCK_M), dtype=tl.float32)
+    xb = X + pid_n * sxn
+    for k0 in range(0, C, BLOCK_K):
+        cs = k0 + tl.arange(0, BLOCK_K)
+        if NOMASK:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :])
+            xv = tl.load(xb + cs[:, None] * M + m[None, :])
+        else:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :],
+                         mask=(oc[:, None] < OC) & (cs[None, :] < C), other=0.0)
+            xv = tl.load(xb + cs[:, None] * M + m[None, :],
+                         mask=(cs[:, None] < C) & (m[None, :] < M), other=0.0)
+        acc += tl.dot(wv, xv)
+    if HAS_BIAS:
+        if NOMASK:
+            acc += tl.load(Bs + oc)[:, None]
+        else:
+            acc += tl.load(Bs + oc, mask=oc < OC, other=0.0)[:, None]
+    yb = Y + pid_n * syn
+    if NOMASK:
+        tl.store(yb + oc[:, None] * M + m[None, :], acc.to(Y.dtype.element_ty))
+    else:
+        tl.store(yb + oc[:, None] * M + m[None, :], acc.to(Y.dtype.element_ty),
+                 mask=(oc[:, None] < OC) & (m[None, :] < M))
 
 
 @triton.jit
@@ -336,6 +388,49 @@ def _pick_tiles(n, oh, ow, oc, stride=(1, 1)):
     return bow, boc, rows
 
 
+def _pick_1x1_tiles(C, M, OC):
+    """wave60 probe976-980: BLOCK_K=32 wins at C=64/128/256 (43-53 GFLOPS
+    against 35-40 at K=64), a 64x64 output tile wins whenever OC > 64, and at
+    OC <= 64 the narrower 32-lane weight tile plus a 128-wide pixel tile is the
+    only thing that fills the grid (1,64,112,112) OC=64: 3.65 ms vs 6.58 at
+    64x64.  SWAP puts the oc axis on program_id(0) so the x tile a program just
+    read is reused by the next oc tile: 2.41 -> 2.24 at (1,64,56,56) OC=256 and
+    2.36 -> 1.93 at (1,128,28,28) OC=512.  With one oc tile it only costs
+    ((1,64,112,112) 6.58 -> 9.66), hence the OC > 64 condition.
+    """
+    bk = 32 if C % 32 == 0 else (16 if C % 16 == 0 else triton.next_power_of_2(C))
+    if OC <= 64:
+        boc = 32 if OC >= 32 else triton.next_power_of_2(OC)
+        bm = 128 if M >= 1024 else 64
+        swap = False
+    else:
+        boc = 64
+        bm = 64
+        swap = True
+    return boc, bm, bk, swap
+
+
+def _conv1x1_gemm(input, weight, bias, OH, OW):
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    M = OH * OW
+    x = input.contiguous()
+    x2 = x.view(N, C, M)
+    w2 = weight.view(OC, C).contiguous()
+    y = torch.empty((N, OC, M), dtype=x.dtype, device=x.device)
+    boc, bm, bk, swap = _pick_1x1_tiles(C, M, OC)
+    nomask = (C % bk == 0) and (M % bm == 0) and (OC % boc == 0)
+    nm, no = triton.cdiv(M, bm), triton.cdiv(OC, boc)
+    grid = (no, nm, N) if swap else (nm, no, N)
+    _conv1x1_kernel[grid](
+        x2, w2, bias if bias is not None else x2, y,
+        C, M, OC, x2.stride(0), y.stride(0),
+        BLOCK_OC=boc, BLOCK_M=bm, BLOCK_K=bk,
+        HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=swap,
+    )
+    return y.view(N, OC, OH, OW)
+
+
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
                       BLOCK_OW=None, BLOCK_C=None):
     N, _, H, W = input.shape
@@ -430,6 +525,13 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
+    # wave60: 1x1 stride-1 pad-0 conv is a GEMM in NCHW already - route it
+    # before anything touches the input (no pad, no channel padding, no copy).
+    # FLAGGEMS_SPACEMIT_CONV_1X1=0 puts the tap kernel back for A/B.
+    if (KH == 1 and KW == 1 and groups == 1 and SH == 1 and SW == 1
+            and pad_h == 0 and pad_w == 0 and C >= 16 and OC >= 16
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1", "1") != "0"):
+        return _conv1x1_gemm(input, weight, bias, OH, OW)
     x = input.contiguous()
     if pad_h or pad_w:
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
