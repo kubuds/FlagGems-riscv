@@ -64,6 +64,14 @@ def _sum_flat_k2(mid, out, MIDN, BLOCK: tl.constexpr):
     tl.store(out, tl.sum(v, axis=0))
 
 
+@triton.jit
+def _sum_flat_single(inp, out, M, BLOCK: tl.constexpr):
+    # wave8: midn == 1 fast case (tiny/small M) - one launch, extent >= 32.
+    off = tl.arange(0, BLOCK)
+    v = tl.load(inp + off, mask=off < M, other=0.0)
+    tl.store(out, tl.sum(v, axis=0))
+
+
 def _flat_block(M: int) -> int:
     b = triton.next_power_of_2(max(4096, -(-M // 64)))
     if b > 16384:
@@ -71,16 +79,29 @@ def _flat_block(M: int) -> int:
     p2 = triton.next_power_of_2(M)
     if b > p2:
         b = p2
+    if b < 32:
+        b = 32  # wave8: tl.sum reduce extent < 32 lowers to NaN (spine backend)
     return b
 
 
 def sum_flat_launch(x, out, M):
-    """Two-stage flat sum into out (scalar tensor). x must be f32/contiguous."""
+    """Two-stage flat sum into out (scalar tensor). x must be f32/contiguous.
+
+    wave8: covers ALL M now (small numels used to fall to the generic
+    sqrt-rule kernel whose stage-2 extent is <= 16 for M <= ~512 and for
+    M == 65536 exactly -> tl.sum extent<32 NaN). Stage-2 reduce extent is
+    floored at 32 and midn==1 short-circuits to a single launch."""
     block = _flat_block(M)
     midn = triton.cdiv(M, block)
+    if midn == 1:
+        _sum_flat_single[(1,)](x, out, M, block)
+        return
     mid = torch.empty(midn, dtype=torch.float32, device=x.device)
     _sum_flat_k1[(midn,)](x, mid, M, block)
-    _sum_flat_k2[(1,)](mid, out, midn, triton.next_power_of_2(midn))
+    blk2 = triton.next_power_of_2(midn)
+    if blk2 < 32:
+        blk2 = 32  # wave8: extent<32 NaN floor (covers the old M=65536 edge)
+    _sum_flat_k2[(1,)](mid, out, midn, blk2)
 
 
 # ---------------- sum_dim multi-row (plain per-row reduce) ----------------
@@ -157,3 +178,65 @@ def sum_dim_mmk_launch(x, out_flat, M, N) -> bool:
         _sum_dim_mmk_chunked[(M // k,)](x, out_flat, N, k, 8192, 4)
         return True
     return False
+
+
+# ---------------- sum_dim dim0 (non-inner) row-fold (wave8) ----------------
+# Grid: (cdiv(N, BN), cdiv(M, RB)); stage 1 accumulates RB rows per program
+# into row-block partials (NO tl.sum - pure load+add, immune to the
+# elementwise-feeding-tl.sum cliff; 2D-load+tl.sum(axis=0) measured 5-13x
+# slower in probe78). Stage 2 combines the PRB partial rows (also pure
+# accumulate). Same-session f32 (probe78/79, ms min-of-9):
+#   (2048,2048)  12.46 generic -> 1.27  (torch 6.69)
+#   (8192,512)    4.41         -> 1.96  (torch 3.83)
+#   (512,32768)  14.33         -> 3.33  (torch 26.27)
+#   (1024,4096)   6.12         -> 1.37  (torch 7.25)
+#   (4096,1024)  17.32         -> 1.98  (torch 6.24)
+@triton.jit
+def _sum_dim0_fold(X, Mid, M, N, RB: tl.constexpr, BN: tl.constexpr):
+    pc = tl.program_id(0)
+    pr = tl.program_id(1)
+    cols = pc * BN + tl.arange(0, BN)
+    cmask = cols < N
+    r_end = tl.minimum((pr + 1) * RB, M)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for r in range(pr * RB, r_end):
+        acc += tl.load(X + r * N + cols, mask=cmask, other=0.0)
+    tl.store(Mid + pr * N + cols, acc, mask=cmask)
+
+
+@triton.jit
+def _sum_dim0_comb(Mid, Out, PRB, N, BN: tl.constexpr):
+    pc = tl.program_id(0)
+    cols = pc * BN + tl.arange(0, BN)
+    cmask = cols < N
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for i in range(0, PRB):
+        acc += tl.load(Mid + i * N + cols, mask=cmask, other=0.0)
+    tl.store(Out + cols, acc, mask=cmask)
+
+
+# (M, N) -> (RB, BN); probed same-session (probe79 refinement).
+_DIM0_ROUTES = {
+    (2048, 2048): (256, 512),
+    (8192, 512): (512, 512),
+    (512, 32768): (128, 8192),
+    (1024, 4096): (128, 2048),
+    (4096, 1024): (256, 1024),
+}
+
+
+def sum_dim0_launch(x2d, out_flat, M, N) -> bool:
+    """Row-fold dim0 reduce. x2d = (M, N) f32 contiguous view; out_flat = (N,).
+
+    Any (M, N >= 1) is handled (masked edges); returns False only for empty."""
+    if M <= 0 or N <= 0:
+        return False
+    rb, bn = _DIM0_ROUTES.get((M, N), (None, None))
+    if rb is None:
+        rb = 128 if M >= 4096 else 64
+        bn = min(1024, triton.next_power_of_2(max(N, 32)))
+    prb = triton.cdiv(M, rb)
+    mid = torch.empty((prb, N), dtype=torch.float32, device=x2d.device)
+    _sum_dim0_fold[(triton.cdiv(N, bn), prb)](x2d, mid, M, N, rb, bn)
+    _sum_dim0_comb[(triton.cdiv(N, bn),)](mid, out_flat, prb, N, bn)
+    return True

@@ -39,7 +39,12 @@ from flag_gems.ops.sum import sum_dim_out as _orig_sum_dim_out
 from flag_gems.ops.sum import sum_out as _orig_sum_out
 from flag_gems.runtime import torch_device_fn
 
-from .sum_fast import sum_dim_mmk_launch, sum_fast_enabled, sum_flat_launch
+from .sum_fast import (
+    sum_dim0_launch,
+    sum_dim_mmk_launch,
+    sum_fast_enabled,
+    sum_flat_launch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +58,7 @@ def _flat_fast_ok(inp, dtype):
         return False
     if dtype is not None and dtype != torch.float32:
         return False
-    if inp.numel() < _FAST_MIN_NUMEL:
+    if inp.numel() < 1:
         return False
     return True
 
@@ -78,6 +83,31 @@ def _dim_fast_target(inp, dim, keepdim):
     N = inp.shape[d]
     M = inp.numel() // N
     return M, N
+
+
+def _dim0_fast_target(inp, dim, keepdim):
+    """Return (M, N, final_shape) for the dim0 row-fold path, else None."""
+    if not sum_fast_enabled():
+        return None
+    if inp.dtype != torch.float32 or not inp.is_contiguous():
+        return None
+    if inp.numel() < _FAST_MIN_NUMEL or inp.numel() == 0 or inp.ndim < 2:
+        return None
+    if dim is None:
+        return None
+    if isinstance(dim, (list, tuple)):
+        if len(dim) != 1:
+            return None
+        d = dim[0]
+    else:
+        d = dim
+    d = d % inp.ndim
+    if d != 0:
+        return None
+    M = inp.shape[0]
+    N = inp.numel() // M
+    final_shape = ((1,) if keepdim else ()) + inp.shape[1:]
+    return M, N, final_shape
 
 
 def sum(inp, *, dtype=None):
@@ -112,6 +142,13 @@ def sum_dim(inp, dim=None, keepdim=False, *, dtype=None):
             with torch_device_fn.device(inp.device):
                 if sum_dim_mmk_launch(inp, out.reshape(M), M, N):
                     return out
+        t0 = _dim0_fast_target(inp, dim, keepdim)
+        if t0 is not None:
+            M, N, fs = t0
+            out = torch.empty(fs, dtype=torch.float32, device=inp.device)
+            with torch_device_fn.device(inp.device):
+                if sum_dim0_launch(inp.reshape(M, N), out.reshape(N), M, N):
+                    return out
     return _orig_sum_dim(inp, dim=dim, keepdim=keepdim, dtype=dtype)
 
 
@@ -125,5 +162,12 @@ def sum_dim_out(inp, dim=None, keepdim=False, *, dtype=None, out):
             out.resize_(final_shape)
             with torch_device_fn.device(inp.device):
                 if sum_dim_mmk_launch(inp, out.reshape(M), M, N):
+                    return out
+        t0 = _dim0_fast_target(inp, dim, keepdim)
+        if t0 is not None:
+            M, N, fs = t0
+            out.resize_(fs)
+            with torch_device_fn.device(inp.device):
+                if sum_dim0_launch(inp.reshape(M, N), out.reshape(N), M, N):
                     return out
     return _orig_sum_dim_out(inp, dim=dim, keepdim=keepdim, dtype=dtype, out=out)

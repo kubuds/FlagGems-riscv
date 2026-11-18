@@ -1265,9 +1265,16 @@ _FULL_CONFIG = (
     ("upsample_nearest3d", upsample_nearest3d),
     ("upsample_trilinear3d", upsample_trilinear3d),
     ("value_selecting_reduction_backward", value_selecting_reduction_backward),
-    ("var", var),
+    # wave8 (campaign 1015night): aten::var and aten::var.dim carry no
+    # Autograd kernel on this spine-torch build (composite-only; probe70)
+    # -> grad-mode calls detached via the autograd fallback (probe68:
+    # x.grad=None + warning). Register the vendor impls for the Autograd
+    # key as well; the vendor wrappers delegate grad-tracking calls to
+    # aten::var.correction (formula present). probe71/72: grads bit-close,
+    # no fallback warning; no-grad dispatch (CPU key) is unchanged.
+    ("var", var, None, (AUTOGRAD_DISPATCH_KEY,)),
     ("var.correction", var_correction),
-    ("var.dim", var_dim),
+    ("var.dim", var_dim, None, (AUTOGRAD_DISPATCH_KEY,)),
     ("var_mean.correction", var_mean),
     ("vdot", vdot),
     ("view_as_complex", view_as_complex),

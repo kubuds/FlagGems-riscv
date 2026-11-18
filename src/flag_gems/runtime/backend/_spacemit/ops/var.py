@@ -111,9 +111,45 @@ def _corr_of(correction):
     return 1.0 if correction is None else float(correction)
 
 
-def var(x, dim=None, *, correction=None, keepdim=False):
+def _grad_delegate_wanted(x) -> bool:
+    """wave8: aten::var and aten::var.dim have NO Autograd formula on this
+    spine-torch build (both composite-only, probe70 dispatch dump), so
+    grad-mode calls used to detach (x.grad=None + 'autograd kernel was not
+    registered' warning, probe68). Delegate grad-tracking calls to
+    aten::var.correction, which does carry a formula (probe71/72:
+    grads bit-close vs analytic; probe74: flat torch.var(x) already routes
+    through var.correction natively)."""
+    return bool(
+        torch.is_grad_enabled()
+        and isinstance(x, torch.Tensor)
+        and x.requires_grad
+    )
+
+
+def var(x, dim=None, *args, correction=None, keepdim=False, **kwargs):
+    """aten::var.default: (self, unbiased=True) - the legacy bool arrives
+    POSITIONALLY: torch.var(x, unbiased=False) / torch.var(x, False) used to
+    land in `dim` and crash the generic fallback (len(False), probe73).
+    wave8 maps positional bools to correction, and grad-tracking calls
+    delegate to var.correction (formula-carrying)."""
     logger.debug("GEMS_SPACEMIT VAR (fast override)")
-    r = _fast_reduce(x, dim, _corr_of(correction), keepdim)
+    unbiased = None
+    if isinstance(dim, bool):
+        unbiased = bool(dim)
+        dim = None
+    else:
+        for a in args:
+            if isinstance(a, bool):
+                unbiased = bool(a)
+                break
+    if correction is None and unbiased is not None:
+        correction = 1.0 if unbiased else 0.0
+    corr = _corr_of(correction)
+    if _grad_delegate_wanted(x):
+        return torch.ops.aten.var.correction(
+            x, dim=dim, correction=corr, keepdim=keepdim
+        )
+    r = _fast_reduce(x, dim, corr, keepdim)
     if r is not None:
         return r
     return _orig_var(x, dim=dim, correction=correction, keepdim=keepdim)
@@ -148,6 +184,10 @@ def var_dim(x, dim=None, *args, correction=None, keepdim=False, **kwargs):
         corr = float(others[0])
     if corr is None:
         corr = 1.0
+    if _grad_delegate_wanted(x):
+        return torch.ops.aten.var.correction(
+            x, dim=dim, correction=corr, keepdim=kd
+        )
     r = _fast_reduce(x, dim, corr, kd)
     if r is not None:
         return r

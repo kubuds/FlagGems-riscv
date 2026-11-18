@@ -90,8 +90,14 @@ def sum(inp, *, dtype=None):
             inp = inp.to(torch.int64)
             dtype = torch.int64
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    if block_size < 32:
+        # wave8: tl.sum reduce extent < 32 lowers to NaN on the spine backend
+        # (extent 2..16 always); floor both stages at 32.
+        block_size = 32
     mid_size = triton.cdiv(M, block_size)
     block_mid = triton.next_power_of_2(mid_size)
+    if block_mid < 32:
+        block_mid = 32
 
     mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
     out = torch.empty([], dtype=dtype, device=inp.device)
@@ -111,8 +117,14 @@ def sum_out(inp, *, dtype=None, out):
             inp = inp.to(torch.int64)
             dtype = torch.int64
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    if block_size < 32:
+        # wave8: tl.sum reduce extent < 32 lowers to NaN on the spine backend
+        # (extent 2..16 always); floor both stages at 32.
+        block_size = 32
     mid_size = triton.cdiv(M, block_size)
     block_mid = triton.next_power_of_2(mid_size)
+    if block_mid < 32:
+        block_mid = 32
 
     mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
     with torch_device_fn.device(inp.device):
