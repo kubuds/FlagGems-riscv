@@ -767,6 +767,26 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
             # spatial axis independently; the trailing slice trims the extra pad
             # that ceil() introduces on the bottom/right, matching torch's "same".
             padding = (padding_h, padding_w)
+            # wave99: route "same" through the inference fast entry as well.
+            # It takes the resolved (padding_h, padding_w) and computes the
+            # same OH/OW; ceil() can leave one extra row/column on the
+            # bottom/right, which the same trailing slice trims.  Training,
+            # requires_grad and odd shapes return None and keep the autograd
+            # path unchanged.
+            try:
+                from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
+                    conv2d_infer,
+                )
+
+                fast_y = conv2d_infer(
+                    input, weight, bias, stride, padding, dilation, groups
+                )
+            except ImportError:
+                fast_y = None
+            if fast_y is not None:
+                if oh == ih and ow == iw:
+                    return fast_y
+                return fast_y[..., (oh - ih) :, (ow - iw) :]
             return Conv2d.apply(input, weight, bias, stride, padding, dilation, groups)[
                 ..., (oh - ih) :, (ow - iw) :
             ]

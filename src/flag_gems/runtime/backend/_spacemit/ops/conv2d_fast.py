@@ -56,8 +56,26 @@ except Exception:  # a wheel without the spacemit extra keeps the tl path
 _STEM_BUF = {}
 
 
+# wave99: os.environ.get costs ~2.2 us per call on this board (the mapping
+# wrapper encodes and decodes every key); the route predicates run 15-20 of
+# them per conv call, which is most of the 18-32 us spent inside
+# conv2d_direct (wave97 note).  Read the raw dict behind os.environ instead
+# (~0.2 us), covering both key types.  Values are decoded only when present,
+# so the untouched default path keeps its exact semantics.
+_ENV_RAW = getattr(os.environ, "_data", os.environ)
+
+
+def _env_str(name, default=""):
+    v = _ENV_RAW.get(name)
+    if v is None:
+        v = _ENV_RAW.get(name.encode())
+    if v is None:
+        return default
+    return v.decode() if isinstance(v, bytes) else v
+
+
 def conv_fast_enabled() -> bool:
-    return os.environ.get("FLAGGEMS_SPACEMIT_CONV_FAST", "1") != "0"
+    return _env_str("FLAGGEMS_SPACEMIT_CONV_FAST", "1") != "0"
 
 
 def _oc_pad(oc):
@@ -72,8 +90,8 @@ def _oc_pad(oc):
     the next power of two at an 8-row floor instead.  FLAGGEMS_SPACEMIT_CONV_OCP
     forces a fixed floor (32 restores the old rule) for A/B.
     """
-    floor = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_OCP", "0"))
-    exact = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_OCP_EXACT", "0"))
+    floor = int(_env_str("FLAGGEMS_SPACEMIT_CONV_OCP", "0"))
+    exact = int(_env_str("FLAGGEMS_SPACEMIT_CONV_OCP_EXACT", "0"))
     if exact > 0:
         return max(8, exact)
     if floor <= 0:
@@ -119,10 +137,10 @@ def _fast_applies_shapes(n, c, h, ww, oc, kh, kw, xd, wd, sh, sw, dh, dw,
         if wd != xd or xd not in (torch.float16, torch.bfloat16):
             return False
         if xd == torch.float16:
-            if os.environ.get("FLAGGEMS_SPACEMIT_CONV_F16_CARRIER", "1") != "1":
+            if _env_str("FLAGGEMS_SPACEMIT_CONV_F16_CARRIER", "1") != "1":
                 return (groups == 1 and kh == 7 and kw == 7 and c <= 8
-                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
-        elif os.environ.get("FLAGGEMS_SPACEMIT_CONV_BF16_CARRIER", "1") == "0":
+                        and _env_str("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
+        elif _env_str("FLAGGEMS_SPACEMIT_CONV_BF16_CARRIER", "1") == "0":
             return False
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
@@ -258,14 +276,14 @@ def conv_fast_route_applies(n, c, h, ww, oc, kh, kw, sh, sw, ph, pw, dh, dw,
             dh == dw and dh > 1 and groups == 1
             and sh == 1 and sw == 1
             and tap_shift_applies(n, c, oc, oh, ow, kh, kw, 1, dh, dw)
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
         )
         dil_dwise = (
             groups == c == oc
             and (dh != 1 or dw != 1)
             and n * oc * oh * ow * kh * kw >= (1 << 14)
             and ow >= 4
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_DW_DIL", "1") != "0"
         )
         dil_phase = (
             dh == dw and dh > 1 and groups == 1
@@ -878,7 +896,7 @@ def _conv1x1_gemm_g_tl(input, weight, bias, OH, OW, groups):
     wg = weight.contiguous().view(groups, OCG, CG)
     y = torch.empty((N, groups, OCG, M), dtype=x.dtype, device=x.device)
     boc, bm, bk = _pick_1x1g_tl_tiles(CG, M, OCG)
-    _t = os.environ.get("FLAGGEMS_SPACEMIT_1X1GT_TILE", "")
+    _t = _env_str("FLAGGEMS_SPACEMIT_1X1GT_TILE", "")
     if _t:
         boc, bm, bk = (int(v) for v in _t.split(","))
     nomask = (CG % bk == 0) and (M % bm == 0) and (OCG % boc == 0)
@@ -931,7 +949,7 @@ def _conv1x1_strided_g(input, weight, bias, OH, OW, SH, SW, groups):
     wg = w2.view(groups, OCG, CG)
     yg = y.view(N, groups, OCG, OH * OW)
     boc, rows, bow, bk = _pick_1x1s2g_tiles(CG, OH, OW, OCG, N * groups)
-    _t = os.environ.get("FLAGGEMS_SPACEMIT_1X1S2G_TILE", "")
+    _t = _env_str("FLAGGEMS_SPACEMIT_1X1S2G_TILE", "")
     if _t:
         boc, rows, bow = (int(v) for v in _t.split(","))
     nomask = False   # unmasked 3-D loads abort spine-opt at ROWS>=2 (wave78); the
@@ -1230,7 +1248,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # an output of at most four columns, i.e. 32-64x of the MACs were padding.
     mn = 64
     if (MY <= 16 and CP <= 1024
-            and os.environ.get("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
+            and _env_str("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
         bm = min(64, max(32, OCP))
         bn = 32
         mn = 32
@@ -1241,7 +1259,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # Splitting to 64/32 measured neutral to worse on every cell tried (g32 c64
     # 3x3 s2 28 1.668 auto / 1.719 at 64 / 2.121 at 32; g16 c64 3x3 s2 56 2.966
     # / 3.005 / 3.953), so the program count is not what limits those cells.
-    ph_bn = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_BN", "0"))
+    ph_bn = int(_env_str("FLAGGEMS_SPACEMIT_PH_BN", "0"))
     if ph_bn:
         bn = min(bn, ph_bn)
     # wave82 A/B knob (no effect measured): pin the row tile.  The tiny-output
@@ -1249,7 +1267,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # layer runs a 64x1024 A block = 256 KiB, over the 96 KiB TCM block the tap
     # tiles were designed around - yet bm 32/16 left the 1-pixel cell at 334 ms
     # (334.1 / 334.1 / 333.5), so that cell is not A-block-bound.
-    ph_bm = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_BM", "0"))
+    ph_bm = int(_env_str("FLAGGEMS_SPACEMIT_PH_BM", "0"))
     if ph_bm:
         bm = min(bm, ph_bm)
     MYP = ((MY + bn - 1) // bn) * bn
@@ -1425,13 +1443,13 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # computes 64 columns for at most 16 real ones.
     mn = 64
     if (MY <= 16 and CP <= 1024
-            and os.environ.get("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
+            and _env_str("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
         bn = 32
         mn = 32
     # wave75: scan knobs for the grouped phase tile (CP 32/64 was tuned in
     # wave74; a CP >= 256 group carries a much wider B block).
-    bm = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_G_BM", "0")) or bm
-    bn = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_G_BN", "0")) or bn
+    bm = int(_env_str("FLAGGEMS_SPACEMIT_PH_G_BM", "0")) or bm
+    bn = int(_env_str("FLAGGEMS_SPACEMIT_PH_G_BN", "0")) or bn
     bm = min(bm, OCP)
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights_g(weight, groups, CP, OCP)
@@ -1463,8 +1481,7 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                         pad_w:pad_w + W].copy_(x[n, g * CG:(g + 1) * CG])
                 else:
                     img[g * CP:g * CP + CG].copy_(x[n, g * CG:(g + 1) * CG])
-        if NP == 1 and os.environ.get(
-                "FLAGGEMS_SPACEMIT_PH_G_PLANE", "1") == "1":
+        if NP == 1 and _env_str("FLAGGEMS_SPACEMIT_PH_G_PLANE", "1") == "1":
             flat = frame
         else:
             flat = _tap_phase_buf(ITOT, NP, PHH, PWW, bn + 96, x.dtype,
@@ -1618,8 +1635,8 @@ def _pick_1x1g_tiles(CG, M, OCG):
         bn = 512
     else:
         bn = 256 if M >= 128 else 64
-    bm = int(os.environ.get("FLAGGEMS_SPACEMIT_1X1G_BM", "0")) or bm
-    bn = int(os.environ.get("FLAGGEMS_SPACEMIT_1X1G_BN", "0")) or bn
+    bm = int(_env_str("FLAGGEMS_SPACEMIT_1X1G_BM", "0")) or bm
+    bn = int(_env_str("FLAGGEMS_SPACEMIT_1X1G_BN", "0")) or bn
     return bm, bn
 
 
@@ -1688,7 +1705,7 @@ def _conv1x1_gemm(input, weight, bias, OH, OW):
     # multiple of MICRO_K) and a pixel count that still fills 8 cores.
     # FLAGGEMS_SPACEMIT_CONV_SMT=0 pins the tl kernel for A/B.
     if (smt is not None and C % 32 == 0 and C <= 256 and OC >= 128 and M >= 64
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_SMT", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_SMT", "1") != "0"):
         # probe987: BLOCK_M=128 only where it was measured to win - short K,
         # few pixels, many output channels ((1,128,28,28) OC=512: 1.30 vs
         # 1.99 tl).  At (1,64,56,56) OC=256 it loses 1.4x (3.31 vs 2.35) and at
@@ -1805,7 +1822,7 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
     # of both the buffer read and the dot on zeros.  160 = 128 + 32 is the
     # smallest legal K and measures 6.95 ms of GEMM against 9.75 at 256.
     # FLAGGEMS_SPACEMIT_CONV_STEM_K256=1 pins the old padded path for A/B.
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_K256", "0") == "1":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_STEM_K256", "0") == "1":
         kpad = 256 if (smt is not None and K <= 256) else max(
             32, triton.next_power_of_2(K))
         ksplit = 0
@@ -2128,8 +2145,8 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
         # 14.45, 5x5 d1 76.34 -> 51.50 (1.42-1.48x).  BN 16 aborts spine-opt
         # (the BN >= 32 landmine) and BN 16 under MICRO_N 32 does not help.
         mn = 32
-        bn = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_TINY_BN", "0")) or bn
-    mn = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_TINY_MN", "0")) or mn
+        bn = int(_env_str("FLAGGEMS_SPACEMIT_CONV_TINY_BN", "0")) or bn
+    mn = int(_env_str("FLAGGEMS_SPACEMIT_CONV_TINY_MN", "0")) or mn
     # wave80: the A block is a descriptor of OCP rows; BLOCK_M must not be
     # taller than that (wave74 landmine) and for a thin block it is the whole
     # waste - bm 32 on OC=2 runs a 16x-padded dot.
@@ -2140,7 +2157,7 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
     grid = (triton.cdiv(OCP, bm), triton.cdiv(MYP, bn))
     kern = (_conv_tap_smt_kernel
-            if os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPLOOP", "1") == "0"
+            if _env_str("FLAGGEMS_SPACEMIT_CONV_TAPLOOP", "1") == "0"
             else _conv_tap_loop_kernel)
     warm = _tap_first_launch((bm, bn, KH, KW, CP, x.dtype, OCP, OC, MYP,
                               SROW, IW, DIL, bias is not None,
@@ -2314,7 +2331,7 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
             and (sh * sw <= 4
                  or (sh == sw == 3 and kh == kw))   # asym s3 loses
             and n * oc * oh * ow * kh * kw * c >= (1 << 20)
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
 
 
 def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
@@ -2337,13 +2354,13 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
     # 1.54x over the group kernel (1.41 against 2.16 ms, 1.32x official), while
     # CG=16 doubles the frame's channel count and loses 0.54x (4.09 against
     # 2.19).  FLAGGEMS_SPACEMIT_PHG_MINCG moves the floor for the A/B.
-    mincg = int(os.environ.get("FLAGGEMS_SPACEMIT_PHG_MINCG", "0"))
+    mincg = int(_env_str("FLAGGEMS_SPACEMIT_PHG_MINCG", "0"))
     if mincg <= 0:
         mincg = 24 if (kh == 1 and kw == 1) else 8
     # wave80: the OCG floor was 8 because a 32-row A block made a thin group
     # pure padding.  The block now pads to 8 rows (_oc_pad), so OCG 2..7 costs
     # only the lane floor - the group floor itself is unchanged.
-    minocg = int(os.environ.get("FLAGGEMS_SPACEMIT_PHG_MINOCG", "0"))
+    minocg = int(_env_str("FLAGGEMS_SPACEMIT_PHG_MINOCG", "0"))
     if minocg <= 0:
         # wave80: measured OCG 2/4/6 at 1.65-2.73x the group kernel once the A
         # block pads to 8 rows (g8 c512 28 oc32 6.30 vs 13.51, g32 c1024 14
@@ -2365,7 +2382,7 @@ def conv_phase_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups) -> bool:
                      and n * oc * oh * ow * kh * kw * cg >= (1 << 20)))
             and (sh * sw <= 4 or (sh == sw == 3 and kh == kw))
             and n * oc * oh * ow * kh * kw * cg >= (1 << 20)
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHG", "1") != "0")
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_TAPPHG", "1") != "0")
 
 
 def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
@@ -2400,15 +2417,15 @@ def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
             or (cp <= 2048 and kh * kw <= 49
                 and not (kh == 3 and (c & (c - 1)) == 0 and oh * ow <= 64))):
         return False
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") == "0":
         return False
     return (kh == 3 or dil_h > 1
             or (kh == 7 and kw == 7
-                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP49", "1") != "0")
+                and _env_str("FLAGGEMS_SPACEMIT_CONV_TAP49", "1") != "0")
             or (kh != kw
-                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPX", "1") != "0")
+                and _env_str("FLAGGEMS_SPACEMIT_CONV_TAPX", "1") != "0")
             or (kh == 5
-                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))
+                and _env_str("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))
 
 
 _DENSE_G = {}
@@ -2463,7 +2480,7 @@ def dense_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups, dil_h=1,
         return False
     if kh * kw < 9 or dil_h != dil_w:
         return False
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
         return False
     cg, ocg = c // groups, oc // groups
     if not (1 <= cg < 8):
@@ -2518,7 +2535,7 @@ def dense_g_1x1_applies(n, c, oc, oh, ow, sh, sw, groups) -> bool:
     """
     if groups <= 1 or groups >= c or groups >= oc or c % groups or oc % groups:
         return False
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
         return False
     cg = c // groups
     if not (1 <= cg < 16):
@@ -2619,7 +2636,7 @@ def conv_1px_applies(n, c, oc, oh, ow, kh, kw, groups) -> bool:
 
     FLAGGEMS_SPACEMIT_CONV_GEMV=0 pins the old route for A/B.
     """
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_GEMV", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_GEMV", "1") == "0":
         return False
     if n != 1 or groups != 1 or oh != 1 or ow != 1:
         return False
@@ -2701,7 +2718,7 @@ def _carrier_weight(weight):
     (bf16 2.34e-03 and f16 3.11e-04 read the same with the cache off).
     """
     key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_CW", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_CW", "1") == "0":
         return weight.float()
     ent = _CW.get(key)
     if ent is not None and ent[0]() is weight and ent[1] == weight._version:
@@ -2799,8 +2816,7 @@ def _mp_patch_g(groups, kp, mpad, device):
     only cached up to 64 MB and a bigger one is allocated as before.
     """
     nbytes = groups * kp * mpad * 4
-    if nbytes > _MP_BUFG_CACHE_MAX or os.environ.get(
-            "FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") == "0":
+    if nbytes > _MP_BUFG_CACHE_MAX or _env_str("FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") == "0":
         return torch.zeros((groups, kp, mpad), dtype=torch.float32,
                            device=device)
     key = (groups, kp, mpad, str(device))
@@ -2823,7 +2839,7 @@ def _mp_weights_g(weight, groups, kp):
     """
     key = (weight.data_ptr(), tuple(weight.shape), weight.dtype, kp, groups)
     ent = None
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") != "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_MP_CACHE", "1") != "0":
         ent = _MP_WG.get(key)
     if ent is not None and ent[0]() is weight and ent[1] == weight._version:
         return ent[2]
@@ -2853,7 +2869,7 @@ def _mp_smt_bk(k=None):
     single-group route needs K to be a multiple of it (it does not pad K); the
     grouped route pads Kg up to one.
     """
-    want = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_BK", "0") or 0)
+    want = int(_env_str("FLAGGEMS_SPACEMIT_CONV_MP_BK", "0") or 0)
     return want if want > 0 else 128
 
 
@@ -3009,7 +3025,7 @@ def _conv_mp_gemm(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     if (smt is not None and x.dtype == torch.float32
             and kp <= (K * 3) // 2
             and M <= _MP_SMT_MAXM
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_MP_SMT", "1") != "0"):
         mp_boc = (128 if OC % 128 == 0 else 64 if OC % 64 == 0
                   else 32 if OC % 32 == 0 else 0)
     if mp_boc:
@@ -3083,7 +3099,7 @@ def _conv_mp_gemm_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     Kp = ((Kg + mp_bk - 1) // mp_bk * mp_bk) if mp_bk else 0
     if (smt is not None and x.dtype == torch.float32 and mp_bk
             and M <= _MP_SMT_MAXM
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_SMT", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_MPG_SMT", "1") != "0"):
         mp_boc = (128 if OCG % 128 == 0 else 64 if OCG % 64 == 0
                   else 32 if OCG % 32 == 0 else 0)
     if mp_boc:
@@ -3143,7 +3159,7 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     the A block at a full BM row.
     FLAGGEMS_SPACEMIT_CONV_MPG=0 pins the grouped kernels for A/B.
     """
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_MPG", "1") == "0":
         return False
     if n < 1 or groups < 2:
         return False
@@ -3158,7 +3174,7 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     if n > 1:
         # wave86: batch folding as in conv_mp_applies; measured live -> fold
         # N=4 g8 c512 3x3 s2 6->2 13.7 -> 3.5 ms.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
+        mx = int(_env_str("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
                  or 4096)
         if n * m > mx:
             return False
@@ -3180,7 +3196,7 @@ def conv_mp_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1,
     # g8 c1024 8.28 -> 9.69 (0.86x), cg 128/256 at 49px flat to 1.01x - so the
     # band stops at the shape class it was measured on.  1x1 stays out: the
     # pointwise GEMMs own it.
-    mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MPG_MAXM", "0") or 0)
+    mx = int(_env_str("FLAGGEMS_SPACEMIT_CONV_MPG_MAXM", "0") or 0)
     if mx <= 0:
         mx = 32
         if m > 32 and (kh, kw) != (1, 1) and (kh * kw <= 9 or cg <= 32):
@@ -3213,7 +3229,7 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
     the vendor im2col path, 393-8689 ms).  Everything the phase kernel already
     streams well stays where it is (the losses above are why).
     """
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP", "1") == "0":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_MP", "1") == "0":
         return False
     if groups != 1 or n < 1:
         return False
@@ -3232,7 +3248,7 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         # 14->7 37.3 -> 20.7 (1.80x).  The column count bounds the weight
         # re-reads (one pass per 32-column block), so the band stops where the
         # last measured win was.
-        mx = int(os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
+        mx = int(_env_str("FLAGGEMS_SPACEMIT_CONV_MP_FOLD", "4096")
                  or 4096)
         if n * m > mx:
             return False
@@ -3243,7 +3259,7 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
         if ((n * m + 31) // 32) * 2 > 5 * n:
             return False
         kt = c * kh * kw
-        if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_KPAD", "1") != "0":
+        if _env_str("FLAGGEMS_SPACEMIT_CONV_MP_KPAD", "1") != "0":
             # wave88: K is padded up to one 128 block instead of declining the
             # route; a pad below 50% of K is worth it because the alternative is
             # the per-item streaming path.  With N items the per-item routes pay
@@ -3280,13 +3296,13 @@ def conv_mp_applies(n, c, oc, oh, ow, kh, kw, sh, sw, h, w, dil_h=1, dil_w=1,
     # to 64 pixels.  FLAGGEMS_SPACEMIT_CONV_MP_EXT=0 pins the 25-pixel gate.
     if not (2 <= m <= _MP_SMT_MAXM):
         return False
-    if m > 32 and os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_EXT", "1") == "0":
+    if m > 32 and _env_str("FLAGGEMS_SPACEMIT_CONV_MP_EXT", "1") == "0":
         return False
     if sh * sw > 4:
         return False
     if oc * c * kh * kw * 4 < (8 << 20):
         return False
-    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_MP_FORCE", "0") == "1":
+    if _env_str("FLAGGEMS_SPACEMIT_CONV_MP_FORCE", "0") == "1":
         # wave84 measurement hook only: admit every structurally valid cell so
         # the descriptor route can be A/B'd on the cells the wave83 gate
         # excludes (power-of-two C at small M, 2..15 px).
@@ -3346,7 +3362,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         # aborts in spine-opt), and for the f16 stem it is 25x faster than the
         # vendor path.  Only the two boundaries convert: input 0.8 MB and
         # output 0.8 MB at (1,64,56,56), weight a few KB.
-        if os.environ.get("FLAGGEMS_SPACEMIT_CONV_CARRIER", "1") != "0":
+        if _env_str("FLAGGEMS_SPACEMIT_CONV_CARRIER", "1") != "0":
             w32 = (_carrier_weight(weight) if weight.dtype == input.dtype
                    else weight.float())
             y = conv2d_direct(input.float(), w32,
@@ -3354,8 +3370,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                               pad_h, pad_w, OH, OW, SH, SW, groups,
                               BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
                               dil_h=dil_h, dil_w=dil_w,
-                              _out_dtype=(None if os.environ.get(
-                                  "FLAGGEMS_SPACEMIT_CONV_STEM_OUT32", "0") == "1"
+                              _out_dtype=(None if _env_str("FLAGGEMS_SPACEMIT_CONV_STEM_OUT32", "0") == "1"
                                   else input.dtype))
             return y if y.dtype == input.dtype else y.to(input.dtype)
     if groups == C == OC:
@@ -3419,7 +3434,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and (C // groups) >= 32
             and (((C // groups) & ((C // groups) - 1)) == 0)
             and OC // groups >= 8 and OH * OW >= 64
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1G", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_1X1G", "1") != "0"):
         return _conv1x1_gemm_g(input, weight, bias, OH, OW, groups)
     # wave78: grouped 1x1 where CG is not a power of two - the smt descriptor
     # rejects a non-power-of-two block shape (CG 160 fails make_block_ptr
@@ -3432,7 +3447,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and 16 <= (C // groups) <= 1024
             and ((C // groups) & ((C // groups) - 1)) != 0
             and (OC // groups) >= 8 and OH * OW >= 64
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1GT", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_1X1GT", "1") != "0"):
         return _conv1x1_gemm_g_tl(input, weight, bias, OH, OW, groups)
     # wave78b: CG below the smt floor (16..31) is the same story - the smt path
     # needs CG >= 32, so a 16-channel group ran the 32-lane group kernel with
@@ -3443,7 +3458,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and C % groups == 0 and OC % groups == 0
             and 16 <= (C // groups) < 32
             and (OC // groups) >= 8 and OH * OW >= 64
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1GT16", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_1X1GT16", "1") != "0"):
         return _conv1x1_gemm_g_tl(input, weight, bias, OH, OW, groups)
     # wave78: grouped 1x1 with a stride > 1 - the one pointwise cell wave77 left
     # on the 32-lane group kernel (the phase gate excludes (1,1) outside stride
@@ -3459,7 +3474,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and (OC // groups) >= 8
             and OH * OW >= 16
             and (OH - 1) * SH < H and (OW - 1) * SW < W
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1S2G", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_1X1S2G", "1") != "0"):
         return _conv1x1_strided_g(input, weight, bias, OH, OW, SH, SW, groups)
     # wave60: 1x1 stride-1 pad-0 conv is a GEMM in NCHW already - route it
     # before anything touches the input (no pad, no channel padding, no copy).
@@ -3471,7 +3486,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and pad_h == 0 and pad_w == 0 and C >= 16
             and (OC >= 16 or OH * OW <= 1024)
             and (OH - 1) * SH < H and (OW - 1) * SW < W
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_1X1", "1") != "0"):
         if SH == 1 and SW == 1:
             return _conv1x1_gemm(input, weight, bias, OH, OW)
         return _conv1x1_strided(input, weight, bias, OH, OW, SH, SW)
@@ -3482,7 +3497,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # back for A/B.
     if (groups == 1 and C <= 8 and KH == 7 and KW == 7
             and dil_h == 1 and dil_w == 1
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
         if input.dtype != torch.float32:
             # wave64 carrier, only reachable with the top-level carrier off:
             # half precision never enters the stem kernels, so the build and the
@@ -3568,7 +3583,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             and 32 <= C and (C & (C - 1)) == 0 and OC >= 128
             and (C <= 1024 or OH * OW <= 64)
             and 16 <= OH * OW <= 1024
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_IM2COL3", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_IM2COL3", "1") != "0"):
         return _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w,
                                out_dtype=_out_dtype)
     x = input.contiguous()
@@ -3596,7 +3611,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # ((1,128,28,28) g4: 7.92 vs 15.86 ms).  FLAGGEMS_SPACEMIT_CONV_GROUP1=0
     # forces the per-group path for A/B.
     if ((groups > 8 or OH * OW < 512)
-            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_GROUP1", "1") != "0"):
+            and _env_str("FLAGGEMS_SPACEMIT_CONV_GROUP1", "1") != "0"):
         return _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
                                   BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C)
     OCG = OC // groups
