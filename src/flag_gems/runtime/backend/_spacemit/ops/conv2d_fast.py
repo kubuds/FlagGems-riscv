@@ -134,7 +134,12 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     # power-of-two-C class dips below 8.
     deep3 = (kh == 3 and kw == 3 and c >= 32 and oc >= 128
              and (c & (c - 1)) == 0)
-    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3) else 8):
+    # wave73: the same 7-pixel floor applies to every square tap kernel the
+    # shifted-tap route accepts (C=1536 3x3 measured 363 ms on the vendor path
+    # purely because 7 < 8), not just the power-of-two 3x3 class.
+    deepw = (groups == 1 and kh == kw and kh in (3, 5, 7)
+             and 32 <= c <= 2048 and oc >= 128)
+    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3 or deepw) else 8):
         return False
     return True
 
@@ -1275,7 +1280,8 @@ def _tap_tiles(oc, my, c=None):
         # wave72: the A block is bm*c*4 bytes of TCM (96 KB); at c=1024 the
         # 32/64-row tiles need 128-256 KB and the launch aborts with
         # "tls memory pool alloc failed", while bm=16 needs 64 KB and runs.
-        bm = 16
+        # wave73: the same arithmetic gives bm=8 for 1024 < c <= 2048.
+        bm = 16 if c <= 1024 else 8
     return bm, bn
 
 
@@ -1476,11 +1482,13 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
     exact and 2.74-2.99x faster than the aborted route, 20-43x than official.
     """
     cp = triton.next_power_of_2(c)
-    wide = cp <= 1024 and kh * kw <= 9      # wave72: bm=16 tier, 3x3 only
-    return (kh == kw and kh in (3, 5, 7) and 3 <= c <= 1024
+    wide = cp <= 2048 and kh * kw <= 49     # wave73: bm=16/8 tier
+    # covers 5x5/7x7 too (the A block is bm*C*4 bytes per tap either way)
+    return ((kh, kw) in _TAP_KERNELS and 3 <= c <= 2048
             and (cp <= 512 or wide)
             and 32 <= oc <= 512 and oh * ow >= 16
-            and (sh * sw <= 4 or (sh == sw == 3))
+            and (sh * sw <= 4
+                 or (sh == sw == 3 and kh == kw))   # asym s3 loses
             and n * oc * oh * ow * kh * kw * c >= (1 << 20)
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAPPHS", "1") != "0")
 
@@ -1580,9 +1588,12 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # the non-dilated 5x5 stays opt-in because the tap kernel is a working
     # alternative there and the 25-dot compile is 158 s.
     if (groups == 1 and (KH, KW) in _TAP_KERNELS and SH == 1 and SW == 1
-            and dil_h == dil_w and 3 <= C <= 1024
+            and dil_h == dil_w and 3 <= C <= 2048
             and (triton.next_power_of_2(C) <= 512
-                 or (triton.next_power_of_2(C) <= 1024 and KH * KW <= 9))
+                 or (triton.next_power_of_2(C) <= 1024 and KH * KW <= 49)
+                 or (triton.next_power_of_2(C) <= 2048 and KH * KW <= 49
+                     and not (KH == 3 and (C & (C - 1)) == 0
+                              and OH * OW <= 64)))
             and 32 <= OC <= 512 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
             and (KH == 3 or dil_h > 1
@@ -1609,7 +1620,8 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # slabs.  FLAGGEMS_SPACEMIT_CONV_IM2COL3=0 pins the old route for A/B.
     if (groups == 1 and KH == 3 and KW == 3 and SH == 1 and SW == 1
             and dil_h == 1 and dil_w == 1
-            and C >= 32 and (C & (C - 1)) == 0 and OC >= 128
+            and 32 <= C and (C & (C - 1)) == 0 and OC >= 128
+            and (C <= 1024 or OH * OW <= 64)
             and 16 <= OH * OW <= 1024
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_IM2COL3", "1") != "0"):
         return _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w,
