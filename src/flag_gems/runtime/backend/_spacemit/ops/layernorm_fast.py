@@ -611,9 +611,12 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     inp = input.contiguous()
     n = _prod(normalized_shape)
     m = inp.numel() // n
-    x2d = inp.view(m, n)
+    # wave45: the two 2-D views are only needed by the wide-row branches (the
+    # tile addresses memory with p*BM*BN + arange), and each .view() costs
+    # 7.5 us on this torch build, so they are created lazily below.
+    x2d = None
+    y2d = None
     y = torch.empty_like(inp)
-    y2d = y.view(m, n)
     mean = torch.empty(m, dtype=inp.dtype, device=inp.device)
     rstd = torch.empty(m, dtype=inp.dtype, device=inp.device)
     sb1 = max(64, triton.next_power_of_2(n))
@@ -624,8 +627,8 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     if n >= 1024 and m * n < _SB2_SMALL_TOTAL:
         sb2 = max(32, 256)
     ab = max(32, _AB if n >= _AB else triton.next_power_of_2(n))
-    w_arg = weight if weight is not None else x2d
-    b_arg = bias if bias is not None else x2d
+    w_arg = weight if weight is not None else inp
+    b_arg = bias if bias is not None else inp
     stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [1] * len(
         normalized_shape
     )
@@ -645,22 +648,38 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
         # take a narrow block safely, so a whole narrow row goes through one
         # tile instead.  nested_dispatch self-gates at 32768 elements, which is
         # where probe425 puts the crossover (below it plain launch wins by 2%).
-        with nested_dispatch(m * n):
-            _ln_fwd_tile_kernel[(m // bm_t,)](
-                x2d,
-                y2d,
-                w_arg,
-                b_arg,
-                mean,
-                rstd,
-                n,
-                eps,
-                BM=bm_t,
-                BN=bn_t,
-                HAS_W=(weight is not None),
-                HAS_B=(bias is not None),
+        # wave45: same host-path treatment the backward got in wave44 - one
+        # cached CompiledKernel launch instead of the JIT's re-bind + key +
+        # lookup (50-65 us), no x2d/y2d views (the tile only uses pointer +
+        # arithmetic, 15 us for the pair), and the putenv-based nested switch.
+        nprog = m // bm_t
+        kern = _ln_fwd_tile_kernel
+        has_w = weight is not None
+        has_b = bias is not None
+        targs = (inp, y, w_arg, b_arg, mean, rstd, n, eps, bm_t, bn_t, has_w, has_b)
+        with _FastNested(m * n):
+            _cached_launch(
+                kern,
+                (
+                    kern,
+                    "fwd_tile",
+                    n,
+                    m,
+                    bm_t,
+                    bn_t,
+                    has_w,
+                    has_b,
+                    inp.dtype,
+                    _align(inp, y, w_arg, b_arg, mean, rstd),
+                ),
+                (nprog,),
+                targs,
             )
         return y, mean.view(stats_shape), rstd.view(stats_shape)
+
+    # wide-row branches below need the 2-D views
+    x2d = inp.view(m, n)
+    y2d = y.view(m, n)
     if inp.dtype != torch.float32 or n > _F32_FAST_MAX_N:
         stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
             1
@@ -1480,6 +1499,12 @@ def _launch(kern, key, grid, args):
 
 def _align(*ts):
     return tuple(t.data_ptr() & 15 == 0 for t in ts)
+
+
+# wave45: ln_fast defines a local `_launch` closure for its wide-row branch,
+# which shadows the module-level cached launcher inside that function; the
+# tile branch uses this alias so the name resolution stays unambiguous.
+_cached_launch = _launch
 
 
 def ln_bwd_fast(
