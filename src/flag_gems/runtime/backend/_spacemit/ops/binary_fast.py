@@ -316,13 +316,14 @@ def _where_kernel_m(c_ptr, x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
     tl.store(o_ptr + offs, tl.where(c, a, b), mask=m)
 
 
-def _launch2(kern, kern_m, A, B, out, nest=False):
+def _launch2(kern, kern_m, A, B, out, nest=False, blk=None):
+    blk = _BLOCK if blk is None else blk
     n = out.numel()
-    grid = (triton.cdiv(n, _BLOCK),)
-    if n % _BLOCK == 0:
-        call = lambda: kern[grid](A, B, out, BLOCK=_BLOCK)
+    grid = (triton.cdiv(n, blk),)
+    if n % blk == 0:
+        call = lambda: kern[grid](A, B, out, BLOCK=blk)
     else:
-        call = lambda: kern_m[grid](A, B, out, n, BLOCK=_BLOCK)
+        call = lambda: kern_m[grid](A, B, out, n, BLOCK=blk)
     if nest:
         with nested_dispatch(n):
             call()
@@ -760,10 +761,7 @@ def _maximum_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs).to(tl.float32)
     y = tl.load(y_ptr + offs).to(tl.float32)
     r = tl.where(x != x, x, tl.where(y != y, y, tl.maximum(x, y)))
-    xb = x.to(tl.int32, bitcast=True)
-    yb = y.to(tl.int32, bitcast=True)
-    tie = (x == y) & ((xb ^ yb) != 0)
-    r = tl.where(tie, y, r)
+    r = tl.where(x == y, y, r)  # wave3 eq-form tie select (bits-exact; probe33)
     tl.store(o_ptr + offs, r)
 
 
@@ -774,10 +772,7 @@ def _maximum_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
     y = tl.load(y_ptr + offs, mask=m).to(tl.float32)
     r = tl.where(x != x, x, tl.where(y != y, y, tl.maximum(x, y)))
-    xb = x.to(tl.int32, bitcast=True)
-    yb = y.to(tl.int32, bitcast=True)
-    tie = (x == y) & ((xb ^ yb) != 0)
-    r = tl.where(tie, y, r)
+    r = tl.where(x == y, y, r)  # wave3 eq-form tie select (bits-exact; probe33)
     tl.store(o_ptr + offs, r, mask=m)
 
 
@@ -787,10 +782,7 @@ def _minimum_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs).to(tl.float32)
     y = tl.load(y_ptr + offs).to(tl.float32)
     r = tl.where(x != x, x, tl.where(y != y, y, tl.minimum(x, y)))
-    xb = x.to(tl.int32, bitcast=True)
-    yb = y.to(tl.int32, bitcast=True)
-    tie = (x == y) & ((xb ^ yb) != 0)
-    r = tl.where(tie, y, r)
+    r = tl.where(x == y, y, r)  # wave3 eq-form tie select (bits-exact; probe33)
     tl.store(o_ptr + offs, r)
 
 
@@ -801,22 +793,30 @@ def _minimum_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
     y = tl.load(y_ptr + offs, mask=m).to(tl.float32)
     r = tl.where(x != x, x, tl.where(y != y, y, tl.minimum(x, y)))
-    xb = x.to(tl.int32, bitcast=True)
-    yb = y.to(tl.int32, bitcast=True)
-    tie = (x == y) & ((xb ^ yb) != 0)
-    r = tl.where(tie, y, r)
+    r = tl.where(x == y, y, r)  # wave3 eq-form tie select (bits-exact; probe33)
     tl.store(o_ptr + offs, r, mask=m)
+
+
+# wave3 (campaign 1014night): max/min narrow-in -- eq-form tie select + BLOCK 16384
+# (probe33: 1.07-1.18x over the previous form; bits-exact incl +/-0 and NaN).
+_MM_BLOCK = 1 << 14
 
 
 def maximum(A, B):
     if _fast_enabled() and _ok2(A, B):
-        return _launch2(_maximum_kernel, _maximum_kernel_m, A, B, torch.empty_like(A))
+        return _launch2(
+            _maximum_kernel, _maximum_kernel_m, A, B, torch.empty_like(A),
+            blk=_MM_BLOCK,
+        )
     return _c_maximum(A, B)
 
 
 def minimum(A, B):
     if _fast_enabled() and _ok2(A, B):
-        return _launch2(_minimum_kernel, _minimum_kernel_m, A, B, torch.empty_like(A))
+        return _launch2(
+            _minimum_kernel, _minimum_kernel_m, A, B, torch.empty_like(A),
+            blk=_MM_BLOCK,
+        )
     return _c_minimum(A, B)
 
 

@@ -19,6 +19,14 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.softmax import softmax_backward as common_softmax_backward
+from flag_gems.ops.softmax import (
+    softmax_backward_out as common_softmax_backward_out,
+)
+from flag_gems.runtime.backend._spacemit.ops.softmax_backward_fast import (
+    sb_fast as _sb_fast,
+    sb_fast_enabled as _sb_fast_enabled,
+    sb_ok as _sb_ok,
+)
 from flag_gems.utils import tl_extra_shim
 
 from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
@@ -146,6 +154,26 @@ def softmax(self, dim, half_to_float=False):
 
 
 def softmax_backward(grad_output, output, dim, input_dtype):
+    # wave3 (campaign 1014night): direct two-loop kernels for the last-dim case.
+    if _sb_fast_enabled() and _sb_ok(grad_output, output, dim, input_dtype):
+        return _sb_fast(grad_output, output, dim, input_dtype)
     logger.debug("GEMS_SPACEMIT SOFTMAX_VJP")
     with nested_dispatch(grad_output.numel()):
         return common_softmax_backward(grad_output, output, dim, input_dtype)
+
+
+def softmax_backward_out(grad_output, output, dim, input_dtype, *, grad_input):
+    if (
+        _sb_fast_enabled()
+        and _sb_ok(grad_output, output, dim, input_dtype)
+        and isinstance(grad_input, torch.Tensor)
+        and grad_input.shape == output.shape
+        and grad_input.dtype == input_dtype
+        and grad_input.is_contiguous()
+    ):
+        _sb_fast(grad_output, output, dim, input_dtype, grad_input=grad_input)
+        return grad_input
+    logger.debug("GEMS_SPACEMIT SOFTMAX_BACKWARD_OUT")
+    return common_softmax_backward_out(
+        grad_output, output, dim, input_dtype, grad_input=grad_input
+    )

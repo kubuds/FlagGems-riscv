@@ -41,7 +41,7 @@ from .rsqrt import rsqrt, rsqrt_
 from .sigmoid import sigmoid, sigmoid_, sigmoid_backward
 from .silu import silu, silu_, silu_backward
 from .tanh import tanh, tanh_, tanh_backward
-from .softmax import softmax, softmax_backward
+from .softmax import softmax, softmax_backward, softmax_backward_out
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 
 # Nested-dispatch wrappers for the common elementwise family (campaign 1012pm).
@@ -246,6 +246,7 @@ __all__ = [
     "tanh_backward",
     "softmax",
     "softmax_backward",
+    "softmax_backward_out",
     "native_layer_norm",
     "layer_norm_backward",
     "thnn_conv2d",
