@@ -50,7 +50,12 @@ from ._dispatch import nested_dispatch
 _LN_MIN_N = 1 << 15
 _LN_MAX_N = 8192
 _SB2 = 512
-_AB = 2048
+# wave15 probe133/134: AB=2048 loses 31% at 2048^2 (4.21 -> 2.90) and 28% at
+# 512x2048 (1.12 -> 0.80); 1024 and 512 tie within 1%.
+_AB = 1024
+# per-shape SB2: n>=1024 with a small element count prefers 256 lanes
+# (512x2048 0.746 vs 0.802), the 2048^2 class prefers 512 (2.905 vs 2.953).
+_SB2_SMALL_TOTAL = 2_000_000
 
 
 def ln_fast_enabled() -> bool:
@@ -203,6 +208,8 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     rstd = torch.empty(m, dtype=inp.dtype, device=inp.device)
     sb1 = max(64, triton.next_power_of_2(n))
     sb2 = _SB2 if n >= _SB2 else triton.next_power_of_2(n)
+    if n >= 1024 and m * n < _SB2_SMALL_TOTAL:
+        sb2 = 256
     ab = _AB if n >= _AB else triton.next_power_of_2(n)
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
