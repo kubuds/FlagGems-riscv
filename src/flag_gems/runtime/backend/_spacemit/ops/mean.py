@@ -24,6 +24,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as tle
 
+from flag_gems.ops.mean import mean as _generic_mean
+
 from .mean_fast import mean_mmk_enabled, mean_mmk_launch
 from .sum_fast import sum_flat_launch, sum_rows16_launch
 
@@ -67,10 +69,14 @@ def mean(inp, *, dtype=None):
     # wave30: 16-bit inputs ride the flat sum carrier (f32 accumulator) and are
     # divided in f32 before the cast - the legacy sqrt-rule path kept f16
     # partials and ran at 5.7 ms per 1M elements (probe295).
+    # wave31: this function is now EXPORTED, so aten::mean.default stops at the
+    # vendor implementation instead of the generic one (probe303: flat f16 4M
+    # 22.16 -> 2.17 ms, bf16 22.13 -> 1.83). f32 stays on the generic kernel
+    # (2.10 vs 2.29 through the carrier at 4M, 0.70 vs 0.95 at 1M).
     if (
         inp.is_contiguous()
         and inp.dtype in (torch.float16, torch.bfloat16)
-        and M >= 65536
+        and M >= 131072
         and mean_mmk_enabled()
     ):
         acc = torch.empty([], dtype=torch.float32, device=inp.device)
@@ -78,17 +84,7 @@ def mean(inp, *, dtype=None):
             sum_flat_launch(inp, acc, M)
         res = acc / M
         return res if dtype == torch.float32 else res.to(dtype)
-    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
-    mid_size = triton.cdiv(M, block_size)
-    block_mid = triton.next_power_of_2(mid_size)
-
-    mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
-    out = torch.empty([], dtype=dtype, device=inp.device)
-
-    with torch_device_fn.device(inp.device):
-        mean_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
-        mean_kernel_2[(1, 1, 1)](mid, out, M, mid_size, block_mid)
-    return out
+    return _generic_mean(inp, dtype=dtype)
 
 
 @libentry()
@@ -202,7 +198,7 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     if (
         x.dtype in (torch.float16, torch.bfloat16)
         and x.is_contiguous()
-        and x.numel() >= 65536
+        and x.numel() >= 131072
         and mean_mmk_enabled()
     ):
         acc = torch.empty(shape, dtype=torch.float32, device=x.device)

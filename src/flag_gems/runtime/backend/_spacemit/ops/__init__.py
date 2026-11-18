@@ -29,7 +29,7 @@ from .gelu import gelu, gelu_, gelu_backward
 from .hardsigmoid import hardsigmoid, hardsigmoid_, hardsigmoid_out
 from .layernorm import layer_norm
 from .max import max_dim
-from .mean import global_avg_pool, mean_dim
+from .mean import global_avg_pool, mean, mean_dim
 from .mm import mm, mm_out
 from .min import min_dim
 from .mv import mv
@@ -247,6 +247,7 @@ __all__ = [
     "hardsigmoid_out",
     "global_avg_pool",
     "layer_norm",
+    "mean",
     "mean_dim",
     "max_dim",
     "log_softmax",

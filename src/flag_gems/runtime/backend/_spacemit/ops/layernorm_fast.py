@@ -77,7 +77,7 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
         return False
     # f32 only: f16 chain measured slower than the common path (26.7 vs 15.3 ms
     # @2048^2, probe45) — the f16 load/upcast lowering is the suspect.
-    if input.dtype != torch.float32:
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
     if not input.is_contiguous():
         return False
@@ -89,6 +89,8 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
     except (TypeError, ValueError):
         return False
     if n <= 0 or n > _LN_MAX_N or numel % n:
+        return False
+    if input.dtype != torch.float32 and (n % 128 or n % _ln16_ab(n)):
         return False
     if input.dim() < 1:
         return False
@@ -184,6 +186,79 @@ def _ln_fwd_kernel(
                 tl.store(Y + base + offs, y.to(Y.dtype.element_ty), mask=mm)
 
 
+# ---------------- wave31: 16-bit layer_norm carrier ----------------
+# probe313b (same session, common vendor kernel -> carrier): 512^2 2.62 ->
+# 0.66, 2048^2 15.08 -> 5.61, 512x4096 5.69 -> 2.49, 8192x512 36.22 -> 9.19,
+# 4096x1024 21.94 -> 6.69 ms (2.3-4.1x). K=8 beats K=16 everywhere and BN=128
+# beats 256; AB=512 ties AB=1024 and matches the f32 fast path.
+_LN16_BN = 128
+
+
+def _ln16_ab(n: int) -> int:
+    for cand in (512, 256, 128):
+        if n % cand == 0:
+            return cand
+    return 128
+
+
+def _pick_k16(m: int, n: int) -> int:
+    k = 8
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
+
+@triton.jit
+def _ln_fwd_kernel_16(
+    X,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    N,
+    eps,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    AB: tl.constexpr,
+    HAS_W: tl.constexpr,
+    HAS_B: tl.constexpr,
+):
+    p = tl.program_id(0)
+    cols = tl.arange(0, BN)
+    for i in tl.static_range(K):
+        row = p * K + i
+        base = row.to(tl.int64) * N
+        acc1 = tl.zeros([BN], dtype=tl.float32)
+        acc2 = tl.zeros([BN], dtype=tl.float32)
+        for off in range(0, N, BN):
+            v = tl.load(X + base + off + cols).to(tl.float32)
+            acc1 += v
+            acc2 += v * v
+        s1 = tl.sum(acc1, axis=0)
+        s2 = tl.sum(acc2, axis=0)
+        m = s1 / N
+        var = s2 / N - m * m
+        rstd = 1.0 / tl.sqrt(var + eps)
+        tl.store(Mean + row, m.to(Mean.dtype.element_ty))
+        tl.store(Rstd + row, rstd.to(Rstd.dtype.element_ty))
+        idx = tl.arange(0, AB)
+        for c in range(0, N, AB):
+            x = tl.load(X + base + c + idx).to(tl.float32)
+            y = (x - m) * rstd
+            if HAS_W and HAS_B:
+                w = tl.load(W + c + idx).to(tl.float32)
+                b = tl.load(B + c + idx).to(tl.float32)
+                y = y * w + b
+            elif HAS_W:
+                w = tl.load(W + c + idx).to(tl.float32)
+                y = y * w
+            elif HAS_B:
+                b = tl.load(B + c + idx).to(tl.float32)
+                y = y + b
+            tl.store(Y + base + c + idx, y.to(Y.dtype.element_ty))
+
+
 _LN_K_SMALL = 32  # N <= 1024 (wave13 probe109 P3: 512^2 0.404 -> 0.343)
 _LN_K_LARGE = 16  # N > 1024 (wave13 probe112 P1: 2048^2 2.86 -> 2.50,
 # 512x2048 0.79 -> 0.71 at K16)
@@ -213,6 +288,31 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     ab = _AB if n >= _AB else triton.next_power_of_2(n)
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
+    if inp.dtype != torch.float32:
+        k16 = _pick_k16(m, n)
+        # wave31 probe314: the serialized 1-D launcher costs the 16-bit carrier
+        # almost half its time - nesting takes 2048^2 5.53 -> 2.81, 512x4096
+        # 2.47 -> 1.05, 4096x1024 6.74 -> 4.12, 8192x512 9.14 -> 7.00 ms.
+        with nested_dispatch(m * n):
+            _ln_fwd_kernel_16[(m // k16,)](
+                x2d,
+                y2d,
+                w_arg,
+                b_arg,
+                mean,
+                rstd,
+                n,
+                eps,
+                K=k16,
+                BN=min(_LN16_BN, triton.next_power_of_2(n)),
+                AB=_ln16_ab(n),
+                HAS_W=(weight is not None),
+                HAS_B=(bias is not None),
+            )
+        stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
+            1
+        ] * len(normalized_shape)
+        return y, mean.view(stats_shape), rstd.view(stats_shape)
     k = _pick_k(m, n)
 
     def _launch():
