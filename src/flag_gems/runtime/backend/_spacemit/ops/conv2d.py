@@ -212,7 +212,7 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     from .conv2d_fast import conv2d_direct, conv_fast_applies, conv_fast_enabled
 
     if conv_fast_enabled() and conv_fast_applies(input, weight, stride, dilation, groups):
-        return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=str_h, SW=str_w)
+        return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=str_h, SW=str_w, groups=groups)
 
     GEMM_M = OH * OW
     KK = KH * KW

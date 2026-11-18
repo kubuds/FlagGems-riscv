@@ -381,6 +381,61 @@ class Conv2d(torch.autograd.Function):
         else:
             dilation_height = dilation_width = dilation
 
+        # wave54/wave56: inference-only direct convolution.  It must run BEFORE
+        # the K>=16 channel padding below: for a depthwise conv weight_c == 1,
+        # so the padding copies the input to 16x its channels (64 -> 1024 at
+        # (1,64,56,56)) and hides the depthwise path - that copy is most of why
+        # the vendor depthwise call costs 291 ms.  Opt out with
+        # FLAGGEMS_SPACEMIT_CONV_FAST=0; training keeps the autograd path.
+        if (
+            not torch.is_grad_enabled()
+            and not input.requires_grad
+            and not weight.requires_grad
+            and not (bias is not None and bias.requires_grad)
+        ):
+            try:
+                from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
+                    conv2d_direct,
+                    conv_fast_applies,
+                    conv_fast_enabled,
+                )
+
+                if conv_fast_enabled() and conv_fast_applies(
+                    input,
+                    weight,
+                    (stride_height, stride_width),
+                    (dilation_height, dilation_width),
+                    groups,
+                ):
+                    fast_oh = conv2d_output_size(
+                        input.shape[2],
+                        weight.shape[2],
+                        stride_height,
+                        padding_height,
+                        dilation_height,
+                    )
+                    fast_ow = conv2d_output_size(
+                        input.shape[3],
+                        weight.shape[3],
+                        stride_width,
+                        padding_width,
+                        dilation_width,
+                    )
+                    return conv2d_direct(
+                        input,
+                        weight,
+                        bias,
+                        padding_height,
+                        padding_width,
+                        fast_oh,
+                        fast_ow,
+                        SH=stride_height,
+                        SW=stride_width,
+                        groups=groups,
+                    )
+            except ImportError:
+                pass
+
         in_n, _, input_height, input_width = input.shape
         out_c, weight_c, weight_height, weight_width = weight.shape
         orig_weight_c = weight_c  # Save original before potential padding
@@ -423,39 +478,9 @@ class Conv2d(torch.autograd.Function):
         # groups 1, f32).  On the K3 this is 4.3-8.9x faster than the im2col
         # kernel below and bit-identical (same f32 accumulate order).  Opt out
         # with FLAGGEMS_SPACEMIT_CONV_FAST=0; training keeps the autograd path.
-        if (
-            not torch.is_grad_enabled()
-            and not input.requires_grad
-            and not weight.requires_grad
-            and not (bias is not None and bias.requires_grad)
-        ):
-            try:
-                from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
-                    conv2d_direct,
-                    conv_fast_applies,
-                    conv_fast_enabled,
-                )
-
-                if conv_fast_enabled() and conv_fast_applies(
-                    input,
-                    weight,
-                    (stride_height, stride_width),
-                    (dilation_height, dilation_width),
-                    groups,
-                ):
-                    return conv2d_direct(
-                        input,
-                        weight,
-                        bias,
-                        padding_height,
-                        padding_width,
-                        out_height,
-                        out_width,
-                        SH=stride_height,
-                        SW=stride_width,
-                    )
-            except ImportError:
-                pass
+        # wave56: the attempt moved to the top of forward() (before the K>=16
+        # channel padding); a second copy here would be dead weight and the
+        # wave55 stride bug showed what two divergent copies cost.
 
         output = torch.empty(
             (in_n, out_c, out_height, out_width),
