@@ -209,8 +209,12 @@ def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, 
         H, W = x.shape[2], x.shape[3]
     wc = weight.reshape(C, KH * KW).contiguous()
     y = torch.empty((N, C, OH, OW), dtype=x.dtype, device=x.device)
-    block_c = BLOCK_C or (64 if C >= 64 else 32 if C >= 32 else 16)
-    block_ow = BLOCK_OW or min(64, triton.next_power_of_2(OW))
+    # depthwise tile scan (probe940/941): BLOCK_C=16 beats 32/64 on every
+    # stage - (1,64,56,56) 6.9 vs 15.1 at c64, (1,32,112,112) 15.3 vs 19.9 at
+    # c32 - because a 64x64 accumulator is 16 KB and spills.  BLOCK_OW=128
+    # only pays at OW=112 (12.6 vs 15.3); at 56 and 28 it costs 1.5x.
+    block_c = BLOCK_C or min(16, triton.next_power_of_2(C))
+    block_ow = BLOCK_OW or min(128, triton.next_power_of_2(OW))
     nomask = (C % block_c == 0) and (OW % block_ow == 0)
     grid = (N * OH * triton.cdiv(OW, block_ow) * triton.cdiv(C, block_c),)
     _depthwise_kernel[grid](
