@@ -279,7 +279,7 @@ def _conv_tap_smt_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, SROW, MY, IW,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr,
     MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, KDIW, DK,
 ):
     """wave67: KxK stride-1 as KH*KW whole-K smt dots on shifted bases.
 
@@ -320,7 +320,7 @@ def _conv_tap_smt_kernel(A, Bx, Bias, Y, OC, OCB, C: tl.constexpr, SROW, MY, IW,
         at = tl.make_block_ptr(base=A + t * OC * C, shape=[OC, C], strides=[C, 1],
                                offsets=[pid_m * BLOCK_M, 0],
                                block_shape=[BLOCK_M, C], order=[1, 0])
-        bt = tl.make_block_ptr(base=Bx + kh * IW + kw, shape=[C, SROW],
+        bt = tl.make_block_ptr(base=Bx + kh * KDIW + kw * DK, shape=[C, SROW],
                                strides=[SROW, 1], offsets=[0, pid_n * BLOCK_N],
                                block_shape=[C, BLOCK_N], order=[1, 0])
         a2 = smt.view(smt.descriptor_load(at, (0, 0)), (0, 0), (BLOCK_M, C),
@@ -1011,9 +1011,10 @@ def _tap_weights(weight, cpad=None, ocpad=None):
 def _tap_flat_buf(c, ih, iw, tail, dtype, device):
     # IH and IW are both in the key, not just IH*IW: two shapes can share the
     # element count with different widths, and then the border written by the
-    # first would survive into the second
+    # first would survive into the second.  The tail is in the key too: a 5x5
+    # layer needs more slack than a 3x3 one at the same (C, IH, IW).
     srow = ih * iw
-    key = (c, ih, iw, dtype, str(device))
+    key = (c, ih, iw, tail, dtype, str(device))
     buf = _TAP_BUF.get(key)
     if buf is None:
         if len(_TAP_BUF) >= 4:
@@ -1048,7 +1049,7 @@ def _tap_tiles(oc, my):
 
 
 def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
-                    out_dtype=None):
+                    out_dtype=None, dil_h=1, dil_w=1):
     """wave67: KxK stride-1 conv as KH*KW whole-K smt dots, no patch matrix.
 
     Measured against the live routes in one process (probe1406, f32, exact
@@ -1073,6 +1074,9 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     """
     N, C, H, W = input.shape
     OC = weight.shape[0]
+    if dil_h != dil_w:
+        raise NotImplementedError("shifted-tap conv needs a square dilation")
+    DIL = int(dil_h)
     CP = max(32, triton.next_power_of_2(C))
     OCP = ((OC + 31) // 32) * 32
     x = input.contiguous()
@@ -1090,7 +1094,12 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
         # written once (zeros) and every call only copies the interior into it:
         # no F.pad tensor, no second copy.  At 28x28 that removed the 0.7 ms
         # that F.pad cost on top of the 2.99 ms kernel.
-        flat = _tap_flat_buf(CP, IH, IW, 2 * IW + 96, x.dtype, x.device)
+        # the tail must absorb the last tile's out-of-range reads beyond
+        # C*SROW: with dilation the tap base moves (KH-1)*DIL*IW + (KW-1)*DIL
+        # further, and the tail is part of the buffer key so two layers that
+        # share (C, IH, IW) but not (KH, KW) cannot reuse a short tail
+        tail = (KH - 1) * DIL * IW + (KW - 1) * DIL + bn + 96
+        flat = _tap_flat_buf(CP, IH, IW, tail, x.dtype, x.device)
         img = flat[:CP * SROW].view(CP, IH, IW)
         if pad_h or pad_w:
             img[:C, pad_h:pad_h + H, pad_w:pad_w + W].copy_(x[n])
@@ -1107,7 +1116,8 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
             at, flat, bias if bias is not None else at, yext, OCP,
             OC if bias is not None else 0, CP, SROW, MYP,
             IW, BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
-            MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None))
+            MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+            KDIW=DIL * IW, DK=DIL)
         if yext.data_ptr() != y[n].data_ptr():
             # as_strided, not view: yext rows are MYP wide and a sliced view
             # cannot be reshaped without a copy
@@ -1204,7 +1214,7 @@ def _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
 
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
                   BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None,
-                  _out_dtype=None):
+                  dil_h=1, dil_w=1, _out_dtype=None):
     N, C, H, W = input.shape
     OC, CG, KH, KW = weight.shape
     if input.dtype != torch.float32:
@@ -1218,6 +1228,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                               bias.float() if bias is not None else None,
                               pad_h, pad_w, OH, OW, SH, SW, groups,
                               BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
+                              dil_h=dil_h, dil_w=dil_w,
                               _out_dtype=(None if os.environ.get(
                                   "FLAGGEMS_SPACEMIT_CONV_STEM_OUT32", "0") == "1"
                                   else input.dtype))
@@ -1245,6 +1256,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # (1,3,224,224)->64.  FLAGGEMS_SPACEMIT_CONV_STEM=0 puts the tap kernel
     # back for A/B.
     if (groups == 1 and C <= 8 and KH == 7 and KW == 7
+            and dil_h == 1 and dil_w == 1
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
         if input.dtype != torch.float32:
             # wave64 carrier, only reachable with the top-level carrier off:
@@ -1267,14 +1279,23 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # 5x5 rides the same kernel (25 dots instead of 9): 8.05 ms against the tap
     # kernel's 32.87 at (1,128,28,28) oc128, exact, 79.4 GFLOPS - but the first
     # call pays 153 s of compile, so it stays opt-in.
+    # wave69: the same kernel takes a dilation - the tap base is
+    # kh*DIL*IW + kw*DIL, still an affine shift of m, so 3x3/5x5 dilated
+    # stride-1 convs (DeepLab-style) leave the vendor im2col path.
     if (groups == 1 and KH == KW and KH in (3, 5) and SH == 1 and SW == 1
-            and 3 <= C <= 512 and triton.next_power_of_2(C) <= 512
+            and dil_h == dil_w and 3 <= C <= 512
+            and triton.next_power_of_2(C) <= 512
             and 32 <= OC <= 512 and OH * OW >= 16
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP9", "1") != "0"
             and (KH == 3 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25",
                                            "0") == "1")):
         return _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
-                               out_dtype=_out_dtype)
+                               out_dtype=_out_dtype, dil_h=dil_h, dil_w=dil_w)
+    if dil_h != 1 or dil_w != 1:
+        # every kernel below assumes a stride-1-dilation tap lattice; conv2d()
+        # only routes a dilated shape here when the gate above is satisfied, so
+        # this is a guard, not a path
+        raise NotImplementedError("dilated conv reached the non-dilated kernels")
     # wave66: 3x3 stride-1 goes through a 9C patch matrix wherever M is small
     # and OC is not.  The tap kernel's nine passes over a 32-lane-split input
     # collapse there: (1,256,14,14) 15.4 vs 8.5 (1.80x), (1,128,28,28) 12.2 vs
@@ -1284,6 +1305,7 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # gate.  C must be a power of two because 9C has to be two power-of-two
     # slabs.  FLAGGEMS_SPACEMIT_CONV_IM2COL3=0 pins the old route for A/B.
     if (groups == 1 and KH == 3 and KW == 3 and SH == 1 and SW == 1
+            and dil_h == 1 and dil_w == 1
             and C >= 32 and (C & (C - 1)) == 0 and OC >= 128
             and 16 <= OH * OW <= 1024
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_IM2COL3", "1") != "0"):

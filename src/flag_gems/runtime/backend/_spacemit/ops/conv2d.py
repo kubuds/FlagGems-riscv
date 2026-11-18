@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 import triton
@@ -209,10 +210,24 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     # fused im2col+bmm path on stride-1 f32 (bit-identical f32 accumulate order:
     # exact vs the vendor path on every shape measured).  Opt out with
     # FLAGGEMS_SPACEMIT_CONV_FAST=0.
+    # wave69: conv_fast_applies() still rejects dilation != 1 for the shared
+    # kernels, but the shifted-tap route handles it (the tap base becomes
+    # kh*DIL*IW + kw*DIL), so a dilated square 3x3/5x5 stride-1 conv enters
+    # conv2d_direct through its own gate.  FLAGGEMS_SPACEMIT_CONV_TAP9=0 or
+    # FLAGGEMS_SPACEMIT_CONV_DIL=0 keeps the vendor path.
     from .conv2d_fast import conv2d_direct, conv_fast_applies, conv_fast_enabled
 
-    if conv_fast_enabled() and conv_fast_applies(input, weight, stride, dilation, groups):
-        return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=str_h, SW=str_w, groups=groups)
+    dil_tap = (dil_h == dil_w and dil_h > 1 and groups == 1
+               and KH == KW and KH in (3, 5) and str_h == 1 and str_w == 1
+               and 3 <= C <= 512 and 32 <= OC <= 512 and OH * OW >= 16
+               and (KH == 3 or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25",
+                                              "0") == "1")
+               and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0")
+    if conv_fast_enabled() and (dil_tap
+                                or conv_fast_applies(input, weight, stride, dilation, groups)):
+        return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW,
+                             SH=str_h, SW=str_w, groups=groups,
+                             dil_h=dil_h, dil_w=dil_w)
 
     GEMM_M = OH * OW
     KK = KH * KW

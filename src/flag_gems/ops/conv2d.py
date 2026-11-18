@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import triton
@@ -400,13 +401,7 @@ class Conv2d(torch.autograd.Function):
                     conv_fast_enabled,
                 )
 
-                if conv_fast_enabled() and conv_fast_applies(
-                    input,
-                    weight,
-                    (stride_height, stride_width),
-                    (dilation_height, dilation_width),
-                    groups,
-                ):
+                if conv_fast_enabled():
                     fast_oh = conv2d_output_size(
                         input.shape[2],
                         weight.shape[2],
@@ -421,6 +416,37 @@ class Conv2d(torch.autograd.Function):
                         padding_width,
                         dilation_width,
                     )
+                    # wave69: dilated 3x3/5x5 stride-1 takes the shifted-tap
+                    # route, which sets the tap base to kh*DIL*IW + kw*DIL.
+                    # conv_fast_applies() still rejects a dilation != 1 (the
+                    # other fast kernels assume a unit tap lattice), so this
+                    # class enters through its own gate.
+                    kh = weight.shape[2]
+                    kw = weight.shape[3]
+                    dil_tap = (
+                        dilation_height == dilation_width
+                        and dilation_height > 1
+                        and groups == 1
+                        and kh == kw
+                        and (kh == 3
+                             or os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP25", "0") == "1")
+                        and stride_height == 1
+                        and stride_width == 1
+                        and 3 <= input.shape[1] <= 512
+                        and 32 <= weight.shape[0] <= 512
+                        and fast_oh * fast_ow >= 16
+                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_DIL", "1") != "0"
+                    )
+                    applies = dil_tap or conv_fast_applies(
+                        input,
+                        weight,
+                        (stride_height, stride_width),
+                        (dilation_height, dilation_width),
+                        groups,
+                    )
+                else:
+                    applies = False
+                if applies:
                     return conv2d_direct(
                         input,
                         weight,
@@ -432,6 +458,8 @@ class Conv2d(torch.autograd.Function):
                         SH=stride_height,
                         SW=stride_width,
                         groups=groups,
+                        dil_h=dilation_height,
+                        dil_w=dilation_width,
                     )
             except ImportError:
                 pass
