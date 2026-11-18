@@ -139,7 +139,12 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     # purely because 7 < 8), not just the power-of-two 3x3 class.
     deepw = (groups == 1 and kh == kw and kh in (3, 5, 7)
              and 32 <= c <= 2048 and oc >= 128)
-    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3 or deepw) else 8):
+    # wave79: thin output channels (8..31) have no usable vendor path at all -
+    # the vendor im2col measures 10-25x the tap kernel on every thin cell - so
+    # they take the same 4-pixel width floor as the deep-stage classes above.
+    thinoc = (groups == 1 and kh == kw and kh in (3, 5, 7)
+              and 128 <= c <= 2048 and 8 <= oc < 32)
+    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3 or deepw or thinoc) else 8):
         return False
     return True
 
@@ -1821,6 +1826,16 @@ def _conv_tap_shift(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW,
     SROW = IH * IW
     MY = OH * IW
     bm, bn = _tap_tiles(OC, MY, CP)
+    # wave79: a 1x1..4x4 output fills at most a quarter of one 64-wide column
+    # tile, so the default 16-row/64-column block spends 16-64x of its MACs on
+    # padding.  A taller row block and a 32-wide column block cut that waste:
+    # c1024 5x5 d2 1x1 output 134.4 -> 79.5 ms (1.69x), 3x3 d2 44.1 -> 28.9
+    # (1.53x), 5x5 d1 123.0 -> 79.2 (1.55x).  bm is clamped to the padded row
+    # count - a descriptor taller than OCP reads past the packed weight buffer
+    # (the wave74 landmine).
+    if MY <= 16 and CP <= 1024:
+        bm = min(64, max(32, ((OC + 31) // 32) * 32))
+        bn = 32
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
     dt = out_dtype or input.dtype
@@ -1986,7 +2001,7 @@ def conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw) -> bool:
     # covers 5x5/7x7 too (the A block is bm*C*4 bytes per tap either way)
     return ((kh, kw) in _TAP_KERNELS and 3 <= c <= 2048
             and (cp <= 512 or wide)
-            and 32 <= oc <= 4096
+            and 4 <= oc <= 4096
             # wave77: 1x1 belongs to the GEMM routes for a single group (the
             # stride-1 GEMM and the strided kernel both cover it), so the tap
             # tuple carries it only for the grouped fallback.  Left in the
@@ -2068,7 +2083,7 @@ def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
     # vendor im2col (hundreds of ms); the MAC floor keeps the change away from
     # micro layers - c1024 3x3 d2 3x3 output 47.394/445.083, c512 5x5 d2
     # 21.877/381.682, c1024 5x5 d2 1x1 135.295/2068.967.
-    if not (3 <= c <= 2048 and 32 <= oc <= 4096
+    if not (3 <= c <= 2048 and 2 <= oc <= 4096
             and (oh * ow >= 16
                  or n * oc * oh * ow * kh * kw * c >= (1 << 20))):
         return False
@@ -2162,7 +2177,9 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     if (groups > 1 and KH == 1 and KW == 1 and pad_h == 0 and pad_w == 0
             and (SH > 1 or SW > 1)
             and C % groups == 0 and OC % groups == 0
-            and (C // groups) >= 32 and (OC // groups) >= 8
+            and ((C // groups) >= 32
+                 or ((C // groups) >= 16 and OH * OW <= 256))
+            and (OC // groups) >= 8
             and OH * OW >= 16
             and (OH - 1) * SH < H and (OW - 1) * SW < W
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1S2G", "1") != "0"):
@@ -2174,7 +2191,8 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     # contiguous): the stride-2 downsample used to be the last 1x1 shape class
     # on the tap kernel.  FLAGGEMS_SPACEMIT_CONV_1X1=0 puts the tap kernel back.
     if (KH == 1 and KW == 1 and groups == 1
-            and pad_h == 0 and pad_w == 0 and C >= 16 and OC >= 16
+            and pad_h == 0 and pad_w == 0 and C >= 16
+            and (OC >= 16 or OH * OW <= 1024)
             and (OH - 1) * SH < H and (OW - 1) * SW < W
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1", "1") != "0"):
         if SH == 1 and SW == 1:
