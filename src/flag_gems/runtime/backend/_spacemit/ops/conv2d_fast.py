@@ -1806,6 +1806,20 @@ def _pick_px1_tiles(C, N, OC):
 _PX1_WARMED = set()
 
 
+def _px1_nomask(dtype, c, n, oc, bk, bn, boc):
+    """wave103: NOMASK is unsafe for a 32-deep f32 tile in the plain kernel.
+
+    The maskless form of ``tl.dot`` at BLOCK_K=32/f32 makes spine-opt fail the
+    e2e pipeline (CalledProcessError, exit 1) for every shape tried (C96/C160
+    at OC 64..192); the masked form compiles and is exact, and f32 at
+    BLOCK_K=64 compiles maskless, as does f16 at 32.  Masking K costs one
+    compare per iteration, so this is a pure availability fix.
+    """
+    if dtype == torch.float32 and bk == 32:
+        return False
+    return (c % bk == 0) and (n % bn == 0) and (oc % boc == 0)
+
+
 def _px1_launch(key, launch):
     """wave102: run a freshly compiled px1 variant twice.
 
@@ -1836,6 +1850,60 @@ def _px1_kchunk(C):
     return kch
 
 
+def _px1_kpad(C):
+    """wave103: smallest 32-aligned K that still has a wide descriptor slab.
+
+    ``_px1_kchunk`` only reads multiples of 32, so a C like 1000/1500/2000 used
+    to leave the descriptor route altogether and take the masked plain kernel
+    (C2000 f16 even dropped BLOCK_K to 16: 72.8 ms).  Padding K with zero rows
+    costs those columns of one dot and nothing else, and the zero rows are
+    exact (they only add zeros to the accumulator).  The slab is kept at 256
+    or wider so the sweep stays a few descriptor loads, and the pad is capped
+    at 1/8 of C so a C just under a boundary does not buy a mostly-empty
+    block: 1000 -> 1024 (1024 slab), 1500 -> 1536 (3x512), 700 -> 768 (3x256),
+    2000 -> 2048 (2x1024).  Returns 0 when no such pad exists.
+    """
+    cands = []
+    for step in (1024, 512, 256, 128, 64, 32):
+        cpad = -(-C // step) * step
+        if cpad - C > max(32, C // 8):
+            continue
+        kch = _px1_kchunk(cpad)
+        if kch >= 32:
+            cands.append((cpad, kch))
+    if not cands:
+        return 0
+    wide = [c for c in cands if c[1] >= 256]
+    return min(wide)[0] if wide else min(cands)[0]
+
+
+_PX1_KW = {}
+_PX1_KW_MAX_ENTRIES = 64
+_PX1_KW_MAX_BYTES = 64 << 20
+
+
+def _px1_pad_weight(weight, cpad):
+    """wave103: K-padded copy of a 1-pixel weight, cached by identity+_version.
+
+    Same hole the tap-major and im2col caches document: a freed weight address
+    is handed straight back at _version 0, so the key carries a weakref to the
+    tensor and its version, and a dead weakref is a miss.
+    """
+    key = (weight.data_ptr(), tuple(weight.shape), weight.dtype, cpad)
+    ent = _PX1_KW.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    oc = weight.shape[0]
+    w2 = weight.reshape(oc, -1)
+    c = w2.shape[1]
+    z = torch.zeros((oc, cpad), dtype=weight.dtype, device=weight.device)
+    z[:, :c].copy_(w2)
+    _mp_cache_put(_PX1_KW, key, (weakref.ref(weight), weight._version, z),
+                  z.numel() * z.element_size(), _PX1_KW_MAX_ENTRIES,
+                  _PX1_KW_MAX_BYTES)
+    return z
+
+
 def _conv1x1_px(input, weight, bias, groups=1):
     """wave101/102: 1-pixel 1x1 conv as one batch-folded GEMM (see _conv1x1_px_kernel).
 
@@ -1863,7 +1931,14 @@ def _conv1x1_px(input, weight, bias, groups=1):
               and _env_str("FLAGGEMS_SPACEMIT_CONV_PX1SMT", "1") != "0")
     bn = 32
     npad = (N + bn - 1) // bn * bn
-    micro = (16, 32, 8) if x.dtype == torch.float16 else (8, 64, 32)
+    # wave103: f32 wants MICRO_N == BLOCK_N.  The wave101 recipe carried
+    # mm's (8, 64, 32) f32 micro tile into a 32-wide block, so every dot
+    # emitted two 32-wide micro tiles per block; matching them measures
+    # 1.33-1.47x on every f32 shape (C2048 6.003 -> 4.074, C1024 2.914 ->
+    # 2.043, C640 1.024 -> 0.734, C320 0.654 -> 0.481, C96 0.160 -> 0.120).
+    # f16 keeps (16, 32, 8): other micro shapes abort spine-opt in
+    # vector::ScalableInsertOp (assert j < ins.size) on the descriptor dot.
+    micro = (16, 32, 8) if x.dtype == torch.float16 else (8, 32, 32)
     if groups > 1:
         CG, OCG = C // groups, OC // groups
         if not (smt_on and CG % 32 == 0 and CG <= 1024
@@ -1886,7 +1961,7 @@ def _conv1x1_px(input, weight, bias, groups=1):
                 boc = 64 if OCG >= 64 else 32
                 bng = 32
                 bk = 32
-                nomask = (CG % bk == 0) and (N % bng == 0) and (OCG % boc == 0)
+                nomask = _px1_nomask(input.dtype, CG, N, OCG, bk, bng, boc)
                 yg = torch.empty((N, OCG), dtype=input.dtype, device=input.device)
                 _conv1x1_px_kernel[(triton.cdiv(OCG, boc), triton.cdiv(N, bng))](
                     xg, wg, bg, yg, CG, N, OCG,
@@ -1913,29 +1988,43 @@ def _conv1x1_px(input, weight, bias, groups=1):
         )
         return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
     if smt_on and OC % 64 == 0 and C >= 32:
-        if npad != N:
-            xt = torch.zeros((C, npad), dtype=x.dtype, device=x.device)
-            xt[:, :N] = x.t()
-        else:
-            xt = x.t().contiguous()
-        yt = torch.empty((OC, npad), dtype=x.dtype, device=x.device)
-        if (C & (C - 1)) == 0 and C <= 1024:
-            _px1_launch(
-                ("one", OC, C, npad, x.dtype, bias is not None),
-                lambda: _conv1x1_smt_kernel[(OC // 64, npad // bn)](
-                    w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
-                    BLOCK_M=64, BLOCK_N=bn,
-                    MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
-                    HAS_BIAS=(bias is not None),
-                ),
-            )
-            return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
-        kch = _px1_kchunk(C)
+        # wave103: a C that is not 32-aligned pads its K instead of dropping to
+        # the masked plain kernel (measured on the kernel: C1000 f16 3.20 ->
+        # 0.40, C1500 f16 5.93 -> 0.99, C700 f16 1.44 -> 0.24, C2000 f16 72.8
+        # -> 1.16, f32 C1000 7.01 -> 2.99, C1500 4.52 -> 2.35).  The padded
+        # weight copy is cached per tensor identity+_version, so only the first
+        # call of a layer pays it; the input pad is a zeros() every call, which
+        # the transposed staging already pays for a batch that is not 32-wide.
+        cpad = C if C % 32 == 0 else _px1_kpad(C)
+        kch = _px1_kchunk(cpad) if cpad else 0
         if kch:
+            # the cache key must be the 4-D weight: a reshaped view is a
+            # fresh object every call, so a view key is a dead weakref
+            # every call and the pad copy would be paid per call.
+            wA = w2 if cpad == C else _px1_pad_weight(weight, cpad)
+            if npad != N or cpad != C:
+                xt = torch.zeros((cpad, npad), dtype=x.dtype, device=x.device)
+                xt[:C, :N] = x.t()
+            else:
+                xt = x.t().contiguous()
+            yt = torch.empty((OC, npad), dtype=x.dtype, device=x.device)
+            if cpad == C and (C & (C - 1)) == 0 and C <= 1024:
+                _px1_launch(
+                    ("one", OC, C, npad, x.dtype, bias is not None),
+                    lambda: _conv1x1_smt_kernel[(OC // 64, npad // bn)](
+                        wA, xt, bias if bias is not None else wA, yt, OC, npad,
+                        cpad,
+                        BLOCK_M=64, BLOCK_N=bn,
+                        MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
+                        HAS_BIAS=(bias is not None),
+                    ),
+                )
+                return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
             _px1_launch(
-                ("kchunk", OC, C, kch, npad, x.dtype, bias is not None),
+                ("kchunk", OC, C, cpad, kch, npad, x.dtype, bias is not None),
                 lambda: _conv1x1_px_kchunk_kernel[(OC // 64, npad // bn)](
-                    w2, xt, bias if bias is not None else w2, yt, OC, npad, C,
+                    wA, xt, bias if bias is not None else wA, yt, OC, npad,
+                    cpad,
                     KCH=kch, BLOCK_M=64, BLOCK_N=bn,
                     MICRO_M=micro[0], MICRO_N=micro[1], MICRO_K=micro[2],
                     HAS_BIAS=(bias is not None),
@@ -1944,7 +2033,7 @@ def _conv1x1_px(input, weight, bias, groups=1):
             return yt[:, :N].t().contiguous().view(N, OC, 1, 1)
     y = torch.empty((N, OC), dtype=input.dtype, device=input.device)
     boc, bn, bk = _pick_px1_tiles(C, N, OC)
-    nomask = (C % bk == 0) and (N % bn == 0) and (OC % boc == 0)
+    nomask = _px1_nomask(input.dtype, C, N, OC, bk, bn, boc)
     grid = (triton.cdiv(OC, boc), triton.cdiv(N, bn))
     _conv1x1_px_kernel[grid](
         x, w2, bias if bias is not None else x, y, C, N, OC,
