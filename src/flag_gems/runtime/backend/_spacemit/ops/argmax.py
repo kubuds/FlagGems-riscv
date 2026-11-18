@@ -55,13 +55,17 @@ def argmax_kernel_1(
 @triton.jit
 def argmax_kernel_2(mid_value, mid_index, out, mid_size, BLOCK_MID: tl.constexpr):
     offset = tl.arange(0, BLOCK_MID)
-    mid_ptrs = mid_value + offset
     mask = offset < mid_size
     min_value = get_dtype_min(mid_value.type.element_ty)
-    mid_val = tl.load(mid_ptrs, mask=mask, other=min_value)
-    index_val = tl.argmax(mid_val, axis=0)
-    mid_index_ptrs = mid_index + index_val
-    out_val = tl.load(mid_index_ptrs)
+    mid_val = tl.load(mid_value + offset, mask=mask, other=min_value)
+    # First chunk achieving the maximum (deterministic min-select; also avoids
+    # sentinel index output for degenerate all-sentinel inputs, clamped below).
+    m = tl.max(mid_val, axis=0)
+    eq = (mid_val == m) & mask
+    big = tl.full((BLOCK_MID,), BLOCK_MID, dtype=tl.int32)
+    sel = tl.min(tl.where(eq, offset, big), axis=0)
+    out_val = tl.load(mid_index + sel)
+    out_val = tl.where(out_val < 0, 0, out_val)
     tl.store(out, out_val)
 
 
@@ -110,7 +114,112 @@ def argmax_kernel(
 
     out_offsets = row_offsets * K + pid_k
     out_ptrs = out_ptr + out_offsets
+    # Rows never updated by the reduction (all elements below the dtype
+    # sentinel, e.g. all -inf) keep the init -1; report 0 like torch.
+    row_argmax = tl.where(row_argmax < 0, 0, row_argmax)
     tl.store(out_ptrs, row_argmax.to(out_ptr.dtype.element_ty), mask=row_mask)
+
+
+# --- Two-stage row reduction (K == 1 fast path) -----------------------------
+# The single-stage row kernel above lowers its reductions to scalar code on the
+# spacemit backend (~54 ms for 2048x2048, on par with the official stack).
+# Splitting the row reduction into a per-(row-block, chunk) partial stage plus a
+# cross-chunk combine stage lets the backend emit the faster return_indices
+# reduction path (measured ~10 ms for 2048x2048, ~5x vs the single-stage form).
+
+
+@libentry()
+@triton.jit
+def argmax_kernel_row_s1(
+    inp,
+    mid_value,
+    mid_index,
+    M,
+    N,
+    NB: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid_c = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    rows = pid_m * NB + tl.arange(0, NB)
+    cols = pid_c * BN + tl.arange(0, BN)
+    x = tl.load(inp + rows[:, None] * N + cols[None, :])
+    max_val, max_idx = tl.max(x, axis=1, return_indices=True)
+    # Degenerate rows (all elements == dtype sentinel) are never replaced in
+    # the index reduction, which yields its init value (-1). Clamp to the
+    # first column of the chunk, matching torch's first-occurrence semantics.
+    max_idx = tl.where(max_idx < 0, 0, max_idx)
+    max_idx = max_idx.to(tl.int32) + pid_c * BN
+    tl.store(mid_value + pid_c * M + rows, max_val)
+    tl.store(mid_index + pid_c * M + rows, max_idx)
+
+
+@libentry()
+@triton.jit
+def argmax_kernel_row_s2(
+    mid_value,
+    mid_index,
+    out,
+    M,
+    C: tl.constexpr,
+    BLOCK_M2: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_M2 + tl.arange(0, BLOCK_M2)
+    rmask = rows < M
+    c = tl.arange(0, C)
+    min_value = get_dtype_min(mid_value.type.element_ty)
+    mv = tl.load(
+        mid_value + c[:, None] * M + rows[None, :], mask=rmask[None, :], other=min_value
+    )
+    m = tl.max(mv, axis=0)
+    eq = mv == m[None, :]
+    big = tl.full((C, BLOCK_M2), 2147483647, dtype=tl.int32)
+    cbr = tl.broadcast_to(c[:, None], (C, BLOCK_M2))
+    sel = tl.min(tl.where(eq, cbr, big), axis=0)
+    idx = tl.load(mid_index + sel * M + rows, mask=rmask)
+    tl.store(out + rows, idx.to(tl.int64), mask=rmask)
+
+
+# Measured per-shape best (NB, BN) for the two-stage row kernel
+# (from campaign session work1010pm/argmax_tune on K3, fp32):
+#   N=512/1024   -> (64, 256);  N>=2048 -> (16, 512)
+_ROW_CFG_BY_N = {
+    512: (64, 256),
+    1024: (64, 256),
+    2048: (16, 512),
+    4096: (16, 512),
+    8192: (16, 512),
+    16384: (16, 512),
+    32768: (16, 512),
+}
+
+
+def _choose_row_cfg(M, N):
+    """Return (NB, BN) for the two-stage row kernel, or None to use the
+    single-stage kernel."""
+    if N < 128 or M < 16:
+        return None
+    cfg = _ROW_CFG_BY_N.get(N)
+    if cfg is not None:
+        nb, bn = cfg
+    else:
+        if N % 512 == 0:
+            bn = 512
+        elif N % 256 == 0:
+            bn = 256
+        elif N % 128 == 0:
+            bn = 128
+        else:
+            return None
+        nb = 16 if (N // bn) >= 4 else 64
+    # NB must divide M; shrink (never grow) otherwise
+    while nb > 4 and M % nb != 0:
+        nb //= 2
+    if M % nb != 0:
+        return None
+    if M * N < 65536:
+        return None
+    return nb, bn
 
 
 def _argmax_flat(inp):
@@ -195,6 +304,30 @@ def argmax(inp, dim=None, keepdim=False, *, dtype=None):
         out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
         if not keepdim:
             out_index = torch.squeeze(out_index, dim)
+
+        if K == 1:
+            cfg = _choose_row_cfg(M, N)
+            if cfg is not None:
+                nb, bn = cfg
+                c = N // bn
+                mid_value = torch.empty(
+                    (c, M), dtype=inp.dtype, device=inp.device
+                )
+                mid_index = torch.empty((c, M), dtype=torch.int32, device=inp.device)
+                with torch_device_fn.device(inp.device):
+                    argmax_kernel_row_s1[(c, M // nb)](
+                        inp, mid_value, mid_index, M, N, NB=nb, BN=bn
+                    )
+                    blk2 = 256
+                    argmax_kernel_row_s2[(triton.cdiv(M, blk2),)](
+                        mid_value,
+                        mid_index,
+                        out_index.reshape(-1),
+                        M,
+                        C=c,
+                        BLOCK_M2=blk2,
+                    )
+                return out_index
 
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), K)
         with torch_device_fn.device(inp.device):
