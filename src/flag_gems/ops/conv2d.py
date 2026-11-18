@@ -791,6 +791,23 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
                 ..., (oh - ih) :, (ow - iw) :
             ]
         elif padding == "valid":
+            # wave100: "valid" is plain zero padding, so the memoized inference
+            # entry applies here as well (it saves Conv2d.apply + the second
+            # predicate cascade, 55-65 us/call on the ~1 ms cells).  Anything
+            # the entry declines (training, requires_grad, non-contiguous,
+            # unusual shapes) falls back to the autograd path unchanged.
+            try:
+                from flag_gems.runtime.backend._spacemit.ops.conv2d_fast import (
+                    conv2d_infer,
+                )
+
+                fast_y = conv2d_infer(
+                    input, weight, bias, stride, 0, dilation, groups
+                )
+            except ImportError:
+                fast_y = None
+            if fast_y is not None:
+                return fast_y
             return Conv2d.apply(input, weight, bias, stride, 0, dilation, groups)
         else:
             raise ValueError(
