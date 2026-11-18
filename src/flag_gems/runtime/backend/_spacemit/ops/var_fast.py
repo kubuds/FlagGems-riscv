@@ -12,60 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wave7 (campaign 1015pm): var / std / var_mean fast paths (spacemit backend).
+"""wave7/wave10 (campaign 1015pm/1016pm): var / std / var_mean fast paths.
 
-Two independent fixes:
+wave7: the generic trailing-dim route is one-row-per-program Welford - the
+launch/setup-amortization penalty (wave5) PLUS the elementwise-reduce cliff
+(wave4). Structure (probe65-67, same-session f32, (8192,512) unless noted):
 
-1) Registration bug (probe62/63): aten.var.dim's schema is
-   ``var.dim(Tensor self, int[1]? dim, bool unbiased, bool keepdim)`` - all
-   positional - so torch calls the python impl as ``var_dim(x, dim, unbiased)``
-   whenever unbiased is spelled out. The generic FlagGems signature
-   ``var_dim(x, dim=None, *, correction=None, keepdim=False)`` raised TypeError
-   ("takes from 1 to 2 positional arguments but 3 were given") for every
-   ``torch.var(x, dim=..., unbiased=False)`` under use_gems. Fixed in
-   ops/var.py (unconditional).
+    generic (official baseline)      41.09 ms
+    two-pass tl.sum(d*d) direct      21.72 ms   (probe65 v1 - REJECTED)
+    single-pass tl.sum(x*x) direct   17.02 ms   (probe65 v2 - REJECTED)
+    wave4 mul-chain acc, two-pass    4.66 ms    (probe67 A - CHOSEN)
 
-2) Speed: the generic trailing-dim route is one-row-per-program Welford -
-   the launch/setup-amortization penalty wave5 found for mean, PLUS the
-   elementwise-reduce cliff wave4 found for layer_norm.
+Accuracy: variant A computes mean first, then sum((x-m)^2) in a second pass
+- cancellation-free. Variant B (one-pass E[x2]-m*m) ties on speed but FAILS
+a large-mean check (mean=1e3: abs err 0.57) - rejected. A's max abs error vs
+torch: <= 3.6e-7 on every shape (probe67).
 
-   Structure (probe65-67, same-session f32, (8192,512) unless noted):
-       generic (official baseline)      41.09 ms
-       two-pass tl.sum(d*d) direct      21.72 ms   (probe65 v1 - REJECTED)
-       single-pass tl.sum(x*x) direct   17.02 ms   (probe65 v2 - REJECTED)
-       wave4 mul-chain acc, two-pass    4.66 ms    (probe67 A - CHOSEN)
-   The poison is tl.sum() over a freshly computed elementwise vector
-   (wave4 probe40 saw the same: 23 ms); the fix is a BLOCK=256 mul-chain
-   accumulator loop + one tl.sum over the accumulator.
+wave10 (1016pm):
+  a) f16 support for the trailing-dim route. A dtype cast feeding tl.sum
+     directly hits the spine "feeding cliff" (probe91b: 20.7 vs 4.9 ms f32
+     @8192x512), so the f16 pass-1 is a chunked LOOP-carried accumulator
+     (W2=256; probe93 scan). Same-session ms (8192x512 / 2048x2048 / 512x512):
+     7.65/3.43/0.48 vs torch 19.64/10.84/0.80, vs pre-wave10 generic
+     46.6/28.2/3.05; err 0.00 vs torch on every probe93 shape (incl. 1001x512
+     K-chain, 1000x1024, 128x32768).
+  b) flat (all-elements) two-stage path. Stage-1 partial sums (BLOCK from
+     the sum-flat rule) + host-side f64 combine (math.fsum); pass 2 =
+     squared-deviation loop with the mean as a runtime arg. Same-session 1M:
+     f32 8.64 -> 1.06 ms (torch 1.07); f16 8.50 -> 0.99 ms (torch 4.40);
+     err 0.00e+00 vs torch (large-mean and M=700000 checks included).
 
-   Accuracy: variant A computes mean first, then sum((x-m)^2) in a second
-   pass - cancellation-free. Variant B (one-pass E[x2]-m*m) ties on speed
-   but FAILS a large-mean check (mean=1e3: abs err 0.57) - rejected.
-   A's max abs error vs torch: <= 3.6e-7 on every shape (probe67).
-
-   Routes (probe67 A, SB=256 unless noted):
-       N=512    K=4   -> 4.66 ms  (official 41.09, torch 19.42)
-       N=1024   K=8   -> 3.64 ms  (official 25.70, torch 15.94)
-       N=2048   K=8   -> 3.05 ms  (official 21.92, torch 14.53)
-       N=4096   K=4   -> 2.68 ms  (official 20.77, torch 17.51)
-       N=32768  K=2, SB=512 -> 9.16 ms (official 77.63, torch 53.40)
-       N=512, M=512 K=4 -> 0.38 ms (official 2.73, torch 1.05)
-
-Coverage: f32, contiguous, single trailing dim, numel >= 65536, row width
-in {512,1024,2048,4096,32768}, M divisible by the route's K (halving K is
-tried before falling back), N > correction. Everything else falls through
-to the generic implementations unchanged.
+Coverage: f32/f16, contiguous, single trailing dim OR fully-flat reduction,
+numel >= 65536, row width in {512,1024,2048,4096,32768}, M divisible by the
+route's K (halving K is tried first). Everything else falls through to the
+generic implementations unchanged.
 
 Kill switch: FLAGGEMS_SPACEMIT_VAR_FAST=0 (fast paths only; the var_dim
 signature fix is always active).
 """
 
+import math
 import os
 
+import torch
 import triton
 import triton.language as tl
 
-# N -> (K, SB, s1_chunk_width, s1_chunks); probe67 A sweep.
+from flag_gems.runtime import torch_device_fn
+
+# N -> (K, SB, s1_chunk_width, s1_chunks); probe67 A sweep (f32 form).
 _ROUTES = {
     512: (4, 256, 512, 1),
     1024: (8, 256, 1024, 1),
@@ -74,9 +69,29 @@ _ROUTES = {
     32768: (2, 512, 8192, 4),
 }
 
+# wave10: f16 pass-1 loop width (W2). 256 wins the probe93 scan for the
+# covered widths; 32768 gets 2048 (not swept; exactness verified probe93).
+_F16_W2 = {512: 256, 1024: 256, 2048: 256, 4096: 512, 32768: 2048}
+
+# wave10 flat path: stage-1 squared-deviation chunk widths, and the midn cap
+# beyond which the flat path declines (host fsum over more than ~8192
+# partials stops being free; that means >128M elements).
+_FLAT_SB = 4096
+_FLAT_SB_F16 = 2048
+_FLAT_HOST_MAX = 8192
+
 
 def var_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_VAR_FAST", "1") != "0"
+
+
+def _fsum(vals):
+    """Exact f64 sum of the f32 stage-1 partials. -inf + inf makes math.fsum
+    raise ValueError while the torch semantic is NaN - map it to NaN."""
+    try:
+        return math.fsum(vals)
+    except ValueError:  # "-inf + inf in fsum"
+        return float("nan")
 
 
 @triton.jit
@@ -84,10 +99,15 @@ def _var_mmk(
     X, Var, Mean, N, CORR,
     K: tl.constexpr, W: tl.constexpr, SB: tl.constexpr,
     NS1: tl.constexpr, OUT_MEAN: tl.constexpr, SQRT: tl.constexpr,
+    LOOP1: tl.constexpr, W2: tl.constexpr,
 ):
     """Two-pass wave4-style var per row (K rows/program).
 
-    Pass 1: NS1 load-sums (single full-row tl.sum when NS1=1) -> mean.
+    Pass 1 computes the row mean:
+      LOOP1=False (f32): NS1 direct load-sums (a single full-row tl.sum when
+        NS1=1). A cast-free load feeding tl.sum is fine on this backend.
+      LOOP1=True (f16): chunked loop-carried accumulator at width W2 - a
+        dtype cast feeding tl.sum directly is the spine feeding cliff.
     Pass 2: BLOCK=SB mul-chain accumulator of (x-m)^2 + one tl.sum over the
     accumulator (tl.sum over a fresh elementwise vector is the cliff).
     """
@@ -96,22 +116,29 @@ def _var_mmk(
         r = p * K + i
         base = X + r * N
         s1 = 0.0
-        for c in tl.static_range(NS1):
-            xv = tl.load(base + c * W + tl.arange(0, W))
-            s1 += tl.sum(xv, axis=0)
+        if LOOP1:
+            acc1 = tl.zeros((W2,), dtype=tl.float32)
+            for c in range(0, N, W2):
+                xv1 = tl.load(base + c + tl.arange(0, W2)).to(tl.float32)
+                acc1 += xv1
+            s1 = tl.sum(acc1, axis=0)
+        else:
+            for c in tl.static_range(NS1):
+                xv = tl.load(base + c * W + tl.arange(0, W))
+                s1 += tl.sum(xv, axis=0)
         m = s1 / N
         acc = tl.zeros((SB,), dtype=tl.float32)
         for c in range(0, N, SB):
-            x = tl.load(base + c + tl.arange(0, SB))
+            x = tl.load(base + c + tl.arange(0, SB)).to(tl.float32)
             d = x - m
             acc += d * d
         s2 = tl.sum(acc, axis=0)
         v = s2 / (N - CORR)
         if SQRT:
             v = tl.sqrt(v)
-        tl.store(Var + r, v)
+        tl.store(Var + r, v.to(Var.dtype.element_ty))
         if OUT_MEAN:
-            tl.store(Mean + r, m)
+            tl.store(Mean + r, m.to(Mean.dtype.element_ty))
 
 
 def var_dim_mmk_launch(
@@ -136,9 +163,101 @@ def var_dim_mmk_launch(
             break
     if k is None:
         return False
+    f16 = x.dtype == torch.float16
     _var_mmk[(M // k,)](
         x, var_out, mean_out, N, float(corr),
         K=k, W=w1, SB=sb, NS1=ns1,
         OUT_MEAN=bool(want_mean), SQRT=bool(sqrt),
+        LOOP1=f16, W2=(_F16_W2.get(N, 256) if f16 else 0),
     )
     return True
+
+
+# ---------------- wave10: flat (all-elements) two-stage ----------------
+def _flat_block(M: int) -> int:
+    """Stage-1 BLOCK rule (same shape as sum_fast._flat_block; probe60)."""
+    b = triton.next_power_of_2(max(4096, -(-M // 64)))
+    if b > 16384:
+        b = 16384
+    p2 = triton.next_power_of_2(M)
+    if b > p2:
+        b = p2
+    if b < 32:
+        b = 32  # tl.sum reduce extent < 32 lowers to NaN on this backend
+    return b
+
+
+@triton.jit
+def _var_flat_sum_k1d(X, MID, M, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(X + off, mask=off < M, other=0.0)
+    tl.store(MID + pid, tl.sum(v, axis=0))
+
+
+@triton.jit
+def _var_flat_sum_k1l(X, MID, M, BLOCK: tl.constexpr, SB: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid * BLOCK
+    acc = tl.zeros((SB,), dtype=tl.float32)
+    for c in range(0, BLOCK, SB):
+        off = base + c + tl.arange(0, SB)
+        v = tl.load(X + off, mask=off < M, other=0.0)
+        acc += v.to(tl.float32)
+    tl.store(MID + pid, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _var_flat_sq_k1(
+    X, MID, m, M, BLOCK: tl.constexpr, SB: tl.constexpr, NOMASK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    base = pid * BLOCK
+    acc = tl.zeros((SB,), dtype=tl.float32)
+    for c in range(0, BLOCK, SB):
+        off = base + c + tl.arange(0, SB)
+        if NOMASK:
+            v = tl.load(X + off).to(tl.float32)
+            d = v - m
+        else:
+            mm = off < M
+            v = tl.load(X + off, mask=mm, other=0.0).to(tl.float32)
+            d = tl.where(mm, v - m, 0.0)
+        acc += d * d
+    tl.store(MID + pid, tl.sum(acc, axis=0))
+
+
+def var_flat_launch(x, corr, want_mean=False, sqrt=False):
+    """Flat var/std/var_mean over ALL elements (two kernels + f64 combine).
+
+    Returns the result tensor (and the mean tensor when want_mean), or None
+    when out of scope. Two-pass (mean first, then squared deviations) so the
+    result is cancellation-free; the combine is exact f64 (math.fsum) - every
+    probe check matched torch (probe91a/92/93). Same-session 1M: f32 8.64 ->
+    1.06 ms (torch 1.07); f16 8.50 -> 0.99 ms (torch 4.40).
+    """
+    n = x.numel()
+    if n <= 0:
+        return None
+    block = _flat_block(n)
+    midn = triton.cdiv(n, block)
+    if midn > _FLAT_HOST_MAX:
+        return None
+    f16 = x.dtype == torch.float16
+    sb = _FLAT_SB_F16 if f16 else _FLAT_SB
+    mid = torch.empty(midn, dtype=torch.float32, device=x.device)
+    with torch_device_fn.device(x.device):
+        if f16:
+            _var_flat_sum_k1l[(midn,)](x, mid, n, block, sb)
+        else:
+            _var_flat_sum_k1d[(midn,)](x, mid, n, block)
+        m = _fsum(mid.tolist()) / n
+        _var_flat_sq_k1[(midn,)](x, mid, m, n, block, sb, n % block == 0)
+        sq = _fsum(mid.tolist())
+    val = sq / (n - float(corr))
+    if sqrt:
+        val = math.sqrt(val)
+    var_t = torch.tensor(val, dtype=x.dtype, device=x.device)
+    if want_mean:
+        return var_t, torch.tensor(m, dtype=x.dtype, device=x.device)
+    return var_t

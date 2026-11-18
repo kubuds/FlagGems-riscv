@@ -13,9 +13,7 @@
 # limitations under the License.
 
 """spacemit vendor override: var / var_dim / var_correction / var_mean / std
-(campaign 1015pm, wave7).
-
-Two things happen here:
+(campaign 1015pm wave7; wave10 additions).
 
 1) Correctness fix (unconditional): aten.var.dim's schema is
    ``var.dim(Tensor self, int[1]? dim, bool unbiased, bool keepdim)`` - all
@@ -27,15 +25,16 @@ Two things happen here:
    (probe62/63). This wrapper accepts the positional form and maps
    unbiased -> correction (True -> 1, False -> 0).
 
-2) Speed (fast path): multi-row two-pass kernels in var_fast.py for the
-   trailing-dim case (f32, contiguous, numel >= 65536, row width in
-   {512,1024,2048,4096,32768}, M divisible by the kernel's K). Baselines
-   (probe62, same session, ms): var 41.09 @8192x512, 25.70 @4096x1024,
-   21.92 @2048x2048, 20.77 @1024x4096, 77.63 @512x32768; std and var_mean
-   similar or worse (std 109.15 @512x32768).
+2) Speed (fast paths, var_fast.py):
+   - trailing-dim multi-row two-pass kernels; f32 (wave7, probe65-67) and
+     f16 (wave10, loop-acc pass-1; probe92/93).
+   - wave10 flat (all-elements) two-stage path: applies when dim is None or
+     a single dim covers every element. Same-session 1M: f32 8.64 -> 1.06 ms
+     (torch 1.07); f16 8.50 -> 0.99 ms (torch 4.40); every probe check exact
+     vs torch (large-mean / M=700000 / M=700000-f16 included).
 
-Anything not covered (flat/None dim, non-last dim, non-f32, non-contiguous,
-small numel, odd widths) falls through to the generic implementations.
+Anything not covered (non-f32/f16, non-contiguous, small numel, multi-dim
+dims, odd widths) falls through to the generic implementations unchanged.
 
 Kill switch: FLAGGEMS_SPACEMIT_VAR_FAST=0 (fast paths only; the var_dim
 signature fix is always active).
@@ -54,18 +53,19 @@ from flag_gems.ops.var import (
 from flag_gems.ops.var_mean import var_mean as _orig_var_mean
 from flag_gems.runtime import torch_device_fn
 
-from .var_fast import var_dim_mmk_launch, var_fast_enabled
+from .var_fast import var_dim_mmk_launch, var_fast_enabled, var_flat_launch
 
 logger = logging.getLogger(__name__)
 
 _FAST_MIN_NUMEL = 65536
+_FAST_DTYPES = (torch.float32, torch.float16)
 
 
 def _trailing_target(x, dim):
     """Return (M, N) if the multi-row fast path applies to this (x, dim)."""
     if not var_fast_enabled():
         return None
-    if x.dtype != torch.float32 or not x.is_contiguous():
+    if x.dtype not in _FAST_DTYPES or not x.is_contiguous():
         return None
     if dim is None or x.numel() < _FAST_MIN_NUMEL:
         return None
@@ -82,7 +82,7 @@ def _trailing_target(x, dim):
 
 
 def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
-    """Return var (and mean) on the fast path, else None."""
+    """Return var (and mean) on the trailing-dim fast path, else None."""
     t = _trailing_target(x, dim)
     if t is None:
         return None
@@ -90,9 +90,9 @@ def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
     if N - float(corr) <= 0:
         return None
     final_shape = x.shape[:-1] + ((1,) if keepdim else ())
-    var_out = torch.empty(final_shape, dtype=torch.float32, device=x.device)
+    var_out = torch.empty(final_shape, dtype=x.dtype, device=x.device)
     if want_mean:
-        mean_out = torch.empty(final_shape, dtype=torch.float32, device=x.device)
+        mean_out = torch.empty(final_shape, dtype=x.dtype, device=x.device)
         mean_flat = mean_out.reshape(M)
     else:
         mean_flat = var_out.reshape(M)  # placeholder, never stored
@@ -105,6 +105,52 @@ def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
     if want_mean:
         return var_out, mean_out
     return var_out
+
+
+def _flat_target(x, dim):
+    """Return numel if the all-elements flat fast path applies, else None."""
+    if not var_fast_enabled():
+        return None
+    if x.dtype not in _FAST_DTYPES or not x.is_contiguous():
+        return None
+    if x.numel() < _FAST_MIN_NUMEL:
+        return None
+    if dim is None:
+        return x.numel()
+    dims = [dim] if isinstance(dim, int) else list(dim)
+    if len(dims) != 1 or x.ndim == 0:
+        return None
+    d = dims[0] % x.ndim
+    if x.shape[d] != x.numel():
+        return None
+    return x.numel()
+
+
+def _flat_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
+    """Return var (and mean) on the flat fast path, else None."""
+    n = _flat_target(x, dim)
+    if n is None:
+        return None
+    if n - float(corr) <= 0:
+        return None
+    res = var_flat_launch(x, corr, want_mean, sqrt)
+    if res is None:
+        return None
+    if dim is None:
+        shape = ()
+    else:
+        dims = [dim] if isinstance(dim, int) else list(dim)
+        d = dims[0] % x.ndim
+        shp = list(x.shape)
+        if keepdim:
+            shp[d] = 1
+        else:
+            shp.pop(d)
+        shape = tuple(shp)
+    if want_mean:
+        v, mm = res
+        return v.reshape(shape), mm.reshape(shape)
+    return res.reshape(shape)
 
 
 def _corr_of(correction):
@@ -152,12 +198,19 @@ def var(x, dim=None, *args, correction=None, keepdim=False, **kwargs):
     r = _fast_reduce(x, dim, corr, keepdim)
     if r is not None:
         return r
+    r = _flat_reduce(x, dim, corr, keepdim)
+    if r is not None:
+        return r
     return _orig_var(x, dim=dim, correction=correction, keepdim=keepdim)
 
 
 def var_correction(x, dim=None, *, correction=None, keepdim=False):
     logger.debug("GEMS_SPACEMIT VAR_CORRECTION (fast override)")
-    r = _fast_reduce(x, dim, _corr_of(correction), keepdim)
+    corr = _corr_of(correction)
+    r = _fast_reduce(x, dim, corr, keepdim)
+    if r is not None:
+        return r
+    r = _flat_reduce(x, dim, corr, keepdim)
     if r is not None:
         return r
     return _orig_var_correction(
@@ -191,14 +244,19 @@ def var_dim(x, dim=None, *args, correction=None, keepdim=False, **kwargs):
     r = _fast_reduce(x, dim, corr, kd)
     if r is not None:
         return r
+    r = _flat_reduce(x, dim, corr, kd)
+    if r is not None:
+        return r
     return _orig_var_dim(x, dim=dim, correction=corr, keepdim=kd)
 
 
 def var_mean(x, dim=None, *, correction=None, keepdim=False):
     logger.debug("GEMS_SPACEMIT VAR_MEAN (fast override)")
-    r = _fast_reduce(
-        x, dim, _corr_of(correction), keepdim, want_mean=True
-    )
+    corr = _corr_of(correction)
+    r = _fast_reduce(x, dim, corr, keepdim, want_mean=True)
+    if r is not None:
+        return r
+    r = _flat_reduce(x, dim, corr, keepdim, want_mean=True)
     if r is not None:
         return r
     return _orig_var_mean(
@@ -208,7 +266,11 @@ def var_mean(x, dim=None, *, correction=None, keepdim=False):
 
 def std(x, dim=None, *, correction=None, keepdim=False):
     logger.debug("GEMS_SPACEMIT STD (fast override)")
-    r = _fast_reduce(x, dim, _corr_of(correction), keepdim, sqrt=True)
+    corr = _corr_of(correction)
+    r = _fast_reduce(x, dim, corr, keepdim, sqrt=True)
+    if r is not None:
+        return r
+    r = _flat_reduce(x, dim, corr, keepdim, sqrt=True)
     if r is not None:
         return r
     return _orig_std(x, dim=dim, correction=correction, keepdim=keepdim)

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wave9 (campaign 1016am): rms_norm backward direct kernels (f32).
+"""wave9/wave10 (campaign 1016am/pm): rms_norm backward direct kernels.
 
-dx: two-loop per-row kernel — pass1 loop-carried acc for
+dx: two-loop per-row kernel - pass1 loop-carried acc for
     c = sum(x*(dy*w)); pass2 apply (dx = r*(dy*w) - x*r^3*c/N); K rows/program.
-    Same-session (probe82/84; legacy = single-block per-row kernel):
+    Same-session f32 (probe82/84; legacy = single-block per-row kernel):
         (512,512)   2.62 -> 0.46 ms  (K=4, TILE=256)
         (2048,2048) 33.7 -> 4.39 ms  (K=4, TILE=256)
         (512,4096)  16.6 -> 2.08 ms  (K=2, TILE=512)
@@ -29,9 +29,16 @@ dw: row-fold (grid (cdiv(N,BN), cdiv(M,RB)), pure acc, no tl.sum) + combine
         (8192,512)  10.1 -> 3.80 + 0.15
 Accuracy vs torch autograd.grad: dx <= ~7.5e-5, dw <= ~1.4e-3 (same order as
 legacy; dw is an M-sum with large magnitude). Nested dispatch hurts these
-kernels (probe82) — default dispatch only.
+kernels (probe82) - default dispatch only.
 
-Coverage: f32 + contiguous + N in {512, 2048, 4096} (+ K-divisibility
+wave10 (1016pm): f16 support. Loads are cast to f32 inside the kernels (the
+casts live in loop-carried accumulate chains, so no feeding cliff); dx/dw
+are stored back in the input dtype. Same-session full-bwd (probe91b):
+rebuild 1.06/6.84/10.98 ms @512^2/2048^2/8192x512 vs legacy 4.35/49.6/49.4
+(4.1-7.3x) and vs torch 5.47/81.2/88.1 (5.2-11.9x); err dx 3.9e-3,
+dw 1.6e-2 (f16 rounding, same order as legacy).
+
+Coverage: f32/f16 + contiguous + N in {512, 2048, 4096} (+ K-divisibility
 fallback chain); anything else returns None -> caller falls back to the
 generic kernels.
 
@@ -58,11 +65,9 @@ def rmsb_fast_enabled() -> bool:
 def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     if x.numel() == 0 or dy.numel() != x.numel():
         return False
-    if (
-        x.dtype != torch.float32
-        or dy.dtype != torch.float32
-        or weight.dtype != torch.float32
-    ):
+    if x.dtype not in (torch.float32, torch.float16):
+        return False
+    if dy.dtype != x.dtype or weight.dtype != x.dtype:
         return False
     if not x.is_contiguous() or not dy.is_contiguous() or not weight.is_contiguous():
         return False
@@ -87,31 +92,31 @@ def _rmsb_dx(
         for c in range(0, N, TILE):
             offs = c + tl.arange(0, TILE)
             if NOMASK:
-                xv = tl.load(X + base + offs)
-                dv = tl.load(DY + base + offs)
-                wv = tl.load(W + offs)
+                xv = tl.load(X + base + offs).to(tl.float32)
+                dv = tl.load(DY + base + offs).to(tl.float32)
+                wv = tl.load(W + offs).to(tl.float32)
                 acc += xv * (dv * wv)
             else:
                 mm = offs < N
-                xv = tl.load(X + base + offs, mask=mm, other=0.0)
-                dv = tl.load(DY + base + offs, mask=mm, other=0.0)
-                wv = tl.load(W + offs, mask=mm, other=0.0)
+                xv = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                dv = tl.load(DY + base + offs, mask=mm, other=0.0).to(tl.float32)
+                wv = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
                 acc += xv * (dv * wv)
         csum = tl.sum(acc, axis=0)
         r3c = (r * r * r * csum) / N
         for c in range(0, N, TILE):
             offs = c + tl.arange(0, TILE)
             if NOMASK:
-                xv = tl.load(X + base + offs)
-                dv = tl.load(DY + base + offs)
-                wv = tl.load(W + offs)
+                xv = tl.load(X + base + offs).to(tl.float32)
+                dv = tl.load(DY + base + offs).to(tl.float32)
+                wv = tl.load(W + offs).to(tl.float32)
                 dxv = r * (dv * wv) - xv * r3c
                 tl.store(DX + base + offs, dxv.to(DX.dtype.element_ty))
             else:
                 mm = offs < N
-                xv = tl.load(X + base + offs, mask=mm, other=0.0)
-                dv = tl.load(DY + base + offs, mask=mm, other=0.0)
-                wv = tl.load(W + offs, mask=mm, other=0.0)
+                xv = tl.load(X + base + offs, mask=mm, other=0.0).to(tl.float32)
+                dv = tl.load(DY + base + offs, mask=mm, other=0.0).to(tl.float32)
+                wv = tl.load(W + offs, mask=mm, other=0.0).to(tl.float32)
                 dxv = r * (dv * wv) - xv * r3c
                 tl.store(DX + base + offs, dxv.to(DX.dtype.element_ty), mask=mm)
 
@@ -129,12 +134,12 @@ def _rmsb_dw_fold(
     for r in range(pr * RB, r_end):
         rv = tl.load(INV + r).to(tl.float32)
         if NOMASK:
-            xv = tl.load(X + r * N + cols)
-            dv = tl.load(DY + r * N + cols)
+            xv = tl.load(X + r * N + cols).to(tl.float32)
+            dv = tl.load(DY + r * N + cols).to(tl.float32)
             acc += (xv * rv) * dv
         else:
-            xv = tl.load(X + r * N + cols, mask=cmask, other=0.0)
-            dv = tl.load(DY + r * N + cols, mask=cmask, other=0.0)
+            xv = tl.load(X + r * N + cols, mask=cmask, other=0.0).to(tl.float32)
+            dv = tl.load(DY + r * N + cols, mask=cmask, other=0.0).to(tl.float32)
             acc += (xv * rv) * dv
     if NOMASK:
         tl.store(PW + pr * N + cols, acc)
@@ -176,7 +181,7 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
         _rmsb_dw_fold[(triton.cdiv(n, bn), prb)](
             x, dy, inv, pw, m, n, _DW_RB, bn, (n % bn) == 0
         )
-        dw = torch.empty(n, dtype=torch.float32, device=x.device)
+        dw = torch.empty(n, dtype=x.dtype, device=x.device)
         cb = min(2048, triton.next_power_of_2(n))
         _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, (n % cb) == 0)
     return dx, dw
