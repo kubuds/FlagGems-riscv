@@ -511,6 +511,8 @@ def _pick_k(m: int, k0: int) -> int:
 # (11.1x), (2048,6000) 3.984 vs 61.4 (15.4x), (1024,12288) 3.717 vs 63.7
 # (17.1x); f32 1.9-3.9x. Gated to the measured range and to M >= 32 so the
 # multirow kernel is used (the row kernel was not measured for odd N).
+# wave51 probe833 moved the pick into _wildcard_entry (K/T per width band and
+# per row count); the constant is kept for the audit trail.
 _WILDCARD = (16, 256)
 # wave37 probe376/377 (interleaved 3 rounds, use_gems): the f32 N=64 entry is
 # only a win while the op is launch bound - 384 rows 0.441 vs 0.584 generic
@@ -523,20 +525,59 @@ _WILD_MAX_N = 1 << 14
 _WILD_MIN_M = 32
 
 
-def _wildcard_entry(N: int, f16: bool):
+def _wildcard_k(m: int, kw: int) -> int:
+    """wave51 probe833: rows gate the wildcard K.
+
+    One program per eight rows keeps the launch count sane - at M=64 every
+    width prefers K8 (768: 0.161 against 0.222 for K32; 12288: K8 5.63 against
+    6.83 for K32) while from 256 rows on the width's own K wins (768: K32T256
+    0.232 against 0.277 for the old K16T256).  Above 8192 columns the K comes
+    back down (12288: K16T512 3.99 against K32T512 4.49 f16).
+    """
+    k = 1 << max(1, (max(2, m // 8)).bit_length() - 1)
+    return min(kw, k)
+
+
+def _wildcard_entry(N: int, f16: bool = False, M: int = 0):
     # wave35 probe359: above 8192 columns a wider tile wins on odd widths -
     # N=12288 f16 21.84 (K16/T256) -> 20.37 (K8/T1024) and f32 25.85 -> 23.51
     # (K4/T512); N=10240 agrees (9.37 -> 8.76 f16, 10.14 -> 9.78 f32).
-    if N >= 8192:
-        return (8, 1024) if f16 else (4, 512)
-    # wave37 probe381: the band just above the 4096 route was still on T256;
-    # T512 wins there at 1024 rows - N=4098 f16 2.026 vs 2.096 and f32 3.016
-    # vs 3.129 (audit number), N=6000 f16 2.386 vs 2.388 and f32 3.207 vs
-    # 3.253.  K8/T512 is within 1.4% of the best pair at both widths and both
-    # dtypes, so one entry covers the band.
-    if N > 4096:
-        return (8, 512)
-    return _WILDCARD
+    # wave51 probe833 (interleaved rounds, min of medians): the wave34/35 picks
+    # were leaving 8-20% on the 256..8192 widths - one tile width per band and
+    # K32 there is the best pair at every measured row count (768 K32T256
+    # 0.619 against 0.740; 3000 K32T512 1.549 against 1.612; 6000 2.614
+    # against 2.992), and K16/T512 at 12288 ties or beats the old K8/T1024
+    # (f16 3.994 against 4.058, f32 5.644 against 6.005).
+    if N > 8192:
+        kw, tile = 16, 512
+    elif N > 1024:
+        kw, tile = 32, 512
+    else:
+        kw, tile = 32, 256
+    return _wildcard_k(M, kw), tile
+
+
+def _rms_band_bm3(m: int, n: int) -> int:
+    """wave51: wave-model BM for the *masked* pow2 tile (N=64/128).
+
+    probe831: when M does not divide the wave BM, the masked tile at the wave
+    BM beats the divisor-halving maskless pick by a wide margin - (1000,64)
+    0.288 ms at BM=128 against 125 eight-row programs before, (3000,64) 0.616,
+    (4095,64) 0.731 at BM=256.  The model is the wave49 one (waves x BM rows)
+    with a 16K-element tile cap, which is where the masked tile's register
+    budget lands: at N=128 the cap is what keeps BM=256 out (1.41x slower at
+    (2048,128) in wave50).
+    """
+    best = None
+    bm = 32
+    while bm <= 256:
+        if bm * n <= 16384 and m >= 2 * bm:
+            cost = ((m + 8 * bm - 1) // (8 * bm)) * bm
+            key = (cost, -bm)
+            if best is None or key < best[0]:
+                best = (key, bm)
+        bm *= 2
+    return best[1] if best else 0
 
 
 def _rms_band_pick(m: int, n: int, f16: bool = False):
@@ -546,8 +587,15 @@ def _rms_band_pick(m: int, n: int, f16: bool = False):
         # that BM divides M - at N=128 the wave49 "larger BM" tie-break was
         # 1.4x slower than BM=64 on f32.
         bm2 = _rms_tile_bm(m, n, f16)
-        if bm2:
+        if bm2 >= 32:
             return bm2, _rms_tile, n
+        # wave51 probe831: when no element-count BM divides M (1000/3000/777
+        # rows), the masked tile at the wave BM is 1.5-4x faster than the
+        # divisor-halving maskless pick it used to fall through to.
+        if m >= 256:
+            bm3 = _rms_band_bm3(m, n)
+            if bm3:
+                return bm3, _rms_tile_mm, n
     if rms_band_rowmask_enabled() and m >= 256:
         bm = _rms_band_bm2(m, n)
         if bm:
@@ -671,7 +719,7 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     ent = routes.get(N)
     if ent is None:
         if _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M:
-            ent = _wildcard_entry(N, f16)
+            ent = _wildcard_entry(N, f16, M)
         else:
             return False
     k0, tile = ent
