@@ -45,6 +45,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+try:  # wave61: the smt descriptor/TCM path that flag_gems.mm uses
+    import triton.language.extra.smt as smt
+except Exception:  # a wheel without the spacemit extra keeps the tl path
+    smt = None
+
 
 def conv_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_CONV_FAST", "1") != "0"
@@ -145,6 +150,101 @@ def _conv1x1_kernel(X, Wm, Bs, Y, C, M, OC, sxn, syn,
     else:
         tl.store(yb + oc[:, None] * M + m[None, :], acc.to(Y.dtype.element_ty),
                  mask=(oc[:, None] < OC) & (m[None, :] < M))
+
+
+@triton.jit
+def _conv1x1_smt_kernel(A, B, Bias, Y, M, N, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """wave61: the 1x1 GEMM on the smt descriptor path (mm's own recipe).
+
+    flag_gems.mm wins 1.3x over the tl.load/tl.dot kernel for one reason: it
+    never loops over K.  It descriptor-loads the whole A block (BLOCK_M x K)
+    and B block (K x BLOCK_N) through triton.language.extra.smt, so the K
+    dimension is swept inside one smt.dot on the TCM path
+    (mm_spacemit: BLOCK 128x64, MICRO 8/32/32).  Transplanted to the 1x1 conv
+    operands (A = weight (OC, C), B = x (C, M)) it measures 1.30 ms at
+    (1,128,28,28) OC=512 against mm's 1.46 and the tl kernel's 1.99.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    a_ptr = tl.make_block_ptr(base=A, shape=[M, K], strides=[K, 1],
+                              offsets=[pid_m * BLOCK_M, 0],
+                              block_shape=[BLOCK_M, K], order=[1, 0])
+    b_ptr = tl.make_block_ptr(base=B, shape=[K, N], strides=[N, 1],
+                              offsets=[0, pid_n * BLOCK_N],
+                              block_shape=[K, BLOCK_N], order=[1, 0])
+    a = smt.view(smt.descriptor_load(a_ptr, (0, 0)), (0, 0),
+                 (BLOCK_M, K), (MICRO_M, MICRO_K))
+    b = smt.view(smt.descriptor_load(b_ptr, (0, 0)), (0, 0),
+                 (K, BLOCK_N), (MICRO_K, MICRO_N))
+    acc = smt.dot(a, b)
+    acc = smt.view(acc, (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < M, other=0.0)[:, None]
+    c_ptr = tl.make_block_ptr(base=Y, shape=[M, N], strides=[N, 1],
+                              offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                              block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
+def _conv1x1_s2_kernel(X, Wm, Bs, Y, C, IH, IW, OH, OW, OC, sxn,
+    BLOCK_OC: tl.constexpr, ROWS: tl.constexpr, BLOCK_OW: tl.constexpr,
+    BLOCK_K: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    HAS_BIAS: tl.constexpr, NOMASK: tl.constexpr,
+):
+    """wave61: 1x1 conv with a stride as a strided GEMM.
+
+    Same y[oc, m] = sum_c w[oc, c] x[c, m] as _conv1x1_kernel, but m now walks
+    the output lattice: the tile is ROWS whole output rows, so the output block
+    is still contiguous in NCHW and the input block is one affine 3-D load with
+    pixel strides (SH, SW).  A stride-2 1x1 is the ResNet downsample, which used
+    to fall back to the tap kernel (4.2 ms -> 2.6 ms at (1,64,112,112)).
+    """
+    pid_oc = tl.program_id(0)
+    pid_r = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    r = pid_r * ROWS + tl.arange(0, ROWS)
+    ow = tl.arange(0, BLOCK_OW)
+    acc = tl.zeros((BLOCK_OC, ROWS * BLOCK_OW), dtype=tl.float32)
+    xb = X + pid_n * sxn
+    for k0 in range(0, C, BLOCK_K):
+        cs = k0 + tl.arange(0, BLOCK_K)
+        if NOMASK:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :])
+            xv = tl.load(xb + cs[:, None, None] * (IH * IW)
+                         + (r[None, :, None] * SH) * IW
+                         + (ow[None, None, :] * SW))
+        else:
+            wv = tl.load(Wm + oc[:, None] * C + cs[None, :],
+                         mask=(oc[:, None] < OC) & (cs[None, :] < C), other=0.0)
+            xv = tl.load(xb + cs[:, None, None] * (IH * IW)
+                         + (r[None, :, None] * SH) * IW
+                         + (ow[None, None, :] * SW),
+                         mask=(cs[:, None, None] < C)
+                         & (r[None, :, None] < OH)
+                         & (ow[None, None, :] < OW), other=0.0)
+        xv = tl.reshape(xv, (BLOCK_K, ROWS * BLOCK_OW))
+        acc += tl.dot(wv, xv)
+    if HAS_BIAS:
+        if NOMASK:
+            acc += tl.load(Bs + oc)[:, None]
+        else:
+            acc += tl.load(Bs + oc, mask=oc < OC, other=0.0)[:, None]
+    acc3 = tl.reshape(acc, (BLOCK_OC, ROWS, BLOCK_OW))
+    yp = (Y + pid_n * (OC * OH * OW) + oc[:, None, None] * (OH * OW)
+          + r[None, :, None] * OW + ow[None, None, :])
+    if NOMASK:
+        tl.store(yp, acc3.to(Y.dtype.element_ty))
+    else:
+        tl.store(yp, acc3.to(Y.dtype.element_ty),
+                 mask=(oc[:, None, None] < OC) & (r[None, :, None] < OH)
+                 & (ow[None, None, :] < OW))
 
 
 @triton.jit
@@ -418,6 +518,28 @@ def _conv1x1_gemm(input, weight, bias, OH, OW):
     x2 = x.view(N, C, M)
     w2 = weight.view(OC, C).contiguous()
     y = torch.empty((N, OC, M), dtype=x.dtype, device=x.device)
+    # wave61: mm's descriptor path beats our tl kernel at every 1x1 shape
+    # measured so far (1.15-1.5x) because the whole K is swept inside one
+    # smt.dot instead of four tl.dot calls.  Needs C 32-aligned (so K is a
+    # multiple of MICRO_K) and a pixel count that still fills 8 cores.
+    # FLAGGEMS_SPACEMIT_CONV_SMT=0 pins the tl kernel for A/B.
+    if (smt is not None and C % 32 == 0 and C <= 256 and OC >= 128 and M >= 64
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_SMT", "1") != "0"):
+        # probe987: BLOCK_M=128 only where it was measured to win - short K,
+        # few pixels, many output channels ((1,128,28,28) OC=512: 1.30 vs
+        # 1.99 tl).  At (1,64,56,56) OC=256 it loses 1.4x (3.31 vs 2.35) and at
+        # K=256 the 128-wide A block no longer fits TCM at all (7.30 vs 4.67),
+        # so everything else runs BLOCK_M=64.
+        bm = 128 if (C >= 96 and M <= 1024 and OC >= 256) else 64
+        bn = 64
+        grid = (triton.cdiv(OC, bm), triton.cdiv(M, bn))
+        for n in range(N):
+            _conv1x1_smt_kernel[grid](
+                w2, x2[n], bias if bias is not None else w2, y[n],
+                OC, M, C, BLOCK_M=bm, BLOCK_N=bn,
+                MICRO_M=8, MICRO_N=64, MICRO_K=32,
+                HAS_BIAS=(bias is not None))
+        return y.view(N, OC, OH, OW)
     boc, bm, bk, swap = _pick_1x1_tiles(C, M, OC)
     nomask = (C % bk == 0) and (M % bm == 0) and (OC % boc == 0)
     nm, no = triton.cdiv(M, bm), triton.cdiv(OC, boc)
@@ -429,6 +551,51 @@ def _conv1x1_gemm(input, weight, bias, OH, OW):
         HAS_BIAS=(bias is not None), NOMASK=nomask, SWAP=swap,
     )
     return y.view(N, OC, OH, OW)
+
+
+def _pick_1x1_s2_tiles(C, OH, OW, OC, N):
+    """wave61 probe983/984: rows follow the output width, not the accumulator.
+
+    BLOCK_K=32 at every C again (K=64 loses 10-30% and, at ROWS>=4, currently
+    miscompiles: err 3.7-7.8 on three shapes).  ROWS buys row-to-row reuse, but
+    it turns bad at both ends of the width range: at OW=56 a 64x512 accumulator
+    spills (r4 2.62 vs r8 3.63), and at OW=7 the 8-wide input runs stop
+    coalescing (r4 0.51 vs r8 1.00 at (1,256,14,14)).  So rows=4 for bow>=64
+    and bow<=8, rows=8 for bow=32/16; rows then halves until the grid reaches
+    one wave (8 programs).  BLOCK_OC=128 only when the dot N collapsed to 32
+    ((1,256,14,14) OC=512: 0.43 vs 0.51 at 64).
+    """
+    bk = 32 if C % 32 == 0 else (16 if C % 16 == 0 else triton.next_power_of_2(C))
+    bow = triton.next_power_of_2(OW)
+    boc = 64 if OC >= 64 else triton.next_power_of_2(OC)
+    rows = 4 if (bow >= 64 or bow <= 8) else 8
+    if rows * bow <= 32 and OC >= 128:
+        boc = 128
+    while (rows > 1 and (triton.cdiv(OC, boc) * triton.cdiv(OH, rows) * N) < 8
+           and (rows // 2) * bow >= 32):
+        # never halve below a 32-wide dot: a 16-wide tile at ROWS=1 trips the
+        # spine-opt MMT4D assertion (wave57/wave60 landmine)
+        rows //= 2
+    return boc, rows, bow, bk
+
+
+def _conv1x1_strided(input, weight, bias, OH, OW, SH, SW):
+    """1x1 conv with a stride, as a strided GEMM over whole output rows."""
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    x = input.contiguous()
+    w2 = weight.view(OC, C).contiguous()
+    y = torch.empty((N, OC, OH, OW), dtype=x.dtype, device=x.device)
+    boc, rows, bow, bk = _pick_1x1_s2_tiles(C, OH, OW, OC, N)
+    nomask = (C % bk == 0) and (OW == bow) and (OH % rows == 0) and (OC % boc == 0)
+    grid = (triton.cdiv(OC, boc), triton.cdiv(OH, rows), N)
+    _conv1x1_s2_kernel[grid](
+        x, w2, bias if bias is not None else x, y,
+        C, H, W, OH, OW, OC, x.stride(0),
+        BLOCK_OC=boc, ROWS=rows, BLOCK_OW=bow, BLOCK_K=bk, SH=SH, SW=SW,
+        HAS_BIAS=(bias is not None), NOMASK=nomask,
+    )
+    return y
 
 
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
@@ -527,11 +694,17 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
         raise NotImplementedError("channel counts do not divide by groups")
     # wave60: 1x1 stride-1 pad-0 conv is a GEMM in NCHW already - route it
     # before anything touches the input (no pad, no channel padding, no copy).
-    # FLAGGEMS_SPACEMIT_CONV_1X1=0 puts the tap kernel back for A/B.
-    if (KH == 1 and KW == 1 and groups == 1 and SH == 1 and SW == 1
+    # wave61 extends the same route to strides (the tile walks whole output
+    # rows, so the input is one affine strided load and the output block stays
+    # contiguous): the stride-2 downsample used to be the last 1x1 shape class
+    # on the tap kernel.  FLAGGEMS_SPACEMIT_CONV_1X1=0 puts the tap kernel back.
+    if (KH == 1 and KW == 1 and groups == 1
             and pad_h == 0 and pad_w == 0 and C >= 16 and OC >= 16
+            and (OH - 1) * SH < H and (OW - 1) * SW < W
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_1X1", "1") != "0"):
-        return _conv1x1_gemm(input, weight, bias, OH, OW)
+        if SH == 1 and SW == 1:
+            return _conv1x1_gemm(input, weight, bias, OH, OW)
+        return _conv1x1_strided(input, weight, bias, OH, OW, SH, SW)
     x = input.contiguous()
     if pad_h or pad_w:
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
