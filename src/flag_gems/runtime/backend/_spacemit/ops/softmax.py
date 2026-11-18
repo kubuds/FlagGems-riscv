@@ -33,6 +33,7 @@ from flag_gems.utils import tl_extra_shim
 
 from flag_gems.runtime.backend._spacemit.ops._dispatch import nested_dispatch
 from flag_gems.runtime.backend._spacemit.ops.fastmath import exp_fast
+from flag_gems.runtime.backend._spacemit.ops.memhint import hugepage_hint
 
 logger = logging.getLogger(__name__)
 exp = tl_extra_shim.exp
@@ -127,7 +128,12 @@ def softmax_kernel_block(input_ptr, output_ptr, n_cols, COL: tl.constexpr):
     m = tl.max(x, axis=0)
     e = tl.exp(x - m)
     s = tl.sum(e, axis=0)
-    tl.store(output_ptr + base + offs, (e / s).to(output_ptr.dtype.element_ty))
+    # wave26: multiply by one reciprocal instead of dividing every lane.  The
+    # per-element divide is not hoisted by this backend: probe262 priced a 1G
+    # f32 row-resident softmax at 1133.9 ms with `e / s` and 832.0 ms with
+    # `e * (1 / s)` - 27% of the whole kernel at 1024^3, 34% at 4096^2.
+    inv = 1.0 / s
+    tl.store(output_ptr + base + offs, (e * inv).to(output_ptr.dtype.element_ty))
 
 
 # wave24: the resident row is not just a f16 trick, and the column loop is what
@@ -150,7 +156,8 @@ def softmax_kernel_rowres(X, Y, n_cols, ROWS: tl.constexpr, COL: tl.constexpr):
         m = tl.max(x, axis=0)
         e = exp_fast(x - m, 1)
         s = tl.sum(e, axis=0)
-        tl.store(Y + base + offs, (e / s).to(Y.dtype.element_ty))
+        inv = 1.0 / s          # wave26: one scalar reciprocal per row, see below
+        tl.store(Y + base + offs, (e * inv).to(Y.dtype.element_ty))
 
 
 @triton.jit
@@ -166,7 +173,8 @@ def softmax_kernel_rowres_m(X, Y, n_cols, ROWS: tl.constexpr, COL: tl.constexpr)
         m = tl.max(x, axis=0)
         e = exp_fast(x - m, 1)
         s = tl.sum(e, axis=0)
-        tl.store(Y + base + offs, (e / s).to(Y.dtype.element_ty), mask=mo)
+        inv = 1.0 / s
+        tl.store(Y + base + offs, (e * inv).to(Y.dtype.element_ty), mask=mo)
 
 
 # wave24: a single row wider than any block (official shape 1048576 is one row).
@@ -395,6 +403,25 @@ def _softmax_nonlast(inp, out, dim):
 def _spacemit_softmax_lastdim(inp, out):
     n_rows, n_cols = inp.shape
     n = inp.numel()
+    # wave26: small tensors were left on the three-pass block_ptr kernel and paid
+    # 2.5-3x the floor.  probe266 at 64x64 f32: current 257 us against 82 us for
+    # one resident-row launch with ROWS=8 (a null Triton launch is 58 us), and the
+    # same 3.1x at f16 (317 -> 102 us).  256x256 f32 is 619 -> 212 us.  No nested
+    # dispatch here: below 1<<16 it only adds overhead.
+    if n < (1 << 16) and n_cols <= 2048:
+        col = triton.next_power_of_2(n_cols)
+        rows = 8 if n_cols <= 1024 else 1
+        while rows > 1 and n_rows % rows:
+            rows //= 2
+        if col == n_cols:
+            softmax_kernel_rowres[(n_rows // rows,)](
+                inp, out, n_cols, ROWS=rows, COL=col
+            )
+        else:
+            softmax_kernel_rowres_m[(n_rows // rows,)](
+                inp, out, n_cols, ROWS=rows, COL=col
+            )
+        return
     # wave24: a single very wide row is a grid=1 launch on the live path (one core
     # walking 4096 column blocks).  Two levels over 32768-element chunks:
     # 10.66 -> 1.58 ms f32, 14.34 -> 1.29 f16 at 1048576 (probe229).
@@ -465,6 +492,7 @@ def softmax(self, dim, half_to_float=False):
     # reduced along the last axis (pre-existing vendor bug, see block comment).
     if dim != inp.ndim - 1 and _softmax_nonlast_enabled():
         out = torch.empty_like(inp, dtype=dtype)
+        hugepage_hint(out)
         _softmax_nonlast(inp, out, dim)
         return out
 
@@ -472,6 +500,7 @@ def softmax(self, dim, half_to_float=False):
     n_rows = inp.numel() // n_cols
     inp_2d = inp.view(n_rows, n_cols)
     out_2d = torch.empty_like(inp_2d, dtype=dtype)
+    hugepage_hint(out_2d)
     _spacemit_softmax_lastdim(inp_2d, out_2d)
     return out_2d.view_as(inp)
 
@@ -525,6 +554,7 @@ def softmax_out(self, dim, half_to_float=False, *, out):
     if out.device != self.device:
         raise RuntimeError("_softmax.out: out must be on the input device")
     inp = self.contiguous()
+    hugepage_hint(out)
     if dim == inp.ndim - 1 and out.is_contiguous():
         n_cols = inp.shape[-1]
         n_rows = inp.numel() // n_cols
