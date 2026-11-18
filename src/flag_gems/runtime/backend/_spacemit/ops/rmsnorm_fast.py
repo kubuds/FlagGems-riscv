@@ -70,6 +70,29 @@ def _rms_tile_bm(m: int) -> int:
     return bm if m % bm == 0 else 0
 
 
+# ---------------- wave39: narrow-row tile (N <= 32) ----------------
+# probe423: these widths have no route at all today - the table starts at 64
+# and the wildcard at 256 - so every N<=32 shape ran the generic kernel.  The
+# wave38 tile is already generic over BN, so it only needed a BM pick and a
+# gate.  Same-session minima, generic -> tile (f32 / f16):
+#   (4096,4)  1.129 -> 0.227 (5.0x, torch 0.497)  / 1.274 -> 0.289 (4.4x)
+#   (4096,8)  1.208 -> 0.373 (3.2x)               / 1.433 -> 0.487 (3.0x)
+#   (2048,16) 0.844 -> 0.303 (2.8x)               / 0.937 -> 0.378 (2.5x)
+#   (2048,32) 2.291 -> 0.495 (4.6x)               / 1.678 -> 0.656 (2.6x)
+#   (256,32)  0.522 -> 0.133 (3.9x)               / 0.440 -> 0.151 (2.9x)
+# BM follows the same rule as the layer_norm forward tile: ~8K elements, a
+# 64-row floor and at least two programs (a single-program tile at (256,32)
+# cost 40% and at (1024,16) 54%).
+_RMS_TILE_MAX_N = 32
+
+
+def _rms_narrow_bm(m: int, bn: int) -> int:
+    bm = min(1024, max(64, 8192 // bn), max(64, m // 2))
+    while bm > 8 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 else 0
+
+
 @triton.jit
 def _rms_tile(X, W, Y, INV, N, eps, BM: tl.constexpr, BN: tl.constexpr):
     p = tl.program_id(0)
@@ -338,6 +361,9 @@ def _wildcard_entry(N: int, f16: bool):
 
 def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
     """True when rms_fast_launch would serve this shape (no allocation)."""
+    if N <= _RMS_TILE_MAX_N and N == triton.next_power_of_2(N) and M >= 8:
+        if _rms_narrow_bm(M, N):
+            return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M and _rms_tile_bm(M):
         return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
@@ -351,6 +377,12 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
 
 def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
+    if N <= _RMS_TILE_MAX_N and N == triton.next_power_of_2(N) and M >= 8:
+        bm = _rms_narrow_bm(M, N)
+        if bm:
+            with nested_dispatch(M * N):
+                _rms_tile[(M // bm,)](x, w, y, inv, N, eps, BM=bm, BN=N)
+            return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M:
         bm = _rms_tile_bm(M)
         if bm:

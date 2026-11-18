@@ -536,6 +536,66 @@ def _pick_k(m: int, n: int) -> int:
     return k
 
 
+# -------------------- wave39: narrow-row forward tile --------------------
+# probe421/422: below 32 lanes the f32 kernel's SB2/AB blocks (== N) are not
+# only slow but unsafe.  The backend widens the row load and folds whatever
+# sits past the row into the variance, so on the first call after allocation
+# a handful of rows come back NaN - 8 of 16384 elements at (4096,4), 224 at
+# (2048,16), 36 at (2048,12) - while the same tensors are clean on the next
+# call and an over-allocated buffer is always clean.  Both blocks are floored
+# at 32 (masked) now, exactly as wave38 fixed the backward; this tile is the
+# fast path for the widths that were affected.
+# probe420/425 same-session minima, routed -> tile:
+#   (4096,4)  f32 2.61 -> 0.404 (6.5x, torch 0.468)  f16 8.14 -> 0.478 (17x)
+#   (4096,8)      1.25 -> 0.347 (3.6x)               f16 2.61 -> 0.385 (6.8x)
+#   (2048,16)     0.87 -> 0.332 (2.6x)               f16 1.45 -> 0.348 (4.2x)
+#   (2048,32)     0.98 -> 0.417 (2.4x)               f16 1.44 -> 0.443 (3.3x)
+# 64 columns already belongs to the routed kernel (0.55 against 1.02 at
+# (1024,64)) and the tile loses there, so the gate is power-of-two N <= 32.
+_LN_FWD_TILE_MAX_N = 32
+
+
+def _fwd_tile_bm(m: int, bn: int) -> int:
+    """Rows per tile program: ~8K elements, 64-row floor, 2+ programs."""
+    bm = min(1024, max(64, 8192 // bn), max(64, m // 2))
+    while bm > 8 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 else 0
+
+
+@triton.jit
+def _ln_fwd_tile_kernel(
+    X,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    N,
+    eps,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    HAS_W: tl.constexpr,
+    HAS_B: tl.constexpr,
+):
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    cols = tl.arange(0, BN)
+    mu = tl.sum(x, axis=1)[:, None] / N
+    var = tl.sum(x * x, axis=1)[:, None] / N - mu * mu
+    rs = 1.0 / tl.sqrt(var + eps)
+    rows = p * BM + tl.arange(0, BM)
+    tl.store(Mean + rows, tl.reshape(mu, (BM,)).to(Mean.dtype.element_ty))
+    tl.store(Rstd + rows, tl.reshape(rs, (BM,)).to(Rstd.dtype.element_ty))
+    y = (x - mu) * rs
+    if HAS_W:
+        y = y * tl.load(W + cols).to(tl.float32)[None, :]
+    if HAS_B:
+        y = y + tl.load(B + cols).to(tl.float32)[None, :]
+    tl.store(Y + idx, tl.reshape(y, (BM * BN,)).to(Y.dtype.element_ty))
+
+
 def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     """Return (y, mean_view, rstd_view) like aten.native_layer_norm."""
     inp = input.contiguous()
@@ -547,12 +607,50 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     mean = torch.empty(m, dtype=inp.dtype, device=inp.device)
     rstd = torch.empty(m, dtype=inp.dtype, device=inp.device)
     sb1 = max(64, triton.next_power_of_2(n))
-    sb2 = _SB2 if n >= _SB2 else triton.next_power_of_2(n)
+    # wave39 probe422: never hand this kernel a block narrower than 32 lanes -
+    # with SB2/AB == N < 32 the widened row load picks up the tail page and a
+    # few rows go NaN on the first call after allocation.
+    sb2 = max(32, _SB2 if n >= _SB2 else triton.next_power_of_2(n))
     if n >= 1024 and m * n < _SB2_SMALL_TOTAL:
-        sb2 = 256
-    ab = _AB if n >= _AB else triton.next_power_of_2(n)
+        sb2 = max(32, 256)
+    ab = max(32, _AB if n >= _AB else triton.next_power_of_2(n))
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
+    stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [1] * len(
+        normalized_shape
+    )
+    bn_t = triton.next_power_of_2(n)
+    bm_t = (
+        _fwd_tile_bm(m, bn_t)
+        if (
+            os.environ.get("FLAGGEMS_SPACEMIT_LN_FWD_TILE", "1") != "0"
+            and n <= _LN_FWD_TILE_MAX_N
+            and n == bn_t
+            and m >= 8
+        )
+        else 0
+    )
+    if bm_t:
+        # wave39: the wide-row kernels re-read x for the apply pass and cannot
+        # take a narrow block safely, so a whole narrow row goes through one
+        # tile instead.  nested_dispatch self-gates at 32768 elements, which is
+        # where probe425 puts the crossover (below it plain launch wins by 2%).
+        with nested_dispatch(m * n):
+            _ln_fwd_tile_kernel[(m // bm_t,)](
+                x2d,
+                y2d,
+                w_arg,
+                b_arg,
+                mean,
+                rstd,
+                n,
+                eps,
+                BM=bm_t,
+                BN=bn_t,
+                HAS_W=(weight is not None),
+                HAS_B=(bias is not None),
+            )
+        return y, mean.view(stats_shape), rstd.view(stats_shape)
     if inp.dtype != torch.float32 or n > _F32_FAST_MAX_N:
         stats_shape = list(inp.shape[: inp.dim() - len(normalized_shape)]) + [
             1

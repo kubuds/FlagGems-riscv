@@ -129,6 +129,64 @@ def rmsb_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_RMSB_FAST", "1") != "0"
 
 
+# ---------------- wave39: narrow-row fused tile (N <= 32) ----------------
+# probe424: below 64 columns there is no route at all, so the whole backward
+# ran the generic FlagGems kernels.  The tile keeps a whole narrow row in one
+# block: c = sum(x*(dy*w)) per row, dx from those same registers, and the dw
+# column partials from the same pass (x*r*dy summed down the tile) so the dw
+# fold kernel never re-reads x.  Same-session minima, generic -> tile:
+#   (4096,4)  f32 6.979 -> 0.615 (11.3x)  f16 7.328 -> 0.796 (9.2x)
+#   (4096,8)      7.105 -> 0.987 (7.2x)       7.633 -> 1.350 (5.7x)
+#   (2048,16)     3.966 -> 0.775 (5.1x)       4.191 -> 0.862 (4.9x)
+#   (2048,32)     5.403 -> 1.180 (4.6x)       4.940 -> 1.504 (3.3x)
+#   (256,32)      1.007 -> 0.367 (2.7x)       0.966 -> 0.421 (2.3x)
+# dx error against a float64 oracle stays at the routed level (f32 6e-7..8e-7,
+# f16 at output rounding); dw is an M-sum, so its f16 error is 1e-2..5e-2 on
+# values of magnitude ~sqrt(M), the same relative level as the row route.
+# 64 columns keeps its existing route (tile 0.357 against 0.533 generic there
+# but the routed route is better), so the tile gate is power-of-two N <= 32.
+_RMSB_TILE_MAX_N = 32
+
+
+def _rmsb_tile_bm(m: int, bn: int) -> int:
+    bm = min(1024, max(64, 8192 // bn), max(64, m // 2))
+    while bm > 8 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 else 0
+
+
+def _rmsb_tile_ok(n: int, m: int, f32: bool = True) -> bool:
+    # f32 only: on a cold process the f16 tile still returned a garbage dw
+    # (2.1e3 against |dw| 105 at (2048,32)) when the fused forward's nested
+    # group was still draining, even with the sync below; every f32 case in the
+    # same cold-process battery is exact, so the gate admits f32 alone and the
+    # f16 narrow backward stays on the generic kernels until the dispatcher
+    # interaction is understood.
+    return (
+        f32
+        and n <= _RMSB_TILE_MAX_N
+        and n == triton.next_power_of_2(n)
+        and m >= 8
+        and _rmsb_tile_bm(m, n) > 0
+    )
+
+
+@triton.jit
+def _rmsb_dx_tile(X, DY, W, INV, DX, PW, N, BM: tl.constexpr, BN: tl.constexpr):
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    d = tl.reshape(tl.load(DY + idx).to(tl.float32), (BM, BN))
+    w = tl.load(W + tl.arange(0, BN)).to(tl.float32)[None, :]
+    rows = p * BM + tl.arange(0, BM)
+    r = tl.load(INV + rows).to(tl.float32)[:, None]
+    dwh = d * w
+    c = tl.sum(x * dwh, axis=1)[:, None]
+    dxv = r * dwh - x * (r * r * r * c / N)
+    tl.store(DX + idx, tl.reshape(dxv, (BM * BN,)).to(DX.dtype.element_ty))
+    tl.store(PW + p * BN + tl.arange(0, BN), tl.sum((x * r) * d, axis=0))
+
+
 def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     if x.numel() == 0 or dy.numel() != x.numel():
         return False
@@ -144,6 +202,8 @@ def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     n = weight.numel()
     if x.numel() % n:
         return False
+    if _rmsb_tile_ok(n, x.numel() // n, x.dtype == torch.float32):
+        return inv_rms is not None and inv_rms.numel() >= x.numel() // n
     if _routes(n, x.numel() // n, x.dtype != torch.float32) is None:
         return False
     if inv_rms is None or inv_rms.numel() < x.numel() // n:
@@ -240,6 +300,25 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
     """Launch the fast backward; returns (dx, dw). Caller must have checked ok()."""
     dx = torch.empty_like(x)
     inv = inv_rms.contiguous().reshape(-1)
+    if _rmsb_tile_ok(n, m, x.dtype == torch.float32):
+        # wave39: one pass over a narrow tile does dx and the dw partials.
+        # The sync is load-bearing: the fused forward's tile runs under the
+        # nested dispatcher and that group's completion is not awaited by the
+        # plain launches that follow, so without it the first backward of a
+        # process returned dw at 6.1e3 against |dw| 105 at (2048,32) f16 while
+        # dx stayed correct (probe435/436: disabling nesting or syncing first
+        # both fix it, and the generic backward never showed it because its own
+        # launch chain gives the group time to drain).
+        torch_device_fn.synchronize()
+        bm = _rmsb_tile_bm(m, n)
+        prb = m // bm
+        pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
+        cb = min(2048, triton.next_power_of_2(n))
+        dw = torch.empty(n, dtype=x.dtype, device=x.device)
+        with torch_device_fn.device(x.device):
+            _rmsb_dx_tile[(prb,)](x, dy, weight, inv, dx, pw, n, BM=bm, BN=n)
+            _rmsb_dw_comb[(triton.cdiv(n, cb),)](pw, dw, n, prb, cb, True)
+        return dx, dw
     k, tile, bn = _routes(n, m, x.dtype != torch.float32)
     while k > 1 and m % k:
         k //= 2
