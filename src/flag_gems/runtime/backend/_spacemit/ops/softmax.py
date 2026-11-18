@@ -114,10 +114,36 @@ def softmax_kernel_spacemit(
                 )
 
 
+@triton.jit
+def softmax_kernel_block(input_ptr, output_ptr, n_cols, COL: tl.constexpr):
+    """wave22: whole row resident in one block (f16, COL == n_cols)."""
+    row = tl.program_id(0)
+    base = row.to(tl.int64) * n_cols
+    offs = tl.arange(0, COL)
+    x = tl.load(input_ptr + base + offs).to(tl.float32)
+    m = tl.max(x, axis=0)
+    e = tl.exp(x - m)
+    s = tl.sum(e, axis=0)
+    tl.store(output_ptr + base + offs, (e / s).to(output_ptr.dtype.element_ty))
+
+
 def _spacemit_softmax_lastdim(inp, out):
     n_rows, n_cols = inp.shape
     row_size = 1 if n_rows < 2 else (2 if n_rows < 8 else 4)
-    col_size = 64
+    # wave22: 256-wide column blocks are 6-13% faster than 64-wide on every
+    # official shape (probe197b), and f16 rows of length 256-1024 are better
+    # held in one resident block (probe197/199b: 512^2 2.17 -> 1.10 ms,
+    # 8192x512 30.4 -> 17.9; at 2048 the block spills and loses 1.5x).
+    if (
+        inp.dtype == torch.float16
+        and 256 <= n_cols <= 1024
+        and (n_cols & (n_cols - 1)) == 0
+    ):
+        # no nested_dispatch here: the resident-row kernel is memory bound and
+        # the nested path costs it 1.9x (probe199b: 1.10 -> 2.05 ms at 512^2)
+        softmax_kernel_block[(n_rows,)](inp, out, n_cols, COL=n_cols)
+        return
+    col_size = 64 if n_cols < 256 else 256
     grid = lambda meta: (triton.cdiv(n_rows, meta["ROW_SIZE"]),)
     with nested_dispatch(inp.numel()):
         softmax_kernel_spacemit[grid](

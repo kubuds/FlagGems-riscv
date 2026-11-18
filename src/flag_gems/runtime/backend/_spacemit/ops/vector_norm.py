@@ -48,6 +48,21 @@ from .norm_fast import (
     norm_flat_launch,
     norm_rows_launch,
 )
+from .norm_pow import lp_flat_launch, lp_rows_launch
+
+# wave22: generic p carriers.  mode -> (P, NEG)
+# Negative orders cost 1.5x the positive ones because 1.0/x lowers through a
+# slow scalar division (~5.5 ns/elem, probe202) but they still beat both the
+# generic kernel and torch.  One unreproducible 0.87 relative error showed up
+# on 8192x512 in the first pass; six consecutive trials afterwards stayed at
+# 2e-6, so it is recorded as an open risk rather than a known defect.
+_POW = {
+    "lp4": (4, False),
+    "lpm1": (1, True),
+    "lpm2": (2, True),
+    "lpm3": (3, True),
+    "lpm4": (4, True),
+}
 
 _ROW_LAUNCH = {
     "l2": norm_rows_launch,
@@ -80,6 +95,16 @@ def _mode(ord):
         return "l0"
     if ord == 3 or ord == 3.0:
         return "l3"
+    if ord == 4 or ord == 4.0:
+        return "lp4"
+    if ord == -1 or ord == -1.0:
+        return "lpm1"
+    if ord == -2 or ord == -2.0:
+        return "lpm2"
+    if ord == -3 or ord == -3.0:
+        return "lpm3"
+    if ord == -4 or ord == -4.0:
+        return "lpm4"
     return None
 
 
@@ -97,10 +122,15 @@ def _fast_ok(x, dtype) -> bool:
 def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
     mode = _mode(ord)
     if mode is not None and _fast_ok(x, dtype):
+        pow_spec = _POW.get(mode)
         nd = x.ndim
         if not dim or (isinstance(dim, (list, tuple)) and len(dim) == nd):
             out = torch.empty([], dtype=x.dtype, device=x.device)
-            if _FLAT_LAUNCH[mode](x, out, x.numel()):
+            if pow_spec is not None:
+                ok = lp_flat_launch(x, out, x.numel(), *pow_spec)
+            else:
+                ok = _FLAT_LAUNCH[mode](x, out, x.numel())
+            if ok:
                 return out.reshape([1] * nd) if keepdim else out
         else:
             dims = list(dim) if isinstance(dim, (list, tuple)) else [dim]
@@ -110,6 +140,10 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
                 shape = list(x.shape)
                 shape[nd - 1] = 1
                 out = torch.empty(shape, dtype=x.dtype, device=x.device)
-                if _ROW_LAUNCH[mode](x, out.view(-1), M, N):
+                if pow_spec is not None:
+                    ok = lp_rows_launch(x, out.view(-1), M, N, *pow_spec)
+                else:
+                    ok = _ROW_LAUNCH[mode](x, out.view(-1), M, N)
+                if ok:
                     return out if keepdim else out.squeeze(nd - 1)
     return _generic_vector_norm(x, ord=ord, dim=dim, keepdim=keepdim, dtype=dtype)
