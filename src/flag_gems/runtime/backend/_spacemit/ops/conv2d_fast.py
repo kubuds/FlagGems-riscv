@@ -2435,6 +2435,9 @@ _MP_WG_MAX_BYTES = 384 << 20
 
 def _mp_cache_put(cache, key, item, nbytes, max_entries, max_bytes):
     """Insert into a descriptor-weight cache, oldest first, entries + bytes."""
+    dead = [k for k, e in cache.items() if e[0]() is None]
+    for k in dead:
+        cache.pop(k)
     while cache:
         if (len(cache) < max_entries
                 and sum(e[2].numel() * e[2].element_size()
