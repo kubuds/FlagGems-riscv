@@ -165,6 +165,7 @@ def _attn_fwd_inner(
     num_n_tiles: tl.constexpr,
     LO,
     HI,
+    ROW_ZERO: tl.constexpr,
 ):
     if STAGE == 1:
         tl.static_assert(BLOCK_M >= BLOCK_N)
@@ -198,7 +199,15 @@ def _attn_fwd_inner(
     # columns <= i; there is no KV_CTX - Q_CTX shift here.
     causal_offset = 0
     # per-row causal bound, built once per task instead of once per KV block
-    row_end_2d = offs_m[:, None] + causal_offset
+    if ROW_ZERO:
+        # wave96: a packed GQA decode (q_len == 1) puts one query head per row,
+        # and every one of those rows is query position 0.  The default bound
+        # would read the packed row index as the query position and let row r
+        # see keys <= r.  Force all rows to key 0, which is exactly torch's
+        # causal mask for a one-token query.
+        row_end_2d = tl.zeros((BLOCK_M, 1), dtype=tl.int32)
+    else:
+        row_end_2d = offs_m[:, None] + causal_offset
 
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -300,6 +309,7 @@ def _attn_fwd(
     MICRO_N: tl.constexpr,
     num_ctas: tl.constexpr,
     ALT: tl.constexpr,
+    ROW_ZERO: tl.constexpr,
 ):
     NUM_BLOCKS_M = tl.cdiv(Q_CTX, BLOCK_M)
     NUM_BLOCKS = NUM_BLOCKS_M * Z * H_Q
@@ -407,6 +417,7 @@ def _attn_fwd(
                 BLOCK_N // MICRO_N,
                 0,
                 0,
+                ROW_ZERO,
             )
         else:
             if STAGE & 1:
@@ -434,6 +445,7 @@ def _attn_fwd(
                     BLOCK_N // MICRO_N,
                     0,
                     0,
+                    ROW_ZERO,
                 )
             if STAGE & 2:
                 acc_4d, l_i_2d, m_i_2d = _attn_fwd_inner(
@@ -460,6 +472,7 @@ def _attn_fwd(
                     BLOCK_N // MICRO_N,
                     0,
                     0,
+                    ROW_ZERO,
                 )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -613,6 +626,7 @@ def _attn_fwd_split(
             num_k_tiles,
             lo,
             hi,
+            False,
         )
 
         acc_2d = smt.view(acc_4d, (0, 0), (BLOCK_M, BLOCK_SIZE_K), (1, 1))
@@ -892,7 +906,7 @@ def _plan(q, k, v, is_causal, group_size):
     return plan
 
 
-def _launch(q, k, v, sm_scale, is_causal, group_size):
+def _launch(q, k, v, sm_scale, is_causal, group_size, row_zero=False):
     """Mirror of Attention.forward without autograd; returns the output tensor."""
     (
         head_dim,
@@ -973,6 +987,7 @@ def _launch(q, k, v, sm_scale, is_causal, group_size):
             MICRO_N=micro_n,
             num_ctas=num_ctas,
             ALT=alt,
+            ROW_ZERO=row_zero,
             num_warps=8,
             num_stages=3,
         )
@@ -1137,14 +1152,15 @@ class Attention(torch.autograd.Function):
         # A (b, H_Q, nq, d) contiguous query is (b, H_KV, GROUP_SIZE*nq, d) with
         # the packed rows being (head, query) pairs, so this is a pure re-view:
         # each packed row keeps its own score row, only K/V is shared, which is
-        # what GQA already guarantees.  Plain only: the causal mask derives each
-        # row key bound from its query position, and packing would move rows to
-        # another position (q_len 1 packs to rows 0..G-1).
+        # what GQA already guarantees.  Causal is safe only when nq == 1: every
+        # packed row is then query position 0, and the kernel's ROW_ZERO flag
+        # pins the causal bound to key 0 for all of them (a packed row index is
+        # NOT a query position).
         if (
-            not is_causal
-            and group_size > 1
+            group_size > 1
             and q.is_contiguous()
             and q.shape[2] * group_size <= 32
+            and (not is_causal or q.shape[2] == 1)
             and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK", 1) != 0
         ):
             b, hq, nq, hd = q.shape
@@ -1155,6 +1171,7 @@ class Attention(torch.autograd.Function):
                 float(sm_scale),
                 is_causal,
                 1,
+                row_zero=is_causal,
             )
             return out.view(b, hq, nq, hd)
 
