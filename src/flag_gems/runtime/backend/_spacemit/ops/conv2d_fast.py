@@ -126,7 +126,14 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     if macs < ((1 << 12) if x.dtype != torch.float32
                else (1 << 14) if dwise else (1 << 20)):
         return False
-    if ww < (4 if (dwise or x.dtype != torch.float32) else 8):
+    # wave66: the 3x3 patch-matrix route is a replacement for the fallback path
+    # in the deep stages, where the width drops to 7 and the old 8-pixel floor
+    # used to hand the whole layer to the vendor kernel: (1,512,7,7) costs
+    # 161.3 ms there against 14.6 ms through the 9C GEMM.  Only the 3x3
+    # power-of-two-C class dips below 8.
+    deep3 = (kh == 3 and kw == 3 and c >= 32 and oc >= 128
+             and (c & (c - 1)) == 0)
+    if ww < (4 if (dwise or x.dtype != torch.float32 or deep3) else 8):
         return False
     return True
 
@@ -825,6 +832,80 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
     return y
 
 
+# wave66: 3x3 stride-1 patch matrices, keyed (KK, Mpad, dtype, device).  The
+# build rewrites every real column of every row on every call, so the pad tail
+# only has to be zero once.
+_IM2COL3_BUF = {}
+
+
+def _im2col3_buf(kk, mpad, dtype, device):
+    key = (kk, mpad, dtype, str(device))
+    buf = _IM2COL3_BUF.get(key)
+    if buf is None:
+        if len(_IM2COL3_BUF) >= 6:
+            _IM2COL3_BUF.pop(next(iter(_IM2COL3_BUF)))
+        buf = torch.zeros((kk, mpad), dtype=dtype, device=device)
+        _IM2COL3_BUF[key] = buf
+    return buf
+
+
+def _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w, out_dtype=None):
+    """wave66: 3x3 stride-1 conv as a K = 9C patch-matrix GEMM.
+
+    The tap kernel splits C into 32-lane dots and walks the input nine times;
+    that collapses where M is small, because the program count shrinks with
+    M while the per-program work stays at nine taps.  (1,512,7,7) is the
+    extreme: 161.3 ms on the fallback path (the tap kernel never sees a
+    7-pixel width) against 2.9 build + 11.6 GEMM here.
+    Same-process A/B against the tap kernel (probe1330): 11.06x at
+    (1,512,7,7), 1.80x at (1,256,14,14), 1.42x at (1,128,28,28), 1.03x at
+    (1,64,56,56) - so the gate takes M <= 1024 and OC >= 128, the band that
+    never measured below 1.4x.
+
+    K = 9C splits into two power-of-two slabs only when C is a power of two
+    (9 * 2^k = 2^(k+3) + 2^k), which is what the gate checks.
+    """
+    N, C, H, W = input.shape
+    OC = weight.shape[0]
+    x = input.contiguous()
+    xp = F.pad(x, (pad_w, pad_w, pad_h, pad_h)) if (pad_h or pad_w) else x
+    IH, IW = xp.shape[2], xp.shape[3]
+    M = OH * OW
+    KK = 9 * C
+    k1 = 1 << (KK.bit_length() - 1)
+    if k1 == KK:
+        k1 = KK // 2
+    k2 = KK - k1
+    wp = weight.permute(0, 2, 3, 1).reshape(OC, KK)
+    a1 = wp[:, :k1].contiguous()
+    a2 = wp[:, k1:].contiguous()
+    # probe1330: BLOCK_N=64 wins where 64 divides M or M is tiny, 128 wins in
+    # the 196-384 band (196: 8.53 at 128 against 9.44 at 64); 256 never won.
+    bn = 64 if (M <= 64 or M % 64 == 0) else (128 if M <= 384 else 64)
+    mpad = ((M + bn - 1) // bn) * bn
+    dt = out_dtype or input.dtype
+    y = torch.empty((N, OC, OH, OW), dtype=dt, device=input.device)
+    bow = min(64, triton.next_power_of_2(OW))
+    for n in range(N):
+        buf = _im2col3_buf(KK, mpad, x.dtype, x.device)
+        grid = (triton.cdiv(OW, bow), OH, triton.cdiv(C, 32))
+        _im2col_kernel[grid](xp[n], buf, C, IH, IW, OH, OW, mpad,
+                             SH=1, SW=1, KH=3, KW=3,
+                             BLOCK_C=32, BLOCK_OW=bow)
+        exact = (mpad == M)
+        yp = y[n].view(OC, M) if exact else torch.empty(
+            (OC, mpad), dtype=dt, device=input.device)
+        g = (triton.cdiv(OC, 32), triton.cdiv(mpad, bn))
+        _conv1x1_smt2_kernel[g](a1, a2, buf, bias if bias is not None else a1,
+                                yp, OC, mpad, k1, k2,
+                                BLOCK_M=32, BLOCK_N=bn,
+                                MICRO_M=8, MICRO_N=64, MICRO_K=32,
+                                HAS_BIAS=(bias is not None))
+        if not exact:
+            y[n].view(OC, M).copy_(yp[:, :M])
+    return y
+
+
 def _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW,
                       BLOCK_OW=None, BLOCK_C=None):
     N, _, H, W = input.shape
@@ -965,6 +1046,20 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
             return y.to(input.dtype)
         return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
                                  out_dtype=_out_dtype)
+    # wave66: 3x3 stride-1 goes through a 9C patch matrix wherever M is small
+    # and OC is not.  The tap kernel's nine passes over a 32-lane-split input
+    # collapse there: (1,256,14,14) 15.4 vs 8.5 (1.80x), (1,128,28,28) 12.2 vs
+    # 8.6 (1.42x), and the 7-pixel stages never reach the tap kernel at all
+    # (161.3 ms on the fallback path against 14.6 here); at (1,64,56,56) it is
+    # a wash (1.03x) and at 112 px it loses, hence the M <= 1024 / OC >= 128
+    # gate.  C must be a power of two because 9C has to be two power-of-two
+    # slabs.  FLAGGEMS_SPACEMIT_CONV_IM2COL3=0 pins the old route for A/B.
+    if (groups == 1 and KH == 3 and KW == 3 and SH == 1 and SW == 1
+            and C >= 32 and (C & (C - 1)) == 0 and OC >= 128
+            and 16 <= OH * OW <= 1024
+            and os.environ.get("FLAGGEMS_SPACEMIT_CONV_IM2COL3", "1") != "0"):
+        return _conv3x3_im2col(input, weight, bias, OH, OW, pad_h, pad_w,
+                               out_dtype=_out_dtype)
     x = input.contiguous()
     if pad_h or pad_w:
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
