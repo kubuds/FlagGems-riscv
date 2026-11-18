@@ -49,6 +49,42 @@ def rms_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_RMS_FAST", "1") != "0"
 
 
+# ------------------- wave38: single-pass tile for N=64 -------------------
+# probe401/402: the routed kernel reads a row twice (sum chain, then apply).
+# At 64 columns the whole tile fits in registers, so one pass suffices: load x,
+# tl.sum(x*x, axis=1), then y from the same registers.  Plain-launch numbers
+# were a wash at 64 rows and only 1.1-1.4x above 256 rows, but the tile wants
+# the nested dispatcher much more than the routed kernel does - at (4096,64)
+# nesting takes it from 2.29 to 0.74 ms f16 (3.09x) and 1.90 to 0.86 f32
+# (2.22x), against 3.03 / ~3.3 for the routed and generic paths.  At the
+# official (64,64) core shape the element count is under the nested floor and
+# the two forms tie, so the tile is gated to M >= 256.
+_RMS_TILE_N = 64
+_RMS_TILE_MIN_M = 256
+
+
+def _rms_tile_bm(m: int) -> int:
+    bm = 128
+    while bm > 32 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 else 0
+
+
+@triton.jit
+def _rms_tile(X, W, Y, INV, N, eps, BM: tl.constexpr, BN: tl.constexpr):
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    s = tl.sum(x * x, axis=1) / N + eps
+    rr = 1.0 / tl.sqrt(s)
+    rows = p * BM + tl.arange(0, BM)
+    tl.store(INV + rows, rr)
+    cols = tl.arange(0, BN)
+    w = tl.load(W + cols).to(tl.float32)[None, :]
+    y = x * rr[:, None] * w
+    tl.store(Y + idx, tl.reshape(y, (BM * BN,)).to(Y.dtype.element_ty))
+
+
 @triton.jit
 def _rms_row(X, W, Y, INV, N, eps, TILE: tl.constexpr):
     row = tl.program_id(0)
@@ -302,6 +338,8 @@ def _wildcard_entry(N: int, f16: bool):
 
 def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
     """True when rms_fast_launch would serve this shape (no allocation)."""
+    if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M and _rms_tile_bm(M):
+        return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     cap = None if f16 else _RMS_F32_MAX_M.get(N)
     if cap is not None and M > cap:
@@ -313,6 +351,14 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
 
 def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
+    if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M:
+        bm = _rms_tile_bm(M)
+        if bm:
+            # wave38: one pass over the tile; nesting is what makes it win
+            # above 32K elements (probe402).
+            with nested_dispatch(M * N):
+                _rms_tile[(M // bm,)](x, w, y, inv, N, eps, BM=bm, BN=N)
+            return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     cap = None if f16 else _RMS_F32_MAX_M.get(N)
     if cap is not None and M > cap:

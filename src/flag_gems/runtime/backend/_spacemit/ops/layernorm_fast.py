@@ -267,7 +267,11 @@ def _ln16_tiles(n: int):
     # BN128/AB512 (1.2%), everything below 262144 keeps the old pair.
     if n >= (1 << 18):
         return 256, 1024
-    return min(_LN16_BN, triton.next_power_of_2(n)), _ln16_ab(n)
+    # wave38 probe396: BN came out as next_pow2(n) below 128; at N=4/8/16 the
+    # masked carrier then reduced a sub-32-lane block and returned NaN for
+    # every element.  Floor BN at 32 (the alignment test below then sends those
+    # widths to the masked kernel, which pads the extra lanes safely).
+    return max(32, min(_LN16_BN, triton.next_power_of_2(n))), _ln16_ab(n)
 
 
 @triton.jit
@@ -653,7 +657,11 @@ def _dx_block(n: int) -> int:
     # wave36 probe370: a fixed BLOCK=512 spends 128 lanes on every useful
     # element when the row is narrow - at (4096,4) dx alone took 12.8 of the
     # 13.4 ms while dW/dB took 0.53.  Cap the pass at the row width.
-    return min(_DX_BLOCK, triton.next_power_of_2(n))
+    # wave38 probe395: the cap alone is wrong below 32 lanes - with BLOCK == N
+    # in {4,8,16} every output element comes back NaN for both dtypes, while
+    # BLOCK=32 on the same shape is exact (it is masked, so the padding lanes
+    # are never read).  Floor at 32 so the un-tiled fallback stays correct.
+    return max(32, min(_DX_BLOCK, triton.next_power_of_2(n)))
 _DWDB_ROWS = 64
 _DWDB_CB = 2048
 
@@ -829,6 +837,106 @@ def _ln_bwd_dx_kernel(
                 tl.store(
                     dX + base + offs, dx.to(dX.dtype.element_ty), mask=mm
                 )
+
+
+# ------------------- wave38: fused narrow-row dx tile -------------------
+# probe390-395: a row narrower than 32 lanes cannot use the three-pass per-row
+# kernel at all - with BLOCK == N in {4,8,16} every element comes back NaN for
+# both dtypes - and padding that kernel to BLOCK=32 costs 7.13 ms at (4096,4)
+# against 1.51 for the broken form.  A (BM rows x BN cols) tile keeps the whole
+# narrow row in one block, so both row sums come from one tl.sum(axis=1) each
+# and the apply reuses the same registers.  Same-session minima, f32:
+# (4096,4) 1.51 -> 0.53, (4096,8) 1.90 -> 0.94, (2048,16) 1.14 -> 0.73,
+# (2048,32) 2.23 -> 1.35; f16 (4096,4) 1.65 -> 0.54.  At 64 columns the
+# per-row kernel wins again (1.42 vs 0.73) and the tile also loses on
+# non-power-of-two widths (N=100: 12.9 against 5.98 ms), so the tile is gated
+# on n == next_power_of_2(n) and n <= 32.
+_LN_DX_TILE_MAX_N = 32
+
+
+def _dx_tile_bm(m: int, bn: int) -> int:
+    """Rows per tile program; the tile is ~4-16K elements, grid stays >16."""
+    cap = 1024 if bn <= 8 else 512
+    bm = cap
+    while bm > 16 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 else 0
+
+
+@triton.jit
+def _ln_bwd_dx_tile_kernel(
+    G,
+    X,
+    W,
+    Mean,
+    Rstd,
+    dX,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    g = tl.reshape(tl.load(G + idx).to(tl.float32), (BM, BN))
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    cols = tl.arange(0, BN)
+    if HAS_W:
+        w = tl.load(W + cols).to(tl.float32)[None, :]
+        dwh = g * w
+    else:
+        dwh = g
+    rows = p * BM + tl.arange(0, BM)
+    mu = tl.load(Mean + rows).to(tl.float32)[:, None]
+    rs = tl.load(Rstd + rows).to(tl.float32)[:, None]
+    xh = (x - mu) * rs
+    s2 = tl.sum(dwh, axis=1)[:, None]
+    s3 = tl.sum(dwh * xh, axis=1)[:, None]
+    dx = rs * (dwh - (s2 + xh * s3) / N)
+    tl.store(dX + idx, tl.reshape(dx, (BM * BN,)).to(dX.dtype.element_ty))
+
+
+@triton.jit
+def _ln_bwd_narrow_kernel(
+    G,
+    X,
+    W,
+    Mean,
+    Rstd,
+    dX,
+    dWp,
+    dBp,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    """wave38: the dx tile plus the dW/dB column partials in the same pass.
+
+    g, x and x_hat are already in registers, so the per-program column sums
+    cost one extra tl.sum(axis=0) each instead of a second kernel that re-reads
+    both tensors (probe399 (4096,4) f32 1.12 -> 0.76 ms).
+    """
+    p = tl.program_id(0)
+    idx = p * BM * BN + tl.arange(0, BM * BN)
+    g = tl.reshape(tl.load(G + idx).to(tl.float32), (BM, BN))
+    x = tl.reshape(tl.load(X + idx).to(tl.float32), (BM, BN))
+    cols = tl.arange(0, BN)
+    if HAS_W:
+        w = tl.load(W + cols).to(tl.float32)[None, :]
+        dwh = g * w
+    else:
+        dwh = g
+    rows = p * BM + tl.arange(0, BM)
+    mu = tl.load(Mean + rows).to(tl.float32)[:, None]
+    rs = tl.load(Rstd + rows).to(tl.float32)[:, None]
+    xh = (x - mu) * rs
+    s2 = tl.sum(dwh, axis=1)[:, None]
+    s3 = tl.sum(dwh * xh, axis=1)[:, None]
+    dx = rs * (dwh - (s2 + xh * s3) / N)
+    tl.store(dX + idx, tl.reshape(dx, (BM * BN,)).to(dX.dtype.element_ty))
+    tl.store(dWp + p * BN + cols, tl.sum(g * xh, axis=0))
+    tl.store(dBp + p * BN + cols, tl.sum(g, axis=0))
 
 
 # ---------------- wave32: 16-bit backward dx carrier ----------------
@@ -1053,9 +1161,79 @@ def ln_bwd_fast(
     g2 = g.view(m, n)
     x2d = x.view(m, n)
     in_grad = None
+    fused_wb = False
+    dW = None
+    dB = None
     if output_mask[0]:
         in_grad = torch.empty_like(x)
-        if x.dtype == torch.float32:
+        bn_t = triton.next_power_of_2(n)
+        bm_t = (
+            _dx_tile_bm(m, bn_t)
+            if (
+                os.environ.get("FLAGGEMS_SPACEMIT_LN_DX_TILE", "1") != "0"
+                and n <= _LN_DX_TILE_MAX_N
+                and n == bn_t
+            )
+            else 0
+        )
+        if bm_t:
+            # wave38: narrow rows are both wrong (<32 lanes) and slow in the
+            # per-row kernel; the tile is dtype agnostic.  When dW/dB are also
+            # wanted the same pass emits the per-program column sums, which
+            # saves a second read of g/x (probe399: (4096,4) 1.12 -> 0.76 ms).
+            np_t = m // bm_t
+            want_w = bool(output_mask[1]) and has_w
+            want_b = bool(output_mask[2]) and b is not None
+            if want_w or want_b:
+                pw = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
+                pb = torch.empty(np_t, n, dtype=torch.float32, device=x.device)
+                dW = torch.empty_like(w) if want_w else pw[0]
+                dB = torch.empty_like(b) if want_b else pb[0]
+                with nested_dispatch(m * n):
+                    _ln_bwd_narrow_kernel[(np_t,)](
+                        g2,
+                        x2d,
+                        w if has_w else x2d,
+                        mean,
+                        rstd,
+                        in_grad.view(m, n),
+                        pw,
+                        pb,
+                        n,
+                        BM=bm_t,
+                        BN=bn_t,
+                        HAS_W=has_w,
+                    )
+                _ln_bwd_combine_kernel[(1,)](
+                    pw,
+                    pb,
+                    dW,
+                    dB,
+                    n,
+                    NRB=np_t,
+                    CB2=bn_t,
+                    NOMASK=True,
+                )
+                if not want_w:
+                    dW = None
+                if not want_b:
+                    dB = None
+                fused_wb = True
+            else:
+                with nested_dispatch(m * n):
+                    _ln_bwd_dx_tile_kernel[(np_t,)](
+                        g2,
+                        x2d,
+                        w if has_w else x2d,
+                        mean,
+                        rstd,
+                        in_grad.view(m, n),
+                        n,
+                        BM=bm_t,
+                        BN=bn_t,
+                        HAS_W=has_w,
+                    )
+        elif x.dtype == torch.float32:
             k = _pick_dx_k(m, n)
             blk = _dx_block(n)
 
@@ -1103,9 +1281,7 @@ def ln_bwd_fast(
                     _launch_dx16()
             else:
                 _launch_dx16()
-    dW = None
-    dB = None
-    if output_mask[1] or output_mask[2]:
+    if (output_mask[1] or output_mask[2]) and not fused_wb:
         # wave13 probe109 P5a: ROWS=32 wins for n>=2048 (2048^2 total
         # 3.95 vs 4.20; 512x2048 1.06 vs 1.07).
         if x.dtype == torch.float32:
