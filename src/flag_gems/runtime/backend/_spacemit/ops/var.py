@@ -116,7 +116,12 @@ def _fast_reduce(x, dim, corr, keepdim, want_mean=False, sqrt=False):
 
 
 def _col_target(x, dim):
-    """wave13: (M, N) when reducing dim=0 of a 2D contiguous tensor."""
+    """wave13/14: (M, N) when reducing dim=0 of a contiguous N-D tensor.
+
+    wave14: N-D (3-D/4-D) first-dim reduce rides the same fold kernels - the
+    reduce axis is the outermost, so X + r*N + cols addresses it exactly like
+    the 2-D case (M = shape[0], N = numel // M).
+    """
     if not var_fast_enabled():
         return None
     if x.dtype not in _FAST_DTYPES or not x.is_contiguous():
@@ -124,11 +129,12 @@ def _col_target(x, dim):
     if dim is None or x.numel() < _FAST_MIN_NUMEL:
         return None
     dims = [dim] if isinstance(dim, int) else list(dim)
-    if len(dims) != 1 or x.ndim != 2:
+    if len(dims) != 1 or x.ndim < 2:
         return None
     if dims[0] % x.ndim != 0:
         return None
-    M, N = x.shape
+    M = x.shape[0]
+    N = x.numel() // M
     if M <= 0 or N <= 0:
         return None
     return int(M), int(N)
