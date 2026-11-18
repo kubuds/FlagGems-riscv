@@ -50,6 +50,10 @@ try:  # wave61: the smt descriptor/TCM path that flag_gems.mm uses
 except Exception:  # a wheel without the spacemit extra keeps the tl path
     smt = None
 
+# wave64: stem patch-matrix buffers, keyed (kpad, M, K, dtype, device); the pad
+# tail is zeroed once at creation and the build rewrites every real row
+_STEM_BUF = {}
+
 
 def conv_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_CONV_FAST", "1") != "0"
@@ -182,6 +186,55 @@ def _conv1x1_smt_kernel(A, B, Bias, Y, M, N, K: tl.constexpr,
                  (K, BLOCK_N), (MICRO_K, MICRO_N))
     acc = smt.dot(a, b)
     acc = smt.view(acc, (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    if HAS_BIAS:
+        oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        acc += tl.load(Bias + oc, mask=oc < M, other=0.0)[:, None]
+    c_ptr = tl.make_block_ptr(base=Y, shape=[M, N], strides=[N, 1],
+                              offsets=[pid_m * BLOCK_M, pid_n * BLOCK_N],
+                              block_shape=[BLOCK_M, BLOCK_N], order=[1, 0])
+    tl.store(c_ptr, acc.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
+def _conv1x1_smt2_kernel(A1, A2, B, Bias, Y, M, N, K1: tl.constexpr,
+    K2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    MICRO_M: tl.constexpr, MICRO_N: tl.constexpr, MICRO_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """wave64: the same GEMM, but K arrives as two power-of-two slabs.
+
+    smt.view refuses any block shape that is not a power of two, so a K of 147
+    cannot be one dot; it can be 128 + 32.  Two descriptor loads and two dots
+    against one register accumulator are exact (err 0.0 against torch at both
+    128+64 and 512+64, probe1206), and the recipe matters: M/N stay runtime
+    args, the second B base is pointer arithmetic (B + K1 * N) rather than a
+    sliced tensor, and the first dot's view is assigned, not accumulated into a
+    zeros tile.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    a1_ptr = tl.make_block_ptr(base=A1, shape=[M, K1], strides=[K1, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, K1], order=[1, 0])
+    b1_ptr = tl.make_block_ptr(base=B, shape=[K1 + K2, N], strides=[N, 1],
+                               offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[K1, BLOCK_N], order=[1, 0])
+    a1 = smt.view(smt.descriptor_load(a1_ptr, (0, 0)), (0, 0), (BLOCK_M, K1),
+                  (MICRO_M, MICRO_K))
+    b1 = smt.view(smt.descriptor_load(b1_ptr, (0, 0)), (0, 0), (K1, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc = smt.view(smt.dot(a1, b1), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
+    a2_ptr = tl.make_block_ptr(base=A2, shape=[M, K2], strides=[K2, 1],
+                               offsets=[pid_m * BLOCK_M, 0],
+                               block_shape=[BLOCK_M, K2], order=[1, 0])
+    b2_ptr = tl.make_block_ptr(base=B + K1 * N, shape=[K2, N], strides=[N, 1],
+                               offsets=[0, pid_n * BLOCK_N],
+                               block_shape=[K2, BLOCK_N], order=[1, 0])
+    a2 = smt.view(smt.descriptor_load(a2_ptr, (0, 0)), (0, 0), (BLOCK_M, K2),
+                  (MICRO_M, MICRO_K))
+    b2 = smt.view(smt.descriptor_load(b2_ptr, (0, 0)), (0, 0), (K2, BLOCK_N),
+                  (MICRO_K, MICRO_N))
+    acc += smt.view(smt.dot(a2, b2), (0, 0), (BLOCK_M, BLOCK_N), (1, 1))
     if HAS_BIAS:
         oc = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         acc += tl.load(Bias + oc, mask=oc < M, other=0.0)[:, None]
@@ -627,6 +680,24 @@ def _conv1x1_strided(input, weight, bias, OH, OW, SH, SW):
     return y
 
 
+def _stem_buf(kpad, M, K, dtype, device):
+    """wave64: one buffer per (kpad, M, K, dtype) with the pad rows already zero.
+
+    The build writes every row k < K on every call, so the zeroed pad tail only
+    has to exist once.  This removes the per-forward buffer allocation, the
+    per-forward memset of the tail (7.1 MB at kpad=256) and the page-fault tax
+    that comes with a fresh 16.8 MB allocation each call.
+    """
+    key = (kpad, M, K, dtype, str(device))
+    buf = _STEM_BUF.get(key)
+    if buf is None:
+        if len(_STEM_BUF) >= 6:            # FIFO, one eviction not a flush
+            _STEM_BUF.pop(next(iter(_STEM_BUF)))
+        buf = torch.zeros((kpad, M), dtype=dtype, device=device)
+        _STEM_BUF[key] = buf
+    return buf
+
+
 def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
     """wave62: a 7x7 stride-2 first layer with C<=8 through a buffered im2col.
 
@@ -646,12 +717,33 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
     IH, IW = xp.shape[2], xp.shape[3]
     M = OH * OW
     K = C * KH * KW
-    if smt is not None and K <= 192:
-        kpad = 256
+    # wave64: K is 147 for the 7x7 stem, and smt.view rejects any block shape
+    # that is not a power of two, so the old code padded to 256 and spent 43%
+    # of both the buffer read and the dot on zeros.  160 = 128 + 32 is the
+    # smallest legal K and measures 6.95 ms of GEMM against 9.75 at 256.
+    # FLAGGEMS_SPACEMIT_CONV_STEM_K256=1 pins the old padded path for A/B.
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_K256", "0") == "1":
+        kpad = 256 if (smt is not None and K <= 256) else max(
+            32, triton.next_power_of_2(K))
+        ksplit = 0
+    elif smt is not None and K <= 160 and K > 128:
+        kpad, ksplit = 160, 128
+    elif smt is not None and K <= 192 and K > 128:
+        kpad, ksplit = 192, 128
     else:
-        kpad = max(32, triton.next_power_of_2(K))
-    w2 = torch.zeros((OC, kpad), dtype=weight.dtype, device=weight.device)
-    w2[:, :K] = weight.permute(0, 2, 3, 1).reshape(OC, K)
+        kpad, ksplit = max(32, triton.next_power_of_2(K)), 0
+    wp = weight.permute(0, 2, 3, 1).reshape(OC, K)
+    if ksplit:
+        w2a = torch.zeros((OC, ksplit), dtype=weight.dtype, device=weight.device)
+        w2a[:, :ksplit] = wp[:, :ksplit]
+        w2b = torch.zeros((OC, kpad - ksplit), dtype=weight.dtype,
+                          device=weight.device)
+        w2b[:, :K - ksplit] = wp[:, ksplit:]
+        w2 = None
+    else:
+        w2a = w2b = None
+        w2 = torch.zeros((OC, kpad), dtype=weight.dtype, device=weight.device)
+        w2[:, :K] = wp
     y = torch.empty((N, OC, OH, OW), dtype=input.dtype, device=input.device)
     bc = 4 if C <= 4 else (8 if C <= 8 else 16)
     bm = 32 if M >= 4096 else 64
@@ -667,23 +759,33 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
           256 if M % 256 == 0 else 128 if M % 128 == 0 else 64)
     # the smt descriptor path has no element mask: it can only run when both
     # grid axes land exactly on the matrix edges
-    use_smt = (smt is not None and kpad == 256 and OC % bm == 0
+    use_smt = (smt is not None and (ksplit or kpad == 256) and OC % bm == 0
                and M % bn == 0)
     for n in range(N):
-        buf = torch.empty((kpad, M), dtype=input.dtype, device=input.device)
+        buf = _stem_buf(kpad, M, K, input.dtype, input.device)
         grid = (triton.cdiv(OW, 64), OH, triton.cdiv(C, bc))
         _im2col_kernel[grid](xp[n], buf, C, IH, IW, OH, OW, M,
                              SH=SH, SW=SW, KH=KH, KW=KW,
                              BLOCK_C=bc, BLOCK_OW=64)
-        if kpad > K:
-            buf[K:].zero_()
-        if use_smt:
+        if use_smt and ksplit:
+            g = (triton.cdiv(OC, bm), triton.cdiv(M, bn))
+            _conv1x1_smt2_kernel[g](w2a, w2b, buf,
+                                    bias if bias is not None else w2a, y[n],
+                                    OC, M, ksplit, kpad - ksplit,
+                                    BLOCK_M=bm, BLOCK_N=bn,
+                                    MICRO_M=8, MICRO_N=64, MICRO_K=32,
+                                    HAS_BIAS=(bias is not None))
+        elif use_smt:
             g = (triton.cdiv(OC, bm), triton.cdiv(M, bn))
             _conv1x1_smt_kernel[g](w2, buf, bias if bias is not None else w2, y[n],
                                    OC, M, kpad, BLOCK_M=bm, BLOCK_N=bn,
                                    MICRO_M=8, MICRO_N=64, MICRO_K=32,
                                    HAS_BIAS=(bias is not None))
         else:
+            if w2 is None:
+                w2 = torch.zeros((OC, kpad), dtype=weight.dtype,
+                                 device=weight.device)
+                w2[:, :K] = wp
             bmk = 128 if M % 128 == 0 else 64
             g = (triton.cdiv(OC, 64), triton.cdiv(M, bmk), 1)
             _conv1x1_kernel[g](buf, w2, bias if bias is not None else buf, y[n],
