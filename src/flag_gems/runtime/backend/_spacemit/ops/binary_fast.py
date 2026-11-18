@@ -591,3 +591,562 @@ def where_self_out(condition, self_, other, out=None):
     if out is not None and _fast_enabled() and _where_ok(condition, self_, other, out):
         return _where_fast(condition, self_, other, out)
     return _vw.where_self_out(condition, self_, other, out=out)
+
+
+# =============================================================================
+# wave2c (campaign 1013am): comparison / select family completion.
+#
+# - ge / le / ne tensor kernels (nested launcher path, mirrors gt/lt/eq);
+# - maximum / minimum (default launcher path; explicit select reproduces
+#   torch's NaN propagation and signed-zero tie behaviour — tl.maximum /
+#   tl.minimum do not propagate NaN on this backend);
+# - in-place comparison kernels for gt_tensor_/lt_/eq_/ge_/le_/ne_ and the
+#   greater_equal_ / less_ / less_equal_ aliases (bool result cast into the
+#   float operand, matching aten in-place *.Tensor semantics);
+# - scalar-comparison kernels for gt/ge/lt/le/eq/ne scalars; the scalar is
+#   pre-rounded to the tensor dtype host-side (torch scalar-typing parity;
+#   fixes f16 scalar mismatches seen with raw f32 constants);
+# - alias wiring: aten less_ / less_equal* / greater* / not_equal* reach the
+#   same kernels through the flag_gems op table.
+# =============================================================================
+
+from flag_gems.ops.greater import (  # noqa: E402
+    greater as _c_greater,
+    greater_scalar as _c_greater_scalar,
+    greater_out as _c_greater_out,
+    greater_scalar_out as _c_greater_scalar_out,
+)
+from flag_gems.ops.greater_equal import (  # noqa: E402
+    greater_equal_ as _c_greater_equal_,
+)
+from flag_gems.ops.maximum import maximum as _c_maximum  # noqa: E402
+from flag_gems.ops.minimum import minimum as _c_minimum  # noqa: E402
+from flag_gems.ops.not_equal import (  # noqa: E402
+    not_equal as _c_not_equal,
+    not_equal_scalar as _c_not_equal_scalar,
+)
+
+
+def _scalar_cast(A, B):
+    """Round the scalar to the tensor dtype first (torch scalar typing: half
+    tensors compare against a half-rounded scalar)."""
+    return float(torch.tensor(B, dtype=A.dtype).item())
+
+
+# --- ge / le / ne (tensor) ---------------------------------------------------
+
+
+@triton.jit
+def _ge_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) >= y)
+
+
+@triton.jit
+def _ge_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) >= y, mask=m)
+
+
+@triton.jit
+def _le_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) <= y)
+
+
+@triton.jit
+def _le_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) <= y, mask=m)
+
+
+@triton.jit
+def _ne_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) != y.to(tl.float32))
+
+
+@triton.jit
+def _ne_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) != y.to(tl.float32), mask=m)
+
+
+def ge(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_ge_kernel, _ge_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _en.ge(A, B)
+
+
+def le(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_le_kernel, _le_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _en.le(A, B)
+
+
+def ne(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_ne_kernel, _ne_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _en.ne(A, B)
+
+
+# --- maximum / minimum (select-based, torch NaN / signed-zero parity) ---------
+
+
+@triton.jit
+def _maximum_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    y = tl.load(y_ptr + offs).to(tl.float32)
+    r = tl.where(x != x, x, tl.where(y != y, y, tl.maximum(x, y)))
+    xb = x.to(tl.int32, bitcast=True)
+    yb = y.to(tl.int32, bitcast=True)
+    tie = (x == y) & ((xb ^ yb) != 0)
+    r = tl.where(tie, y, r)
+    tl.store(o_ptr + offs, r)
+
+
+@triton.jit
+def _maximum_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
+    y = tl.load(y_ptr + offs, mask=m).to(tl.float32)
+    r = tl.where(x != x, x, tl.where(y != y, y, tl.maximum(x, y)))
+    xb = x.to(tl.int32, bitcast=True)
+    yb = y.to(tl.int32, bitcast=True)
+    tie = (x == y) & ((xb ^ yb) != 0)
+    r = tl.where(tie, y, r)
+    tl.store(o_ptr + offs, r, mask=m)
+
+
+@triton.jit
+def _minimum_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    y = tl.load(y_ptr + offs).to(tl.float32)
+    r = tl.where(x != x, x, tl.where(y != y, y, tl.minimum(x, y)))
+    xb = x.to(tl.int32, bitcast=True)
+    yb = y.to(tl.int32, bitcast=True)
+    tie = (x == y) & ((xb ^ yb) != 0)
+    r = tl.where(tie, y, r)
+    tl.store(o_ptr + offs, r)
+
+
+@triton.jit
+def _minimum_kernel_m(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
+    y = tl.load(y_ptr + offs, mask=m).to(tl.float32)
+    r = tl.where(x != x, x, tl.where(y != y, y, tl.minimum(x, y)))
+    xb = x.to(tl.int32, bitcast=True)
+    yb = y.to(tl.int32, bitcast=True)
+    tie = (x == y) & ((xb ^ yb) != 0)
+    r = tl.where(tie, y, r)
+    tl.store(o_ptr + offs, r, mask=m)
+
+
+def maximum(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_maximum_kernel, _maximum_kernel_m, A, B, torch.empty_like(A))
+    return _c_maximum(A, B)
+
+
+def minimum(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_minimum_kernel, _minimum_kernel_m, A, B, torch.empty_like(A))
+    return _c_minimum(A, B)
+
+
+# --- in-place comparisons (bool result cast into the float operand) ----------
+
+
+def _launch_ip(kern, kern_m, A, B):
+    n = A.numel()
+    grid = (triton.cdiv(n, _BLOCK),)
+    if n % _BLOCK == 0:
+        kern[grid](A, B, BLOCK=_BLOCK)
+    else:
+        kern_m[grid](A, B, n, BLOCK=_BLOCK)
+    return A
+
+
+@triton.jit
+def _gt_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) > y).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _gt_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) > y).to(x_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _lt_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) < y).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _lt_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) < y).to(x_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _eq_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) == y.to(tl.float32)).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _eq_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) == y.to(tl.float32)).to(x_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _ge_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) >= y).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _ge_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) >= y).to(x_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _le_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) <= y).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _le_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) <= y).to(x_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _ne_ip_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    tl.store(x_ptr + offs, (x.to(tl.float32) != y.to(tl.float32)).to(x_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _ne_ip_kernel_m(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    y = tl.load(y_ptr + offs, mask=m)
+    tl.store(x_ptr + offs, (x.to(tl.float32) != y.to(tl.float32)).to(x_ptr.dtype.element_ty), mask=m)
+
+
+def gt_tensor_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_gt_ip_kernel, _gt_ip_kernel_m, A, B)
+    return _en.gt_tensor_(A, B)
+
+
+def lt_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_lt_ip_kernel, _lt_ip_kernel_m, A, B)
+    return _en.lt_(A, B)
+
+
+def eq_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_eq_ip_kernel, _eq_ip_kernel_m, A, B)
+    return _en.eq_(A, B)
+
+
+def le_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_le_ip_kernel, _le_ip_kernel_m, A, B)
+    return _en.le_(A, B)
+
+
+def ne_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_ne_ip_kernel, _ne_ip_kernel_m, A, B)
+    return _en.ne_(A, B)
+
+
+def less_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_lt_ip_kernel, _lt_ip_kernel_m, A, B)
+    return _en.less_(A, B)
+
+
+def greater_equal_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_ge_ip_kernel, _ge_ip_kernel_m, A, B)
+    return _c_greater_equal_(A, B)
+
+
+def not_equal_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_ne_ip_kernel, _ne_ip_kernel_m, A, B)
+    return _en.not_equal_(A, B)
+
+
+# --- scalar comparisons ------------------------------------------------------
+
+
+def _launch_s(kern, kern_m, A, v):
+    return _launch1(kern, kern_m, A, torch.empty_like(A, dtype=torch.bool), (v,), nest=True)
+
+
+@triton.jit
+def _gt_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) > v)
+
+
+@triton.jit
+def _gt_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) > v, mask=m)
+
+
+@triton.jit
+def _ge_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) >= v)
+
+
+@triton.jit
+def _ge_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) >= v, mask=m)
+
+
+@triton.jit
+def _lt_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) < v)
+
+
+@triton.jit
+def _lt_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) < v, mask=m)
+
+
+@triton.jit
+def _le_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) <= v)
+
+
+@triton.jit
+def _le_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) <= v, mask=m)
+
+
+@triton.jit
+def _eq_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) == v)
+
+
+@triton.jit
+def _eq_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) == v, mask=m)
+
+
+@triton.jit
+def _ne_scalar_kernel(x_ptr, o_ptr, v, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x.to(tl.float32) != v)
+
+
+@triton.jit
+def _ne_scalar_kernel_m(x_ptr, o_ptr, v, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m)
+    tl.store(o_ptr + offs, x.to(tl.float32) != v, mask=m)
+
+
+def _sc_ok(A, B) -> bool:
+    return _fast_enabled() and _ok1(A) and _scalar(B)
+
+
+def gt_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_gt_scalar_kernel, _gt_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.gt_scalar(A, B)
+
+
+def ge_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_ge_scalar_kernel, _ge_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.ge_scalar(A, B)
+
+
+def lt_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_lt_scalar_kernel, _lt_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.lt_scalar(A, B)
+
+
+def le_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_le_scalar_kernel, _le_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.le_scalar(A, B)
+
+
+def eq_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_eq_scalar_kernel, _eq_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.eq_scalar(A, B)
+
+
+def ne_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_ne_scalar_kernel, _ne_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.ne_scalar(A, B)
+
+
+# --- aliases: greater* / less_equal* / not_equal* ride the same kernels -------
+
+
+def greater(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_gt_kernel, _gt_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _c_greater(A, B)
+
+
+def greater_out(A, B, *, out=None):
+    if out is None:
+        return greater(A, B)
+    if (
+        _fast_enabled()
+        and _ok2(A, B)
+        and isinstance(out, torch.Tensor)
+        and out.dtype == torch.bool
+        and out.is_contiguous()
+        and out.shape == A.shape
+    ):
+        _launch2(_gt_kernel, _gt_kernel_m, A, B, out, nest=True)
+        return out
+    return _c_greater_out(A, B, out=out)
+
+
+def greater_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_gt_scalar_kernel, _gt_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _c_greater_scalar(A, B)
+
+
+def greater_scalar_out(A, B, *, out=None):
+    if out is None:
+        return greater_scalar(A, B)
+    if (
+        _fast_enabled()
+        and _ok1(A)
+        and _scalar(B)
+        and isinstance(out, torch.Tensor)
+        and out.dtype == torch.bool
+        and out.is_contiguous()
+        and out.shape == A.shape
+    ):
+        _launch1(_gt_scalar_kernel, _gt_scalar_kernel_m, A, out, (_scalar_cast(A, B),), nest=True)
+        return out
+    return _c_greater_scalar_out(A, B, out=out)
+
+
+def less_equal(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_le_kernel, _le_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _en.less_equal(A, B)
+
+
+def less_equal_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_le_scalar_kernel, _le_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _en.less_equal_scalar(A, B)
+
+
+def less_equal_(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch_ip(_le_ip_kernel, _le_ip_kernel_m, A, B)
+    return _en.less_equal_(A, B)
+
+
+def not_equal(A, B):
+    if _fast_enabled() and _ok2(A, B):
+        return _launch2(_ne_kernel, _ne_kernel_m, A, B, torch.empty_like(A, dtype=torch.bool), nest=True)
+    return _c_not_equal(A, B)
+
+
+def not_equal_scalar(A, B):
+    if _sc_ok(A, B):
+        return _launch_s(_ne_scalar_kernel, _ne_scalar_kernel_m, A, _scalar_cast(A, B))
+    return _c_not_equal_scalar(A, B)

@@ -152,6 +152,42 @@ ge_scalar = _wrap(_c_ge_scalar)
 le = _wrap(_c_le)
 le_scalar = _wrap(_c_le_scalar)
 
+# --- wave2c additions (campaign 1013am): comparison/select family completion.
+# Fallback nested wrappers for the newly wired names (the fast modules load
+# after this one and override what they cover; everything here also serves as
+# the non-fast fallback path).
+from flag_gems.ops.ne import ne as _c_ne, ne_scalar as _c_ne_scalar  # noqa: E402
+from flag_gems.ops.ne_ import ne_ as _c_ne_, ne_scalar_ as _c_ne_scalar_  # noqa: E402
+from flag_gems.ops.le_ import le_ as _c_le_, le_scalar_ as _c_le_scalar_  # noqa: E402
+from flag_gems.ops.less_ import less_ as _c_less_, less_scalar_ as _c_less_scalar_  # noqa: E402
+from flag_gems.ops.less_equal import (  # noqa: E402
+    less_equal as _c_less_equal,
+    less_equal_scalar as _c_less_equal_scalar,
+)
+from flag_gems.ops.less_equal_ import (  # noqa: E402
+    less_equal_ as _c_less_equal_,
+    less_equal_scalar_ as _c_less_equal_scalar_,
+)
+from flag_gems.ops.not_equal_ import (  # noqa: E402
+    not_equal_ as _c_not_equal_,
+    not_equal_scalar_ as _c_not_equal_scalar_,
+)
+
+ne = _wrap(_c_ne)
+ne_scalar = _wrap(_c_ne_scalar)
+ne_ = _wrap(_c_ne_)
+ne_scalar_ = _wrap(_c_ne_scalar_)
+le_ = _wrap(_c_le_)
+le_scalar_ = _wrap(_c_le_scalar_)
+less_ = _wrap(_c_less_)
+less_scalar_ = _wrap(_c_less_scalar_)
+less_equal = _wrap(_c_less_equal)
+less_equal_scalar = _wrap(_c_less_equal_scalar)
+less_equal_ = _wrap(_c_less_equal_)
+less_equal_scalar_ = _wrap(_c_less_equal_scalar_)
+not_equal_ = _wrap(_c_not_equal_)
+not_equal_scalar_ = _wrap(_c_not_equal_scalar_)
+
 # --- clamp ------------------------------------------------------------------
 from flag_gems.ops.clamp import (  # noqa: E402
     clamp as _c_clamp,
