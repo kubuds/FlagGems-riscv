@@ -51,7 +51,13 @@ _LN_MIN_N = 1 << 15
 _LN_MAX_N = 8192
 # 16-bit carrier is a 128-lane streaming loop with a masked tail, so it does
 # not need the f32 block-size ceiling; the tests exercise N=40999.
-_LN16_MAX_N = 1 << 16
+# wave34 probe346: (16,8,128,128) normalizes over [8,128,128] = 131072
+# columns; the generic f16 kernel takes 29.4 ms there, the carrier 2.22 ms
+# (13x), so the ceiling moves to 262144.
+_LN16_MAX_N = 1 << 18
+# f32 above _LN_MAX_N also uses the streaming carrier (probe346: 5.14 -> 2.58
+# ms at (16,8,128,128) f32) because the f32 fast kernel would allocate a
+# next_power_of_2(n) accumulator.
 _SB2 = 512
 # wave15 probe133/134: AB=2048 loses 31% at 2048^2 (4.21 -> 2.90) and 28% at
 # 512x2048 (1.12 -> 0.80); 1024 and 512 tie within 1%.
@@ -96,7 +102,10 @@ def ln_fast_ok(input, normalized_shape, weight, bias) -> bool:
     # wave33: the 16-bit carrier is no longer capped at _LN_MAX_N - the
     # aligned kernel covers any N up to 65536 (official bench (16,8,128,128)
     # is N=16384) and the masked variant covers the rest.
-    nmax = _LN_MAX_N if input.dtype == torch.float32 else _LN16_MAX_N
+    # wave34: the official benchmark's 4-D shape (16,8,128,128) normalizes over
+    # [8,128,128] = 131072 columns, above the old 65536 ceiling; f32 above
+    # _LN_MAX_N now takes the same streaming carrier.
+    nmax = _LN16_MAX_N
     if n > nmax:
         return False
     if input.dim() < 1:
@@ -212,10 +221,13 @@ def _pick_k16(m: int, n: int) -> int:
     # wave32 probe322: K=32 wins at every 16-bit shape measured (512^2 0.712 ->
     # 0.422, 2048^2 3.04 -> 2.24, 8192x512 7.04 -> 4.88, 4096x1024 4.22 ->
     # 3.07 ms); more rows per program amortises the launch.
+    # wave34 probe346/348: rows/program also sets the grid, and M rows with a
+    # K=M launch leaves one program on eight cores - (16,8,128,128) N=131072
+    # ran 4.55 ms at K=16 against 2.22 ms at K=2. Keep at least 8 programs.
     k = 32
     while k > 1 and m % k:
         k //= 2
-    return k
+    return min(k, max(1, m // 8))
 
 
 @triton.jit
@@ -358,7 +370,7 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     ab = _AB if n >= _AB else triton.next_power_of_2(n)
     w_arg = weight if weight is not None else x2d
     b_arg = bias if bias is not None else x2d
-    if inp.dtype != torch.float32:
+    if inp.dtype != torch.float32 or n > _LN_MAX_N:
         k16 = _pick_k16(m, n)
         bn16 = min(_LN16_BN, triton.next_power_of_2(n))
         ab16 = _ln16_ab(n)
@@ -619,10 +631,12 @@ def _pick_dx_k16(m: int, n: int) -> int:
     # wave32 probe323: rows/program 32 for short rows, 16 for n>=2048
     # (512^2 0.575 -> 0.540, 8192x512 7.23 -> 6.96, 4096x1024 5.55 -> 5.25;
     # 512x4096 and 2048^2 tie within 1-3%).
+    # wave34 probe345: same grid effect as the forward - at (16,16384) K=16
+    # leaves one program and takes 1.453 ms against 0.752 ms at K=8.
     k = _LN16_BWD_K if n <= 1024 else 16
     while k > 1 and m % k:
         k //= 2
-    return k
+    return min(k, max(1, m // 8))
 
 
 @triton.jit
@@ -877,9 +891,17 @@ def ln_bwd_fast(
             # probe320 wb scan: ROWS=64 wins at all five shapes; the column
             # block prefers n itself at 512 and about n/2 above (2048^2 1024
             # 2.14 vs 2048 2.87; 512x4096 2048 1.05 vs 1024 ~1.1).
+            # wave34 probe345: above 8192 columns the block should keep
+            # growing - (16,16384) CB 1024/2048/4096/8192 = 0.593/0.471/
+            # 0.427/0.383 ms and (8,32768) 0.762/0.606/0.506/0.438 ms.
             rows = _DWDB_ROWS
             nn = triton.next_power_of_2(n)
-            cb = nn if n <= 512 else min(_DWDB_CB, nn // 2)
+            if n <= 512:
+                cb = nn
+            elif n >= 16384:
+                cb = min(8192, nn // 2)
+            else:
+                cb = min(_DWDB_CB, nn // 2)
         nrb = triton.cdiv(m, rows)
         pw = torch.empty(nrb, n, dtype=torch.float32, device=x.device)
         pb = torch.empty(nrb, n, dtype=torch.float32, device=x.device)

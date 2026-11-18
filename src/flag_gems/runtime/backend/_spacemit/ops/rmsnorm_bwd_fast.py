@@ -67,9 +67,52 @@ _DX_ROUTES = {
     1024: (4, 256),
     # wave33 probe340: N=16384 K2/T512 1.763 ms @64 rows, 5.331 @256 rows.
     16384: (2, 512),
+    # wave34 probe347: (4096,256) is the official accuracy shape and had no
+    # backward route; K8/T256 3.735 ms f16 / 3.684 f32 (K4 3.77/4.79).
+    256: (8, 256),
+    # wave34 probe343: N=32768 K2/T512 3.217 ms @64 rows f16 (K1 3.135, K4
+    # 3.192 - flat); at 8 rows K4 0.726, K2 0.805, K1 0.751.
+    32768: (2, 512),
+    # wave34 probe354: N=65536 K is flat (K1 76.99, K2 79.56, K4 78.23 ms at
+    # 1024 rows f16); dw BN 8192 is best (74.99 vs 80.14 at BN 2048).
+    65536: (2, 512),
 }
-_DW_BN = {512: 512, 1024: 1024, 2048: 512, 4096: 1024, 8192: 2048, 16384: 2048}
+_DW_BN = {
+    512: 512,
+    1024: 1024,
+    2048: 512,
+    4096: 1024,
+    8192: 2048,
+    16384: 2048,
+    # wave34 probe347: N=256 BN 256 beats 512 (3.735 vs 4.19 ms f16).
+    256: 256,
+    # wave34 probe343: at 64 rows BN 8192 is 3% ahead of 2048 (3.113 vs 3.218
+    # for the whole backward).
+    32768: 8192,
+    # wave34 probe354: N=65536 BN 8192 74.99 ms (BN 4096 76.11, 2048 80.14).
+    65536: 8192,
+}
 _DW_RB = 64
+
+# wave34 probe351: any N missing from the tables takes one masked route instead
+# of the generic kernels - (4096,4098) 147.5 -> 47.8 ms, (2048,3000) 76.2 ->
+# 15.3 ms (K4/T512, dw BN 1024; K2/K8/K16 and BN 256/512/2048 are 3-10%
+# worse). Same bounds as the forward wildcard: measured widths, M >= 32.
+_WILD_DX = (4, 512)
+_WILD_BN = 1024
+_WILD_MIN_N = 256
+_WILD_MAX_N = 1 << 14
+_WILD_MIN_M = 32
+
+
+def _routes(n: int, m: int):
+    """(dx K, dx TILE, dw BN) or None when the shape must fall back."""
+    ent = _DX_ROUTES.get(n)
+    if ent is not None:
+        return ent[0], ent[1], _DW_BN[n]
+    if _WILD_MIN_N <= n <= _WILD_MAX_N and m >= _WILD_MIN_M:
+        return _WILD_DX[0], _WILD_DX[1], _WILD_BN
+    return None
 
 
 def rmsb_fast_enabled() -> bool:
@@ -89,7 +132,9 @@ def rmsb_fast_ok(x, dy, inv_rms, weight) -> bool:
     if not x.is_contiguous() or not dy.is_contiguous() or not weight.is_contiguous():
         return False
     n = weight.numel()
-    if n not in _DX_ROUTES or x.numel() % n:
+    if x.numel() % n:
+        return False
+    if _routes(n, x.numel() // n) is None:
         return False
     if inv_rms is None or inv_rms.numel() < x.numel() // n:
         return False
@@ -185,7 +230,7 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
     """Launch the fast backward; returns (dx, dw). Caller must have checked ok()."""
     dx = torch.empty_like(x)
     inv = inv_rms.contiguous().reshape(-1)
-    k, tile = _DX_ROUTES[n]
+    k, tile, bn = _routes(n, m)
     while k > 1 and m % k:
         k //= 2
     nomask_dx = (n % tile) == 0
@@ -203,7 +248,6 @@ def rmsb_fast(x, dy, inv_rms, weight, n, m):
                 _rmsb_dx[grid](x, dy, weight, inv, dx, n, k, tile, nomask_dx)
         else:
             _rmsb_dx[grid](x, dy, weight, inv, dx, n, k, tile, nomask_dx)
-        bn = _DW_BN[n]
         prb = triton.cdiv(m, _DW_RB)
         pw = torch.empty((prb, n), dtype=torch.float32, device=x.device)
         _rmsb_dw_fold[(triton.cdiv(n, bn), prb)](

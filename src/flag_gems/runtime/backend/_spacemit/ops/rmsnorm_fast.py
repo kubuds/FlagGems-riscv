@@ -215,6 +215,17 @@ _ROUTES_F32 = {
     # wave33 probe340: official benchmark shapes (1,16384) and (64,16384).
     # K8/T512 f32 0.521 ms @64 rows, 1.901 @256 rows (K4 7-10% slower).
     16384: (8, 512),
+    # wave34 probe342: (4096,256) is the official accuracy shape that had no
+    # route; K32/T256 1.834 ms (K16 2.125, K8 2.813) at 4096 rows and 6.971 ms
+    # at 16384 rows.
+    256: (32, 256),
+    # wave34 probe343: N=32768 K8/T512 0.615 ms @64 rows f16 / 0.966 f32
+    # (K2 1.676 / 2.021); at 1 and 8 rows every K ties (0.13 / 0.28 ms).
+    32768: (8, 512),
+    # wave34 probe354: the official core shape (1024,65536) had no route -
+    # K8/T512 17.203 ms f16 (K2 50.3) and 32.787 f32 (K4 33.7); 1.151 at 64
+    # rows, 0.180 at 1 row (all K tie there).
+    65536: (8, 512),
 }
 _ROUTES_F16 = {
     512: (16, 256),
@@ -229,6 +240,15 @@ _ROUTES_F16 = {
     1024: (16, 256),
     # wave33 probe340: N=16384 K8/T512 0.407 ms @64 rows, 1.234 @256 rows.
     16384: (8, 512),
+    # wave34 probe342: N=256 K32/T256 1.722 ms f16 / 1.911 bf16 @4096 rows
+    # (K16 1.99 / 1.97, K8 2.76 / 2.94); 6.53 ms at 16384 rows.
+    256: (32, 256),
+    # wave34 probe343: N=32768 K8/T512 0.615 ms @64 rows f16 (K2 1.676);
+    # at 8 rows K2 0.279 vs K8 0.281 (tie).
+    32768: (8, 512),
+    # wave34 probe354: N=65536 K8/T512 17.203 ms at 1024 rows, 1.151 at 64,
+    # 0.180 at 1 (K4/T512 ties at 64 rows, K2 is 3x slower).
+    65536: (8, 512),
 }
 
 
@@ -239,12 +259,35 @@ def _pick_k(m: int, k0: int) -> int:
     return k
 
 
+# wave34 probe347: any N missing from the tables now takes one masked route
+# instead of the generic kernel. K16/T256 won at every odd width measured -
+# (4096,4098) f16 7.383 vs 81.8 generic (11.1x), (2048,3000) 2.879 vs 32.1
+# (11.1x), (2048,6000) 3.984 vs 61.4 (15.4x), (1024,12288) 3.717 vs 63.7
+# (17.1x); f32 1.9-3.9x. Gated to the measured range and to M >= 32 so the
+# multirow kernel is used (the row kernel was not measured for odd N).
+_WILDCARD = (16, 256)
+_WILD_MIN_N = 256
+_WILD_MAX_N = 1 << 14
+_WILD_MIN_M = 32
+
+
+def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
+    """True when rms_fast_launch would serve this shape (no allocation)."""
+    routes = _ROUTES_F16 if f16 else _ROUTES_F32
+    if routes.get(N) is not None:
+        return True
+    return _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M
+
+
 def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     ent = routes.get(N)
     if ent is None:
-        return False
+        if _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M:
+            ent = _WILDCARD
+        else:
+            return False
     k0, tile = ent
     if M < 2 * k0:
         row = _rms_row16 if f16 else _rms_row

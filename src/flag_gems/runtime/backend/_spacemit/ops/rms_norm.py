@@ -37,7 +37,7 @@ from .rmsnorm_bwd_fast import (
     rmsb_fast_enabled as _rmsb_fast_enabled,
     rmsb_fast_ok as _rmsb_fast_ok,
 )
-from .rmsnorm_fast import rms_fast_enabled, rms_fast_launch
+from .rmsnorm_fast import rms_fast_enabled, rms_fast_launch, rms_fast_route
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,11 @@ def _forward_fast(x, normalized_shape, weight, eps):
     if N <= 0 or x.numel() % N:
         return None
     M = x.numel() // N
+    # wave34: check the route before allocating - (64,64) is an official core
+    # shape with no route, and the two empty_like allocations alone cost ~12%
+    # of the generic op at that size (0.342 -> 0.390 ms).
+    if not rms_fast_route(M, N, f16=(x.dtype != torch.float32)):
+        return None
     y = torch.empty_like(x)
     inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
     with torch_device_fn.device(x.device):
