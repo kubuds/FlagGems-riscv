@@ -656,6 +656,33 @@ class Attention(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(head_dim_k)
 
+        # GQA head packing: GROUP_SIZE query heads share one K/V head, and the
+        # rows a short query leaves empty in the M tile (decode pads 1 real row
+        # up to 8) are exactly the rows the other heads of the group can fill.
+        # A (b, H_Q, nq, d) contiguous query is (b, H_KV, GROUP_SIZE*nq, d) with
+        # the packed rows being (head, query) pairs, so this is a pure re-view:
+        # each packed row keeps its own score row, only K/V is shared, which is
+        # what GQA already guarantees.  Plain only: the causal mask derives each
+        # row key bound from its query position, and packing would move rows to
+        # another position (q_len 1 packs to rows 0..G-1).
+        if (
+            not is_causal
+            and group_size > 1
+            and q.is_contiguous()
+            and q.shape[2] * group_size <= 32
+            and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK", 1) != 0
+        ):
+            b, hq, nq, hd = q.shape
+            out = _launch(
+                q.view(b, h_kv, group_size * nq, hd),
+                k,
+                v,
+                float(sm_scale),
+                is_causal,
+                1,
+            )
+            return out.view(b, hq, nq, hd)
+
         return _launch(q, k, v, float(sm_scale), is_causal, group_size)
 
 
