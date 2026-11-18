@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wave22: generic p-norm carriers for ord in {4, -1, -2, -3, -4}.
+"""wave22/23: generic p-norm carriers for ord in {4, -1, -2, -3, -4}.
 
-The wave18/19 carriers cover ord 0/1/2/3/inf/-inf only; every other ord falls
-into the generic flag_gems kernel, which lowers its (BLOCK_M, BLOCK_N) tile
-reduce elementwise-scalar (0.06-0.16x torch on the row shapes, probe162).
+wave22 added the carriers with a plain `1.0 / x`, which lowers to a scalar
+division at ~5.5 ns/element inside a reduction loop (probe202) and kept the
+negative orders at 1-4x torch.
 
-Same narrow-carrier structure as norm_fast: one program per K rows, a vector
-accumulator, a single final reduce per row, then the p-th root in scalar form.
-Negative orders accumulate 1/|v|^p and invert at the end, so a zero in the row
-gives 1/0 = inf -> sum inf -> root inf -> 1/inf = 0, which is what torch
-returns.  Masked lanes load +inf for the negative orders (1/inf = 0) and 0 for
-the positive ones, so padding never contributes.
+wave23 replaces that division with a bit-trick seed plus two Newton steps
+(`fastmath.recip_fast`, probe205: 1.60 -> 0.51 ns/element standalone, max
+relative error 6.7e-6).  Exact zeros still return +inf (-> 1/inf = 0, matching
+torch) and masked lanes still load +inf.
 """
 
 import os
@@ -31,6 +29,8 @@ import os
 import torch
 import triton
 import triton.language as tl
+
+from .fastmath import recip_fast
 
 _POW_ROWS_K = 8
 _POW_BLOCK = 2048
@@ -64,7 +64,7 @@ def _root(s, P: tl.constexpr):
 
 @triton.jit
 def _lp_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr,
-             P: tl.constexpr, NEG: tl.constexpr):
+             P: tl.constexpr, NEG: tl.constexpr, RF: tl.constexpr):
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     for i in tl.static_range(K):
@@ -77,7 +77,7 @@ def _lp_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr,
             mk = (idx < N) & rmask
             if NEG:
                 v = tl.load(X + base + idx, mask=mk, other=float("inf")).to(tl.float32)
-                acc += 1.0 / _pw(v, P)
+                acc += recip_fast(_pw(v, P), RF)
             else:
                 v = tl.load(X + base + idx, mask=mk, other=0.0).to(tl.float32)
                 acc += _pw(v, P)
@@ -91,7 +91,7 @@ def _lp_rows(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr,
 
 @triton.jit
 def _lp_flat_stage1(X, Mid, M, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
-                    P: tl.constexpr, NEG: tl.constexpr):
+                    P: tl.constexpr, NEG: tl.constexpr, RF: tl.constexpr):
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     acc = tl.zeros([BLOCK], dtype=tl.float32)
@@ -99,7 +99,7 @@ def _lp_flat_stage1(X, Mid, M, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
         idx = pid.to(tl.int64) * CHUNK + off + cols
         if NEG:
             v = tl.load(X + idx, mask=idx < M, other=float("inf")).to(tl.float32)
-            acc += 1.0 / _pw(v, P)
+            acc += recip_fast(_pw(v, P), RF)
         else:
             v = tl.load(X + idx, mask=idx < M, other=0.0).to(tl.float32)
             acc += _pw(v, P)
@@ -127,6 +127,10 @@ def lp_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_NORM_FAST", "1") != "0"
 
 
+def _recip_flag() -> int:
+    return 0 if os.environ.get("FLAGGEMS_SPACEMIT_FASTMATH_RECIP", "1") == "0" else 1
+
+
 def _row_block(N):
     if N >= 4096:
         return 2048
@@ -138,7 +142,8 @@ def lp_rows_launch(x, out, M, N, P, NEG) -> bool:
         return False
     k = _POW_ROWS_K if M % _POW_ROWS_K == 0 else 1
     bn = _row_block(N)
-    _lp_rows[(triton.cdiv(M, k),)](x, out, M, N, K=k, BLOCK_N=bn, P=P, NEG=NEG)
+    _lp_rows[(triton.cdiv(M, k),)](x, out, M, N, K=k, BLOCK_N=bn, P=P, NEG=NEG,
+                                   RF=_recip_flag())
     return True
 
 
@@ -148,7 +153,7 @@ def lp_flat_launch(x, out, numel, P, NEG) -> bool:
     nb = triton.cdiv(numel, _POW_FLAT_CHUNK)
     mid = torch.empty((nb,), dtype=torch.float32, device=x.device)
     _lp_flat_stage1[(nb,)](x, mid, numel, CHUNK=_POW_FLAT_CHUNK, BLOCK=_POW_FLAT_BLOCK,
-                           P=P, NEG=NEG)
+                           P=P, NEG=NEG, RF=_recip_flag())
     _lp_flat_stage2[(1,)](mid, out, nb, BLOCK=min(_POW_FLAT_BLOCK, triton.next_power_of_2(nb)),
                           P=P, NEG=NEG)
     return True

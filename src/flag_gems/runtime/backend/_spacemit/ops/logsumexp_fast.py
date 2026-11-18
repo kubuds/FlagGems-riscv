@@ -260,7 +260,10 @@ def logsumexp_mid_launch(x, out, A, B, C) -> bool:
         bn = _MID_BN_SMALL if C <= 128 else _MID_BN
     else:
         bn = _MID_BN_LARGE if C >= 2048 else _MID_BN
-    rb = _MID_RB_BIG if B >= 64 else _MID_RB
+    # wave23: B=32 wants RB=32 (probe211: 64x32x1024 BN=256 RB=8 3.290 ->
+    # RB=32 3.035 ms); B=16 wants 16, B=8 keeps 8.  B>=64 stays at 16: the
+    # 32-row unroll only buys 2.5% on 8x128x64x64 and costs registers.
+    rb = _MID_RB_BIG if B >= 64 else (32 if B >= 32 else (16 if B >= 16 else _MID_RB))
     if f32 and C % bn == 0 and B % rb == 0:
         _lse_mid_u[(A, C // bn)](x, out, B, C, BN=bn, RB=rb, DEG=_poly_deg())
         return True
@@ -285,13 +288,13 @@ def logsumexp_rows_launch(x, out, M, N) -> bool:
         block, u = _ROWS_BLOCK_F16, 1
     if N % (block * u) == 0 and M % _ROWS == 0:
         _lse_rows_u[(M // _ROWS,)](
-            x, out, M, N, K=_ROWS, BLOCK=block, U=u, DEG=_poly_deg(),
+            x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK=block, U=u, DEG=_poly_deg(),
             TAIL=False, RMASK=False,
         )
         return True
     block = _BLOCK_SMALL if N <= 1024 else _BLOCK_LARGE
     block = min(block, triton.next_power_of_2(N))
-    _lse_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=block, DEG=_poly_deg())
+    _lse_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=block, DEG=_poly_deg())
     return True
 
 

@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.softmax import softmax_backward as common_softmax_backward
+from flag_gems.ops.softmax import softmax_out as common_softmax_out
 from flag_gems.ops.softmax import (
     softmax_backward_out as common_softmax_backward_out,
 )
@@ -203,3 +204,36 @@ def softmax_backward_out(grad_output, output, dim, input_dtype, *, grad_input):
     return common_softmax_backward_out(
         grad_output, output, dim, input_dtype, grad_input=grad_input
     )
+
+
+# wave23: vendor softmax_out.  The generic implementation only knows the
+# row-per-program inner kernel (single core at 1024^3: 12 min, probe207) and a
+# non-inner kernel that parallelises ~1 core as well.  Route the last-dim case
+# through the same fast kernel as softmax(), and wrap the non-inner fallback in
+# nested dispatch (probe207: 64x512x512 376.7 -> 95.0 ms, 3.96x; gain appears
+# only when K/TILE_K == 1, i.e. TILE_K covers the contiguous dim, which is what
+# the heuristic already picks for these shapes).
+def softmax_out(self, dim, half_to_float=False, *, out):
+    assert dim >= -self.ndim and dim < self.ndim, "Invalid dim"
+    if self.numel() == 0:
+        if tuple(out.shape) != tuple(self.shape):
+            out.resize_(self.shape)
+        out.zero_()
+        return out
+    dim = dim % self.ndim
+    dtype = torch.float32 if half_to_float else self.dtype
+    if tuple(out.shape) != tuple(self.shape):
+        out.resize_(self.shape)
+    if out.dtype != dtype:
+        raise RuntimeError(f"_softmax.out: expected out dtype {dtype}, got {out.dtype}")
+    if out.device != self.device:
+        raise RuntimeError("_softmax.out: out must be on the input device")
+    inp = self.contiguous()
+    if dim == inp.ndim - 1 and out.is_contiguous():
+        n_cols = inp.shape[-1]
+        n_rows = inp.numel() // n_cols
+        _spacemit_softmax_lastdim(inp.view(n_rows, n_cols), out.view(n_rows, n_cols))
+        return out
+    logger.debug("GEMS_SPACEMIT SOFTMAX_OUT (non-inner)")
+    with nested_dispatch(self.numel()):
+        return common_softmax_out(self, dim, half_to_float, out=out)

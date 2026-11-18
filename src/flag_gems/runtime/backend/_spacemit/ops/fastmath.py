@@ -71,3 +71,30 @@ def fastmath_exp_enabled() -> bool:
 def exp_flag() -> int:
     """constexpr FAST argument for exp_fast at launch time."""
     return 1 if fastmath_exp_enabled() else 0
+
+# wave23: reciprocal without the slow scalar division.
+# probe205 (1M f32 standalone): 1.0/x 1.60 ns/elem; bit-trick seed + 2 Newton
+# 0.51 ns/elem with max relative error 6.7e-6 (3 Newton: 0.55 ns, 1.8e-7).
+# The clamp is a select, not fmax, so NaN propagates; exact zero still yields
+# +inf (a zero in a negative-order norm poisons the row to 0, as torch does)
+# and +inf yields 0 (masked lanes load +inf).
+@triton.jit
+def recip_fast(x, FAST: tl.constexpr):
+    if FAST == 0:
+        return 1.0 / x
+    xc = tl.where(x < 1.0e-38, 1.0e-38, x)
+    r = (0x7EF311C3 - xc.to(tl.int32, bitcast=True)).to(tl.float32, bitcast=True)
+    r = r * (2.0 - xc * r)
+    r = r * (2.0 - xc * r)
+    r = tl.where(x == 0.0, float("inf"), r)
+    r = tl.where(x == float("inf"), 0.0, r)
+    return r
+
+
+def fastmath_recip_enabled() -> bool:
+    return os.environ.get("FLAGGEMS_SPACEMIT_FASTMATH_RECIP", "1") != "0"
+
+
+def recip_flag() -> int:
+    """constexpr FAST argument for recip_fast at launch time."""
+    return 1 if fastmath_recip_enabled() else 0

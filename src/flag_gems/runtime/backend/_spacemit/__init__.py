@@ -22,6 +22,10 @@ if importlib.util.find_spec("triton.backends.spine_triton") is not None:
 
     setup_triton_config()
 
+    from .malloc_tune import apply_malloc_tune
+
+    apply_malloc_tune()
+
     import triton  # noqa: E402
     from triton.backends.spine_triton.driver import CPUDriver  # noqa: E402
 

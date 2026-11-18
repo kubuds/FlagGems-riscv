@@ -406,21 +406,21 @@ def _row_block(N):
 def norm_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _l2_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _l2_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
 def l1_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _l1_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _l1_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
 def linf_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _linf_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _linf_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
@@ -495,21 +495,21 @@ def l0_flat_launch(x, out, numel) -> bool:
 def l0_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _l0_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _l0_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
 def l3_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _l3_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _l3_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
 def lneg_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
-    _lneg_rows[(triton.cdiv(M, _ROWS),)](x, out, M, N, K=_ROWS, BLOCK_N=_row_block(N))
+    _lneg_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=_row_block(N))
     return True
 
 
