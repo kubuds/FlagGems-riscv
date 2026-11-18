@@ -1009,6 +1009,15 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
     # PWW-OW columns of every row are computed and thrown away at the crop
     MY = OH * PWW
     bm, bn = _tap_tiles(OC, MY, CP)
+    # wave81: port the 1x1..4x4 output rule from the tap kernel (wave79/80).
+    # The phase route still ran a 64-wide block under a 64-wide micro tile for
+    # an output of at most four columns, i.e. 32-64x of the MACs were padding.
+    mn = 64
+    if (MY <= 16 and CP <= 1024
+            and os.environ.get("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
+        bm = min(64, max(32, OCP))
+        bn = 32
+        mn = 32
     bm = min(bm, OCP)      # wave80: thin OC pads to 8/16 rows, not 32
     MYP = ((MY + bn - 1) // bn) * bn
     at = _tap_weights(weight, CP, OCP)
@@ -1045,7 +1054,7 @@ def _conv_tap_phase(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                 at, flat, bias if bias is not None else at, yext, OCP,
                 OC if bias is not None else 0, CP, MYP, PWW, PLANE, CSTR,
                 BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
-                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                MICRO_M=8, MICRO_N=mn, MICRO_K=32, HAS_BIAS=(bias is not None),
                 SH=SH, SW=SW, DILH=dil_h, DILW=dil_w)
 
         _launch()
@@ -1178,6 +1187,14 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
         # 16 (32*1024*4 = 128 KB against the 96 KB TCM), CP 2048 at 8.
         bn = 128
         bm = 32 if CP <= 512 else (16 if CP <= 1024 else 8)
+    # wave81: the 1x1..4x4 output rule from the tap kernel applies to the
+    # grouped phase route too - a 32-wide block with a 64-wide micro tile
+    # computes 64 columns for at most 16 real ones.
+    mn = 64
+    if (MY <= 16 and CP <= 1024
+            and os.environ.get("FLAGGEMS_SPACEMIT_PH_TINY", "1") == "1"):
+        bn = 32
+        mn = 32
     # wave75: scan knobs for the grouped phase tile (CP 32/64 was tuned in
     # wave74; a CP >= 256 group carries a much wider B block).
     bm = int(os.environ.get("FLAGGEMS_SPACEMIT_PH_G_BM", "0")) or bm
@@ -1234,7 +1251,7 @@ def _conv_tap_phase_g(input, weight, bias, OH, OW, pad_h, pad_w, KH, KW, SH, SW,
                 at, flat, bias if bias is not None else at, yext, OCP, OCG, CP,
                 MYP, PWW, PLANE, CSTR, KH * KW * OCP * CP, OCP * MYP, OCG,
                 BLOCK_M=bm, BLOCK_N=bn, KH=KH, KW=KW,
-                MICRO_M=8, MICRO_N=64, MICRO_K=32, HAS_BIAS=(bias is not None),
+                MICRO_M=8, MICRO_N=mn, MICRO_K=32, HAS_BIAS=(bias is not None),
                 SH=SH, SW=SW, DILH=dil_h, DILW=dil_w)
 
         _launch()
@@ -2151,6 +2168,92 @@ def tap_shift_applies(n, c, oc, oh, ow, kh, kw, groups=1,
                 and os.environ.get("FLAGGEMS_SPACEMIT_CONV_TAP5", "1") != "0"))
 
 
+_DENSE_G = {}
+
+
+def _dense_group_weight(weight, groups):
+    """wave81: block-diagonal dense weight for a very thin grouped conv.
+
+    A group thinner than the 32-lane dot floor turns a grouped GEMM into a
+    padded one: with CG=4 the K block reads 32 channels of which 4 are real,
+    and the B stream is reread per group.  Writing the same convolution as one
+    dense conv whose weight is block diagonal (zeros off the group blocks)
+    replaces groups*OCP*CP with OC_pad*C_pad MACs and lets the A block carry
+    every output row over one B read.  The zeros contribute nothing, so the
+    result is exact; the price is a dense weight tensor, small exactly where
+    this route applies (CG < 8).
+    """
+    key = (weight.data_ptr(), tuple(weight.shape), groups)
+    ent = _DENSE_G.get(key)
+    if ent is not None and ent[0]() is weight and ent[1] == weight._version:
+        return ent[2]
+    OC, CG, KH, KW = weight.shape
+    C = CG * groups
+    dense = torch.zeros((OC, C, KH, KW), dtype=weight.dtype,
+                        device=weight.device)
+    for g in range(groups):
+        dense[g * (OC // groups):(g + 1) * (OC // groups),
+              g * CG:(g + 1) * CG] = weight[
+                  g * (OC // groups):(g + 1) * (OC // groups)]
+    if len(_DENSE_G) >= 4:
+        _DENSE_G.pop(next(iter(_DENSE_G)))
+    _DENSE_G[key] = (weakref.ref(weight), weight._version, dense)
+    return dense
+
+
+def dense_g_applies(n, c, oc, oh, ow, kh, kw, sh, sw, groups, dil_h=1,
+                    dil_w=1) -> bool:
+    """wave81: grouped conv so thin that a dense block-diagonal weight wins.
+
+    The grouped phase/tap kernels floor the channel block at 32 rows, so a
+    CG < 8 group spends 4-16x its real lanes and rereads the same B planes once
+    per group.  One dense conv over the full channel axis removes both, at the
+    cost of groups x more MACs in principle - but the floor makes the dense
+    count the smaller one whenever OC_pad*C_pad < groups*OCP*CP.  Measured
+    wins, interleaved A/B in one process, ms: g16 c64 3x3 s2 56 6.19 -> 2.86
+    (2.16x), g32 c64 3x3 s2 28 10.66 -> 1.72 (6.19x), g16 c32 3x3 s2 28
+    5.38 -> 1.18 (4.57x), g16 c64 3x3 s1 56 26.54 -> 5.33 (4.98x), g16 c64
+    3x3 s2 112 22.69 -> 9.72 (2.33x), g32 c64 3x3 s2 56 10.79 -> 2.79 (3.87x).
+    FLAGGEMS_SPACEMIT_CONV_DENSEG=0 pins the grouped kernels for A/B.
+    """
+    if groups <= 1 or groups >= c or groups >= oc or c % groups or oc % groups:
+        return False
+    if kh * kw < 9 or dil_h != dil_w:
+        return False
+    if os.environ.get("FLAGGEMS_SPACEMIT_CONV_DENSEG", "1") == "0":
+        return False
+    cg, ocg = c // groups, oc // groups
+    if not (1 <= cg < 8):
+        return False
+    # a dense dot with fewer than 32 output rows leaves the A100 lanes idle:
+    # g16 c64 3x3 s2 56 with OC=16 measured 20.75 against 20.82 grouped (a tie,
+    # not a win), while the same shape at OC=32 is 2.2x.  Below 32 rows the
+    # grouped kernel is as good, so do not pay the dense weight build.
+    if oc < 32:
+        return False
+    if oc * c * kh * kw * 4 > (8 << 20):
+        return False
+    cp = triton.next_power_of_2(c)
+    dense_mac = _oc_pad(oc) * cp
+    grouped_mac = groups * _oc_pad(ocg) * max(32, triton.next_power_of_2(cg))
+    if dense_mac > grouped_mac:
+        return False
+    if n * oc * oh * ow * kh * kw * c < (1 << 20):
+        return False
+    if sh * sw > 4:
+        return False
+    # the dense rewrite only pays when the resulting single-group shape lands on
+    # a fast kernel; anything below the lane/MAC floors would fall back to the
+    # generic conv and lose the grouped route's advantage (g8 c32 3x3 s2 28
+    # dense landed under the 1<<20 floor and measured 3.10 against 3.05).
+    if sh > 1 or sw > 1 or dil_h > 1:
+        if not conv_phase_applies(n, c, oc, oh, ow, kh, kw, sh, sw):
+            return False
+    elif not tap_shift_applies(n, c, oc, oh, ow, kh, kw, 1, dil_h, dil_w):
+        return False
+    return True
+
+
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
                   BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None,
                   dil_h=1, dil_w=1, _out_dtype=None):
@@ -2177,6 +2280,16 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
                                  C, KH, KW, dil_h=dil_h, dil_w=dil_w)
     if C != CG * groups or OC % groups:
         raise NotImplementedError("channel counts do not divide by groups")
+    # wave81: CG below the lane floor goes dense (block-diagonal weight, one
+    # launch over the whole channel axis).  Everything below this point is a
+    # grouped route; the dense rewrite is exact and hands the shape back to the
+    # single-group tap/phase pickers, so it must run before them.
+    if (groups > 1 and dense_g_applies(N, C, OC, OH, OW, KH, KW, SH, SW,
+                                       groups, dil_h, dil_w)):
+        return conv2d_direct(input, _dense_group_weight(weight, groups), bias,
+                             pad_h, pad_w, OH, OW, SH, SW, 1,
+                             BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
+                             dil_h=dil_h, dil_w=dil_w, _out_dtype=_out_dtype)
     # wave77: grouped 1x1 stride-1 pad-0 pointwise conv as one grouped GEMM.
     # The class had no GEMM route (the 1x1 route below requires groups == 1)
     # and ran the 32-lane group kernel at 0.96-2.97x official; on the phase
