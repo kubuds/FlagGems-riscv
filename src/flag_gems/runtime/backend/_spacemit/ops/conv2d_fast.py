@@ -72,11 +72,22 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
         # wave64: the 7x7 / C<=8 stem has no usable vendor path at all in half
         # precision - f16 measured 372 ms at (1,3,224,224)->64 against 13.8 ms
         # on the f32 stem route - so it takes an f32 carrier instead of falling
-        # back.  Everything else in half precision stays on the vendor path.
-        return (x.dtype in (torch.float16, torch.bfloat16)
-                and w.dtype == x.dtype and groups == 1
-                and kh == 7 and kw == 7 and c <= 8
-                and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
+        # back.
+        # wave65: bf16 conv has no working vendor kernel in this wheel at all
+        # (spine-opt aborts with exit 134 on 3x3 c64, 1x1 c256 and C=16, with
+        # the fast gate on or off), so every bf16 shape the f32 rules accept
+        # takes the same carrier.  f16 turned out to be 1.5-54x slower on the
+        # vendor path than on the f32 tap kernel (3x3 46->15 ms, depthwise
+        # 521->9.7), so the carrier is the default there too;
+        # FLAGGEMS_SPACEMIT_CONV_F16_CARRIER=0 keeps the vendor path.
+        if w.dtype != x.dtype or x.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if x.dtype == torch.float16:
+            if os.environ.get("FLAGGEMS_SPACEMIT_CONV_F16_CARRIER", "1") != "1":
+                return (groups == 1 and kh == 7 and kw == 7 and c <= 8
+                        and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM_F16", "1") != "0")
+        elif os.environ.get("FLAGGEMS_SPACEMIT_CONV_BF16_CARRIER", "1") == "0":
+            return False
     dwise = (groups == c == oc)
     if groups != 1 and not dwise:
         # wave57: grouped conv ran as g independent (c/g -> oc/g) problems, one
@@ -109,9 +120,13 @@ def conv_fast_applies(x, w, stride, dilation, groups) -> bool:
     # depthwise has a much lower launch floor: the vendor path pads 1 input
     # channel to 16 and copies the whole tensor, so even a 512x7x7 depthwise
     # costs 86 ms there (wave56 probe933 measured 14-35x on every shape)
-    if macs < ((1 << 14) if dwise else (1 << 20)):
+    # wave65: half precision has no vendor fallback at all (bf16 aborts, f16 is
+    # 3-60x slower there), so its floor is the launch cost only - 0.78 ms of tap
+    # kernel at (1,16,20,20) against 2.9 ms of vendor f32 and 4.6 of vendor f16.
+    if macs < ((1 << 12) if x.dtype != torch.float32
+               else (1 << 14) if dwise else (1 << 20)):
         return False
-    if ww < (4 if dwise else 8):
+    if ww < (4 if (dwise or x.dtype != torch.float32) else 8):
         return False
     return True
 
@@ -705,7 +720,8 @@ def _stem_buf(kpad, M, K, dtype, device):
     return buf
 
 
-def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
+def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
+                      out_dtype=None):
     """wave62: a 7x7 stride-2 first layer with C<=8 through a buffered im2col.
 
     The tap kernel is the wrong shape for this layer: it pads C=3 to 16 and
@@ -751,7 +767,11 @@ def _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w):
         w2a = w2b = None
         w2 = torch.zeros((OC, kpad), dtype=weight.dtype, device=weight.device)
         w2[:, :K] = wp
-    y = torch.empty((N, OC, OH, OW), dtype=input.dtype, device=input.device)
+    # wave65: the half-precision carrier computes in f32 but stores its result
+    # in the caller's dtype; writing 12.8 MB of f32 and copying it to half cost
+    # ~1.5 ms of the stem's 15.7, and the GEMM already casts on store.
+    y = torch.empty((N, OC, OH, OW), dtype=out_dtype or input.dtype,
+                    device=input.device)
     bc = 4 if C <= 4 else (8 if C <= 8 else 16)
     bm = 32 if M >= 4096 else 64
     # probe1011: the GEMM is bound by the 12.8 MB buffer read, so the widest
@@ -892,9 +912,25 @@ def _conv_group_launch(x, weight, bias, y, OH, OW, SH, SW, groups,
 
 
 def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=1,
-                  BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None):
+                  BLOCK_OW=None, BLOCK_OC=None, ROWS=None, BLOCK_C=None,
+                  _out_dtype=None):
     N, C, H, W = input.shape
     OC, CG, KH, KW = weight.shape
+    if input.dtype != torch.float32:
+        # wave65 carrier: half precision never enters the f32 kernels.  For
+        # bf16 this is the only working route in the wheel (the vendor conv
+        # aborts in spine-opt), and for the f16 stem it is 25x faster than the
+        # vendor path.  Only the two boundaries convert: input 0.8 MB and
+        # output 0.8 MB at (1,64,56,56), weight a few KB.
+        if os.environ.get("FLAGGEMS_SPACEMIT_CONV_CARRIER", "1") != "0":
+            y = conv2d_direct(input.float(), weight.float(),
+                              bias.float() if bias is not None else None,
+                              pad_h, pad_w, OH, OW, SH, SW, groups,
+                              BLOCK_OW, BLOCK_OC, ROWS, BLOCK_C,
+                              _out_dtype=(None if os.environ.get(
+                                  "FLAGGEMS_SPACEMIT_CONV_STEM_OUT32", "0") == "1"
+                                  else input.dtype))
+            return y if y.dtype == input.dtype else y.to(input.dtype)
     if groups == C == OC:
         return _depthwise_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH, SW, C, KH, KW)
     if C != CG * groups or OC % groups:
@@ -920,14 +956,15 @@ def conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW, SH=1, SW=1, groups=
     if (groups == 1 and C <= 8 and KH == 7 and KW == 7
             and os.environ.get("FLAGGEMS_SPACEMIT_CONV_STEM", "1") != "0"):
         if input.dtype != torch.float32:
-            # wave64 carrier: half precision never enters the stem kernels, so
-            # the patch-matrix build and the smt dot stay f32 and only the
-            # boundaries convert (input 0.4 MB, output 12.8 MB f32 -> half).
+            # wave64 carrier, only reachable with the top-level carrier off:
+            # half precision never enters the stem kernels, so the build and the
+            # smt dot stay f32 and the output converts afterwards.
             y = _conv_stem_im2col(input.float(), weight.float(),
                                   bias.float() if bias is not None else None,
                                   OH, OW, SH, SW, pad_h, pad_w)
             return y.to(input.dtype)
-        return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w)
+        return _conv_stem_im2col(input, weight, bias, OH, OW, SH, SW, pad_h, pad_w,
+                                 out_dtype=_out_dtype)
     x = input.contiguous()
     if pad_h or pad_w:
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h))
