@@ -36,6 +36,9 @@ from .mv import mv
 from .native_layer_norm import layer_norm_backward, native_layer_norm
 from .log_softmax import log_softmax, log_softmax_out
 from .prod import prod, prod_dim
+from .logsumexp import logsumexp
+from .norm import norm, norm_scalar, norm_scalaropt_dim
+from .vector_norm import vector_norm
 from .pow import (
     pow_scalar,
     pow_tensor_scalar,
@@ -250,6 +253,11 @@ __all__ = [
     "log_softmax_out",
     "prod",
     "prod_dim",
+    "logsumexp",
+    "norm",
+    "norm_scalar",
+    "norm_scalaropt_dim",
+    "vector_norm",
     "mm",
     "min_dim",
     "mm_out",

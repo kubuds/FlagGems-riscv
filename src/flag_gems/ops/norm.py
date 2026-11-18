@@ -321,7 +321,9 @@ def norm(x, p=2, dim=None, keepdim=False):
             else:
                 v_norm_kernel[grid](x, out, M, N, p)
     if not keepdim:
-        out = out.squeeze(dim=dim)
+        # spacemit torch raises on squeeze(dim=None); squeeze() keeps the
+        # torch.norm(x, p) contract of a 0-dim result.
+        out = out.squeeze() if dim is None else out.squeeze(dim=dim)
     return out
 
 

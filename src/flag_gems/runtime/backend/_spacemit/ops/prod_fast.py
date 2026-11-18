@@ -49,6 +49,7 @@ import triton
 import triton.language as tl
 
 _ROWS_LOOP = 8
+_ROWS_NM = 16
 _LOOP_BLOCK = 64
 _MIN_N = 64
 _FLAT_CHUNK = 8192
@@ -77,6 +78,24 @@ def _prod_rows_loop(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
             v = tl.load(X + base + idx, mask=m, other=1.0).to(tl.float32)
             acc = acc * v
         tl.store(Out + r, tl.reduce(acc, axis=0, combine_fn=_mul).to(Out.dtype.element_ty), mask=rmask)
+
+
+@triton.jit
+def _prod_rows_nm(X, Out, M, N, K: tl.constexpr, BLOCK_N: tl.constexpr):
+    """No-mask row kernel (wave18): requires N % BLOCK_N == 0, M % K == 0.
+
+    probe160: dropping the per-iteration row/column masks is worth 20-27% on
+    the row-heavy shapes (8192x512 6.17 -> 4.85 ms, 4096x1024 4.05 -> 3.03).
+    """
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    for i in tl.static_range(K):
+        r = pid * K + i
+        base = r.to(tl.int64) * N
+        acc = tl.full([BLOCK_N], value=1.0, dtype=tl.float32)
+        for off in range(0, N, BLOCK_N):
+            acc = acc * tl.load(X + base + off + cols)
+        tl.store(Out + r, tl.reduce(acc, axis=0, combine_fn=_mul).to(Out.dtype.element_ty))
 
 
 @triton.jit
@@ -138,6 +157,9 @@ def prod_rows_launch(x, out, M, N) -> bool:
     if M <= 0 or N < _MIN_N:
         return False
     block = min(_LOOP_BLOCK, triton.next_power_of_2(N))
+    if N % block == 0 and M % _ROWS_NM == 0:
+        _prod_rows_nm[(M // _ROWS_NM,)](x, out, M, N, K=_ROWS_NM, BLOCK_N=block)
+        return True
     _prod_rows_loop[(triton.cdiv(M, _ROWS_LOOP),)](x, out, M, N, K=_ROWS_LOOP, BLOCK_N=block)
     return True
 
@@ -148,7 +170,7 @@ def prod_flat_launch(x, out, numel) -> bool:
     nblk = triton.cdiv(numel, _FLAT_CHUNK)
     mid = torch.empty((nblk,), dtype=torch.float32, device=x.device)
     _prod_flat_stage1[(nblk,)](x, mid, numel, CHUNK=_FLAT_CHUNK, BLOCK=_FLAT_BLOCK)
-    _prod_flat_stage2[(1,)](mid, out, nblk, BLOCK=triton.next_power_of_2(min(nblk, 1024)))
+    _prod_flat_stage2[(1,)](mid, out, nblk, BLOCK=max(32, triton.next_power_of_2(min(nblk, 1024))))
     return True
 
 
