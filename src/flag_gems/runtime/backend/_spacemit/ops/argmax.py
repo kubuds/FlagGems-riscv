@@ -68,7 +68,19 @@ def _argmax_dim0_s2(PV, PI, OUT, K, NRB, BN: tl.constexpr):
     tl.store(OUT + cols, idx.to(tl.int64), mask=cm)
 
 
-_ARGM0_RB = 128
+_ARGM0_RB = 128  # default; per-shape value from _dim0_rb(N)
+
+
+def _dim0_rb(N: int) -> int:
+    """wave14: row-block size for the dim=0 fold table. probe125 scan:
+    N=256 -> 64 (3.92 ms vs 7.22 at 128), N=512 -> 128, N>=1024 -> 256
+    (14.36 vs 14.67 @1024x4096; 15.19 vs 15.69 @8192x512)."""
+    rb = N // 4
+    if rb < 64:
+        rb = 64
+    if rb > 256:
+        rb = 256
+    return rb
 
 
 def _argmax_dim0(inp, N, K):
@@ -79,13 +91,14 @@ def _argmax_dim0(inp, N, K):
         bn = 512
     else:
         bn = 1024
-    nrb = triton.cdiv(N, _ARGM0_RB)
+    rb = _dim0_rb(N)
+    nrb = triton.cdiv(N, rb)
     nblk = triton.cdiv(K, bn)
     pv = torch.empty(nrb, K, dtype=torch.float32, device=inp.device)
     pi = torch.empty(nrb, K, dtype=torch.int32, device=inp.device)
     out = torch.empty(K, dtype=torch.int64, device=inp.device)
     with torch_device_fn.device(inp.device):
-        _argmax_dim0_s1[(nrb, nblk)](inp, pv, pi, N, K, _ARGM0_RB, bn)
+        _argmax_dim0_s1[(nrb, nblk)](inp, pv, pi, N, K, rb, bn)
         _argmax_dim0_s2[(nblk,)](pv, pi, out, K, nrb, bn)
     return out
 
