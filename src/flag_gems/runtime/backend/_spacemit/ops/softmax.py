@@ -400,6 +400,24 @@ def _softmax_nonlast(inp, out, dim):
     return out
 
 
+def _sm_rows(n_rows: int) -> int:
+    """Rows per resident-row program (wave48).
+
+    probe613: below 128 rows the old rule always launched one row per program,
+    so a 16-row 4096-column tensor became 16 single-row programs and left the
+    three-pass kernel within 1.4x.  M//8 rows per program (power of two, 1..8)
+    was within 2% of the best measured ROWS on every shape in the band and is
+    1.3-1.5x over one-row launches at 16-64 rows.  Above 128 rows the wave24
+    rule is unchanged.
+    """
+    if n_rows >= 128:
+        return max(1, min(128, n_rows // 128))
+    r = 1
+    while r * 2 <= n_rows // 8 and r < 8:
+        r *= 2
+    return r
+
+
 def _spacemit_softmax_lastdim(inp, out):
     n_rows, n_cols = inp.shape
     n = inp.numel()
@@ -408,9 +426,17 @@ def _spacemit_softmax_lastdim(inp, out):
     # one resident-row launch with ROWS=8 (a null Triton launch is 58 us), and the
     # same 3.1x at f16 (317 -> 102 us).  256x256 f32 is 619 -> 212 us.  No nested
     # dispatch here: below 1<<16 it only adds overhead.
-    if n < (1 << 16) and n_cols <= 2048:
+    # wave48: the band 2049..8192 columns with fewer than 65536 elements had no
+    # resident route (the old guard stopped at 2048) and paid 1.1-3.4x to the
+    # three-pass kernel.  probe611/613: keep the row resident there too.
+    if n < (1 << 16) and n_cols <= 8192:
         col = triton.next_power_of_2(n_cols)
-        rows = 8 if n_cols <= 1024 else 1
+        if n_cols <= 1024:
+            rows = 8
+        elif n_cols <= 2048:
+            rows = 1
+        else:
+            rows = _sm_rows(n_rows)
         while rows > 1 and n_rows % rows:
             rows //= 2
         if col == n_cols:
@@ -433,7 +459,9 @@ def _spacemit_softmax_lastdim(inp, out):
     # chunk and three passes over the row, which is 1.7-3.5x slower (probe231).
     if n_cols <= 8192 and n >= (1 << 16):
         col = triton.next_power_of_2(n_cols)
-        rows = max(1, min(128, n_rows // 128))
+        # wave48: _sm_rows keeps the same rule above 128 rows and gives 16-64
+        # row tensors 2-8 rows per program (1.3-1.5x, probe613).
+        rows = _sm_rows(n_rows)
         if n_rows % rows:
             rows = 1  # keep every launch exact; a masked row store is not safe here
         with nested_dispatch(n):

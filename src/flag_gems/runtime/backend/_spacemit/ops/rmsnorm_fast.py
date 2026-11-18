@@ -136,9 +136,20 @@ _RMS_TILE_MAX_N = 32
 # wildcard floor at 256), so those widths run the generic FlagGems kernel.  At
 # (2048,128) f32 that is 2.8-4.1 ms against 0.66-0.96 ms for the wave38 tile
 # (BM = 8192/BN = 64), i.e. 3-4x, and f16 the same.  128 is the only power of
-# two in that hole, so only it can use the unmasked tile; the rest stay on the
-# generic path until a masked variant is measured.
-_RMS_WIDE_TILE_MAX_N = 128
+# two in that hole, so only it can use the unmasked tile.
+#
+# ---------------- wave48: masked tile fills the whole 33..255 band ----------
+# probe610/612: the unmasked tile cannot serve a non-power-of-two width, so 33..63
+# and every non-pow2 width up to 255 still ran the generic kernel.  A masked
+# variant (BN = next_pow2(N)) wins there, same-session vendor -> tile medians:
+#   (4096,33) 3.38 -> 0.68 (5.0x), (2048,48) 1.80 -> 0.42 (4.3x),
+#   (2048,63) 1.91 -> 0.44 (4.3x), (2048,96) 2.59 -> 0.69 (3.8x),
+#   (2048,160) 4.10 -> 1.21 (3.4x), (2048,255) 4.85 -> 1.30 (3.7x),
+#   (4096,255) 9.35 -> 2.52 (3.7x), f16 tracks f32 within 5%.
+# BM rule from the sweep: one program per core (M//8 rows), at most 32K
+# elements and at most 256 rows; the picker still needs BM to divide M and at
+# least two programs.
+_RMS_BAND_MAX_N = 255
 
 
 def _rms_narrow_bm(m: int, bn: int) -> int:
@@ -146,6 +157,33 @@ def _rms_narrow_bm(m: int, bn: int) -> int:
     while bm > 8 and m % bm:
         bm //= 2
     return bm if m % bm == 0 else 0
+
+
+def _rms_band_bm(m: int, n: int) -> int:
+    """Picker for the masked 33..255 tile (wave48)."""
+    bm = 8
+    cap = max(16, m // 8)
+    while bm * 2 <= 256 and bm * 2 <= cap and (bm * 2) * n <= 32768:
+        bm *= 2
+    while bm > 8 and m % bm:
+        bm //= 2
+    return bm if m % bm == 0 and m >= 2 * bm else 0
+
+
+@triton.jit
+def _rms_tile_m(X, W, Y, INV, N, eps, BM: tl.constexpr, BN: tl.constexpr):
+    p = tl.program_id(0)
+    rows = p * BM + tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    m = cols < N
+    off = rows[:, None] * N + cols[None, :]
+    x = tl.load(X + off, mask=m[None, :], other=0.0).to(tl.float32)
+    s = tl.sum(x * x, axis=1) / N + eps
+    rr = 1.0 / tl.sqrt(s)
+    tl.store(INV + rows, rr)
+    w = tl.load(W + cols, mask=m, other=1.0).to(tl.float32)[None, :]
+    tl.store(Y + off, (x * rr[:, None] * w).to(Y.dtype.element_ty),
+             mask=m[None, :])
 
 
 @triton.jit
@@ -421,13 +459,17 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
             return True
     if N == _RMS_TILE_N and M >= _RMS_TILE_MIN_M and _rms_tile_bm(M):
         return True
-    # wave47: 65..128 tile (only 128 is a power of two, the rest stay generic)
-    if (
-        _RMS_TILE_MAX_N < N <= _RMS_WIDE_TILE_MAX_N
-        and N == triton.next_power_of_2(N)
-        and M >= 8
-    ):
-        bm = _rms_narrow_bm(M, N)
+    # wave48: the masked tile covers every width in 33..255; only the two
+    # powers of two in the band keep the unmasked kernel.  probe619: below 256
+    # rows the masked tile is a 0.94-1.06x tie against the generic kernel (it
+    # is launch bound), so the masked half starts at M=256 where it is 1.0-1.45x.
+    if _RMS_TILE_MAX_N < N <= _RMS_BAND_MAX_N and M >= 8:
+        if N == triton.next_power_of_2(N):
+            bm = _rms_narrow_bm(M, N)
+        elif M >= 256:
+            bm = _rms_band_bm(M, N)
+        else:
+            bm = 0
         if bm and M >= 2 * bm:
             return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
@@ -459,8 +501,16 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
                 _launch(_rms_tile, ("tile", N, bm, al), (M // bm,),
                         (x, w, y, inv, N, eps, bm, N))
             return True
-    if _RMS_TILE_MAX_N < N <= _RMS_WIDE_TILE_MAX_N and M >= 8:
-        bm = _rms_narrow_bm(M, N) if N == triton.next_power_of_2(N) else 0
+    if _RMS_TILE_MAX_N < N <= _RMS_BAND_MAX_N and M >= 8:
+        if N == triton.next_power_of_2(N):
+            bm = _rms_narrow_bm(M, N)
+            kern, bn = _rms_tile, N
+        elif M >= 256:
+            bm = _rms_band_bm(M, N)
+            kern, bn = _rms_tile_m, triton.next_power_of_2(N)
+        else:
+            bm = 0
+            kern, bn = _rms_tile, N
         # wave47: never a single-program tile (wave38: 40% at (256,32)).  The
         # official (64,64) row is exactly that case - bm lands on M and one
         # program serves 4096 elements, measured 0.286 -> 0.300 ms.
@@ -468,8 +518,14 @@ def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
             bm = 0
         if bm:
             with nested_dispatch(M * N):
-                _launch(_rms_tile, ("tile", N, bm, al), (M // bm,),
-                        (x, w, y, inv, N, eps, bm, N))
+                # wave48: plain JIT for the whole 33..255 band, including the
+                # N=64/128 powers of two.  The cached CompiledKernel path is
+                # unsafe here: probe619 aft died with "double free or
+                # corruption" right after a cached (256,128) f32 launch, when
+                # the f16 variant compiled next (same trap as wave47's
+                # ent.run note, but triggered through ent[grid] as well).  The
+                # band shapes are 0.2-2.5 ms, so the ~50 us JIT tax is 2-20%.
+                kern[(M // bm,)](x, w, y, inv, N, eps, bm, bn)
             return True
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
     cap = None if f16 else _RMS_F32_MAX_M.get(N)
