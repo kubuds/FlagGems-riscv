@@ -24,6 +24,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as tle
 
+from .mean_fast import mean_mmk_enabled, mean_mmk_launch
+
 logger = logging.getLogger(__name__)
 
 
@@ -179,7 +181,17 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     out = torch.empty(shape, dtype=dtype, device=x.device)
     grid = (M,)
     with torch_device_fn.device(x.device):
-        if x.is_contiguous() and N >= 2048 and N % 2048 == 0:
+        if (
+            x.is_contiguous()
+            and mean_mmk_enabled()
+            and mean_mmk_launch(x, out, M, N)
+        ):
+            # campaign 1014pm (wave5): multi-row-per-program kernels - the
+            # short-row penalty was launch/setup amortization, not the reduce
+            # itself; K rows per program gives 1.1x-5.8x over the legacy
+            # routes (see mean_fast.py docstring). Kill: MEAN_MMK=0.
+            pass
+        elif x.is_contiguous() and N >= 2048 and N % 2048 == 0:
             # campaign 1011am: 2048-wide tiles keep tl.sum on the vectorized
             # side of the length-2048 cliff. Measured 1.2-1.3x over the
             # block_ptr loop on long-row shapes; short rows (N <= 1024) stay

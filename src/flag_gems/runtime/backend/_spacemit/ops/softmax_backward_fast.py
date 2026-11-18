@@ -38,6 +38,9 @@ import triton.language as tl
 
 _SB_MIN_N = 1 << 16
 _SB_MAX_BLOCK = 1 << 13
+# wave5 (campaign 1014pm): K rows per program. Runtime-n form only - the
+# constexpr-n form of the same kernel compiles 3-5x slower on spine (probe55).
+_SB_ROWS_K = 4
 
 
 def sb_fast_enabled() -> bool:
@@ -109,6 +112,52 @@ def _sb_row_kernel(
             )
 
 
+@triton.jit
+def _sb_rows_kernel(
+    g_ptr, y_ptr, dx_ptr, n_cols, BLOCK: tl.constexpr, NOMASK: tl.constexpr,
+    K: tl.constexpr,
+):
+    # campaign 1014pm (wave5): K rows per program to amortize the launcher cost.
+    # Structure mirrors _sb_row_kernel exactly (runtime n_cols!). Measured
+    # (probe56, f32): 512^2 0.539->0.405 ms (1.33x), 2048^2 5.14->4.77 (1.08x)
+    # with K=4; K=8/16 slightly worse. Kill switch: FLAGGEMS_SPACEMIT_SB_ROWS=0.
+    p = tl.program_id(0)
+    for r in tl.static_range(K):
+        row = p * K + r
+        base = row * n_cols
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in range(0, n_cols, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(g_ptr + base + offs).to(tl.float32)
+                y = tl.load(y_ptr + base + offs).to(tl.float32)
+                acc += g * y
+            else:
+                mm = offs < n_cols
+                g = tl.load(g_ptr + base + offs, mask=mm, other=0.0).to(tl.float32)
+                y = tl.load(y_ptr + base + offs, mask=mm, other=0.0).to(tl.float32)
+                acc += g * y
+        total = tl.sum(acc, axis=0)
+        for c in range(0, n_cols, BLOCK):
+            offs = c + tl.arange(0, BLOCK)
+            if NOMASK:
+                g = tl.load(g_ptr + base + offs).to(tl.float32)
+                y = tl.load(y_ptr + base + offs).to(tl.float32)
+                tl.store(
+                    dx_ptr + base + offs,
+                    (y * (g - total)).to(dx_ptr.dtype.element_ty),
+                )
+            else:
+                mm = offs < n_cols
+                g = tl.load(g_ptr + base + offs, mask=mm, other=0.0).to(tl.float32)
+                y = tl.load(y_ptr + base + offs, mask=mm, other=0.0).to(tl.float32)
+                tl.store(
+                    dx_ptr + base + offs,
+                    (y * (g - total)).to(dx_ptr.dtype.element_ty),
+                    mask=mm,
+                )
+
+
 def _sb_block(ncols: int) -> int:
     b = 1
     while b < ncols and b < _SB_MAX_BLOCK:
@@ -124,5 +173,9 @@ def sb_fast(grad_output, output, dim, input_dtype, grad_input=None):
     block = _sb_block(ncols)
     nomask = (ncols % block) == 0
     dx = grad_input if grad_input is not None else torch.empty_like(y, dtype=input_dtype)
-    _sb_row_kernel[(rows,)](g, y, dx, ncols, BLOCK=block, NOMASK=nomask)
+    k = _SB_ROWS_K
+    if k > 1 and rows % k == 0 and os.environ.get("FLAGGEMS_SPACEMIT_SB_ROWS", "1") != "0":
+        _sb_rows_kernel[(rows // k,)](g, y, dx, ncols, BLOCK=block, NOMASK=nomask, K=k)
+    else:
+        _sb_row_kernel[(rows,)](g, y, dx, ncols, BLOCK=block, NOMASK=nomask)
     return dx
