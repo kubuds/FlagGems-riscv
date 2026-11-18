@@ -310,13 +310,18 @@ def setup_once(request):
 @pytest.fixture(scope="function", autouse=True)
 def clear_function_cache():
     yield
-    torch_device_fn.empty_cache()
+    # Local compatibility guard: the spacemit torch build may not expose
+    # empty_cache on torch.cpu; skip cache clearing when unavailable.
+    if hasattr(torch_device_fn, "empty_cache"):
+        torch_device_fn.empty_cache()
 
 
 @pytest.fixture(scope="module", autouse=True)
 def clear_module_cache():
     yield
-    torch_device_fn.empty_cache()
+    # Local compatibility guard: see clear_function_cache above.
+    if hasattr(torch_device_fn, "empty_cache"):
+        torch_device_fn.empty_cache()
 
 
 @pytest.fixture()
