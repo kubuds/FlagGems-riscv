@@ -273,6 +273,12 @@ def _pick_k(m: int, k0: int) -> int:
 # (17.1x); f32 1.9-3.9x. Gated to the measured range and to M >= 32 so the
 # multirow kernel is used (the row kernel was not measured for odd N).
 _WILDCARD = (16, 256)
+# wave37 probe376/377 (interleaved 3 rounds, use_gems): the f32 N=64 entry is
+# only a win while the op is launch bound - 384 rows 0.441 vs 0.584 generic
+# (1.32x), 512 rows a tie (0.682 vs 0.696), then the multirow kernel loses at
+# 768 (0.977 vs 0.919), 1024 (1.208 vs 1.143) and 4096 (3.579 vs 3.314).  Cap
+# the route by rows instead of dropping it.
+_RMS_F32_MAX_M = {64: 512}
 _WILD_MIN_N = 256
 _WILD_MAX_N = 1 << 14
 _WILD_MIN_M = 32
@@ -284,12 +290,22 @@ def _wildcard_entry(N: int, f16: bool):
     # (K4/T512); N=10240 agrees (9.37 -> 8.76 f16, 10.14 -> 9.78 f32).
     if N >= 8192:
         return (8, 1024) if f16 else (4, 512)
+    # wave37 probe381: the band just above the 4096 route was still on T256;
+    # T512 wins there at 1024 rows - N=4098 f16 2.026 vs 2.096 and f32 3.016
+    # vs 3.129 (audit number), N=6000 f16 2.386 vs 2.388 and f32 3.207 vs
+    # 3.253.  K8/T512 is within 1.4% of the best pair at both widths and both
+    # dtypes, so one entry covers the band.
+    if N > 4096:
+        return (8, 512)
     return _WILDCARD
 
 
 def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
     """True when rms_fast_launch would serve this shape (no allocation)."""
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
+    cap = None if f16 else _RMS_F32_MAX_M.get(N)
+    if cap is not None and M > cap:
+        return False
     if routes.get(N) is not None:
         return True
     return _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M
@@ -298,6 +314,9 @@ def rms_fast_route(M: int, N: int, f16: bool = False) -> bool:
 def rms_fast_launch(x, w, y, inv, M, N, eps, f16: bool = False) -> bool:
     """Launch the fast forward kernel; False = caller must fall back."""
     routes = _ROUTES_F16 if f16 else _ROUTES_F32
+    cap = None if f16 else _RMS_F32_MAX_M.get(N)
+    if cap is not None and M > cap:
+        return False
     ent = routes.get(N)
     if ent is None:
         if _WILD_MIN_N <= N <= _WILD_MAX_N and M >= _WILD_MIN_M:

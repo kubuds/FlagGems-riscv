@@ -391,8 +391,20 @@ def _ln_fwd_kernel_16m(
 # splitB 9.17 ms. 16-bit keeps the plain carrier (8.05 ms) - its apply pass is
 # already bandwidth bound and the extra pass only adds traffic.
 _LN_SPLIT_MIN_N = 1 << 18
-_LN_SPLIT_S = 2
+# wave37 probe385/386 (three interleaved rounds, min-of-9): S=2 7.12 ms was
+# not the best split - S3/AB512 6.16, S6/AB1024 6.28, S4/AB1024 6.46,
+# S4/AB512 6.73, S8/AB1024 6.75 at (20,6,65536) f32, error 1.9e-6 against
+# torch (fp32 accumulation order only).  Keep the pick shape-aware because the
+# split path must divide N: prefer 3, then 2/4/6/8.
+_LN_SPLIT_S = 3
 _LN_SPLIT_AB = 512
+
+
+def _pick_split(n: int) -> int:
+    for s in (_LN_SPLIT_S, 2, 4, 6, 8):
+        if n % s == 0:
+            return s
+    return 1
 
 
 @triton.jit
@@ -482,7 +494,7 @@ def _ln_split_apply_kernel(
 
 
 def ln_split_launch(x2d, y2d, w_arg, b_arg, mean, rstd, m, n, eps, has_w, has_b):
-    split = _LN_SPLIT_S
+    split = _pick_split(n)
     ch = (n + split - 1) // split
     p1 = torch.empty(m * split, dtype=torch.float32, device=x2d.device)
     p2 = torch.empty(m * split, dtype=torch.float32, device=x2d.device)
@@ -547,7 +559,7 @@ def ln_fast(input, normalized_shape, weight=None, bias=None, eps=1e-5):
         if (
             inp.dtype == torch.float32
             and n >= _LN_SPLIT_MIN_N
-            and n % _LN_SPLIT_S == 0
+            and _pick_split(n) > 1
             and m >= 2
         ):
             ln_split_launch(
