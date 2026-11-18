@@ -64,6 +64,20 @@ bmm_spacemit:
     MICRO_M: 8
     MICRO_N: 32
     MICRO_K: 32
+- META:
+    TILE_M: 256
+    TILE_N: 64
+    EVEN_K: 1
+    MICRO_M: 8
+    MICRO_N: 32
+    MICRO_K: 32
+- META:
+    TILE_M: 256
+    TILE_N: 128
+    EVEN_K: 1
+    MICRO_M: 8
+    MICRO_N: 32
+    MICRO_K: 32
 bmm:
   - META:
       TILE_M: 32
