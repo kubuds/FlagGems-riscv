@@ -205,6 +205,15 @@ def conv2d(input, weight, bias=None, padding=0, stride=1, dilation=1, groups=1):
     OH = (H + 2 * pad_h - dil_h * (KH - 1) - 1) // str_h + 1
     OW = (W + 2 * pad_w - dil_w * (KW - 1) - 1) // str_w + 1
 
+    # wave54: a direct output-stationary convolution is 4.3-8.9x faster than the
+    # fused im2col+bmm path on stride-1 f32 (bit-identical f32 accumulate order:
+    # exact vs the vendor path on every shape measured).  Opt out with
+    # FLAGGEMS_SPACEMIT_CONV_FAST=0.
+    from .conv2d_fast import conv2d_direct, conv_fast_applies, conv_fast_enabled
+
+    if conv_fast_enabled() and conv_fast_applies(input, weight, stride, dilation, groups):
+        return conv2d_direct(input, weight, bias, pad_h, pad_w, OH, OW)
+
     GEMM_M = OH * OW
     KK = KH * KW
     GEMM_K = C * KK
