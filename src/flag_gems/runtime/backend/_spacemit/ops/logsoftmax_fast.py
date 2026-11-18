@@ -40,6 +40,12 @@ f16/bf16 used to fall through to the generic kernel (26 ms vs 2.6 ms at
 1024^2, 1.0 ms vs 0.2 at 64^2); they now run the same f32-accumulating kernel
 and cast on store.
 
+wave28: like logsumexp, this row kernel had never been nested - the serialized
+1-D launcher was the ceiling. Nested + more rows per program (probe277-280,
+kernel-only f32): 256^2 0.29 -> 0.19, 512^2 0.40 -> 0.37, 1024^2 2.63 -> 0.96,
+2048^2 9.48 -> 3.52 ms (R16 at N=2048, R32 below - wide rows lose a little at
+32). f16 follows the same rule: 256^2 0.19, 1024^2 0.89, 2048^2 2.85 ms.
+
 Kill switch: FLAGGEMS_SPACEMIT_LOGSOFTMAX_FAST=0.
 """
 
@@ -49,10 +55,13 @@ import torch
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
 from .fastmath import exp_fast as _expf
 from .fastmath import exp_flag
 
-_ROWS = 8
+_ROWS_SMALL = 8      # M < 256: 4-8 programs are all the grid can carry
+_ROWS_LARGE = 32     # wave28 (probe279: 1024^2 1.33 -> 0.96 against R8)
+_ROWS_WIDE_N = 16    # N >= 2048 (probe280: 2048^2 3.79 at R32 vs 3.52 at R16)
 _BLOCK_MAX = 256
 
 
@@ -107,11 +116,18 @@ def logsm_fast_enabled() -> bool:
     return os.environ.get("FLAGGEMS_SPACEMIT_LOGSOFTMAX_FAST", "1") != "0"
 
 
-def _row_split(M: int) -> int:
-    for k in (8, 4, 2):
-        if M % k == 0:
-            return k
-    return 1
+def _row_split(M: int, N: int) -> int:
+    """wave28: rows per program under nested dispatch. The nested launcher
+    splits the grid across streams, so fewer/bigger programs win; 32 rows is
+    the pick up to N=1024, 16 above (probe279/280). M < 256 keeps 8 so the
+    grid still has work for every stream."""
+    if M < 256:
+        k = _ROWS_SMALL
+    else:
+        k = _ROWS_LARGE if N <= 1024 else _ROWS_WIDE_N
+    while k > 1 and M % k:
+        k //= 2
+    return k
 
 
 def _block_split(N: int, esize: int) -> int:
@@ -135,9 +151,10 @@ def _block_split(N: int, esize: int) -> int:
 def logsm_launch(x, out, M, N) -> bool:
     if M <= 0 or N < 64:
         return False
-    k = _row_split(M)
+    k = _row_split(M, N)
     bn = _block_split(N, x.element_size())
-    _logsm_rows[(M // k,)](
-        out, x, N, K=k, BN=bn, TAIL=(N % bn) != 0, FAST=exp_flag()
-    )
+    with nested_dispatch(M * N):
+        _logsm_rows[(M // k,)](
+            out, x, N, K=k, BN=bn, TAIL=(N % bn) != 0, FAST=exp_flag()
+        )
     return True

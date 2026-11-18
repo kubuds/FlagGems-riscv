@@ -47,6 +47,14 @@ at 512^2 / 2048^2 / 512x4096 / 8192x512 (1.42-1.48x).
 tl.range(num_stages=...) is a pathology on this build (identical work at
 2-10x the plain-range cost, no benefit from stages 2/3) - never use it here.
 
+wave28: the row kernel had never been wrapped in nested dispatch, and the
+serialized 1-D launcher - not the block shape - was the ceiling. Nesting plus
+16-32 rows per program (probe277-280, kernel-only, f32): 512^2 0.79 -> 0.43,
+1024^2 2.12 -> 1.01, 2048^2 6.75 -> 2.77, 512x4096 3.32 -> 1.21,
+4096^2 24.86 -> 9.87, 8192x512 9.41 -> 4.46 ms. BLOCK=64 x U=4 stays the best
+block shape under nesting; only the row count and the launcher changed. f16
+follows the same row rule (512^2 0.45, 2048^2 2.67, 8192x512 5.50 ms).
+
 Kill switches: FLAGGEMS_SPACEMIT_LOGSUMEXP_FAST=0, FLAGGEMS_SPACEMIT_LSE_POLY=0.
 """
 
@@ -55,10 +63,14 @@ import os
 import triton
 import triton.language as tl
 
+from ._dispatch import nested_dispatch
 from .fastmath import exp_fast as _expf
 from .fastmath import exp_flag
 
-_ROWS = 4
+_ROWS = 4            # masked-fallback rows per program (wave22)
+_ROWS_WIDE = 32      # wave28: M >= 2048 (probe280: 2048^2 2.92 -> 2.77,
+#                      8192x512 4.84 -> 4.46 against K16)
+_ROWS_MID = 16       # wave28: M < 2048 (probe279: 512^2 0.79 -> 0.43)
 _ROWS_BLOCK = 64     # column tile of the unrolled row kernel (wave22, f32)
 _ROWS_U = 4          # column blocks unrolled per step
 _ROWS_BLOCK_F16 = 128  # f16: 64-wide blocks scalarize on this backend
@@ -273,6 +285,16 @@ def logsumexp_mid_launch(x, out, A, B, C) -> bool:
     return True
 
 
+def _pick_rows(m: int) -> int:
+    """wave28 rows/program. Under nested dispatch the grid is split across
+    streams, so bigger row groups amortise better: 32 for M >= 2048, 16
+    below, halving until the grid is exact (probe279/280)."""
+    k = _ROWS_WIDE if m >= 2048 else _ROWS_MID
+    while k > 1 and m % k:
+        k //= 2
+    return k
+
+
 def logsumexp_rows_launch(x, out, M, N) -> bool:
     """True if the (M rows x N cols) row logsumexp was launched."""
     import torch
@@ -286,15 +308,23 @@ def logsumexp_rows_launch(x, out, M, N) -> bool:
         block, u = _ROWS_BLOCK, _ROWS_U
     else:
         block, u = _ROWS_BLOCK_F16, 1
-    if N % (block * u) == 0 and M % _ROWS == 0:
-        _lse_rows_u[(M // _ROWS,)](
-            x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK=block, U=u, DEG=_poly_deg(),
-            TAIL=False, RMASK=False,
-        )
+    k = _pick_rows(M)
+    if N % (block * u) == 0 and M % k == 0:
+        # wave28: nested dispatch is worth 1.8-2.8x on these rows (probe277:
+        # 2048^2 7.03 -> 4.26, 512x4096 3.32 -> 1.60 with the old K4).
+        with nested_dispatch(M * N):
+            _lse_rows_u[(M // k,)](
+                x, out, M, N, K=k, BLOCK=block, U=u, DEG=_poly_deg(),
+                TAIL=False, RMASK=False,
+            )
         return True
+    kf = _ROWS if M % _ROWS == 0 else 1
     block = _BLOCK_SMALL if N <= 1024 else _BLOCK_LARGE
     block = min(block, triton.next_power_of_2(N))
-    _lse_rows[(triton.cdiv(M, _ROWS if M % _ROWS == 0 else 1),)](x, out, M, N, K=(_ROWS if M % _ROWS == 0 else 1), BLOCK_N=block, DEG=_poly_deg())
+    with nested_dispatch(M * N):
+        _lse_rows[(triton.cdiv(M, kf),)](
+            x, out, M, N, K=kf, BLOCK_N=block, DEG=_poly_deg()
+        )
     return True
 
 
