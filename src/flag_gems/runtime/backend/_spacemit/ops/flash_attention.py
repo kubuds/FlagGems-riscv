@@ -1212,9 +1212,11 @@ class Attention(torch.autograd.Function):
             # g8 q16 b2 2.81x at 128 rows.  Plain packing only fills the
             # padding rows of a short query, so 32 rows stays the rule --
             # except when the per-head query itself is short (nq <= 4): there
-            # an 8-row unpacked tile is mostly padding and 64 packed rows win
-            # 1.69-4.98x (g16 q4 2.19 -> 1.30, g32 q2 3.69 -> 1.35,
-            # g64 q1 6.84 -> 1.37), while nq 8+ at 64 rows loses (g8 q8 0.91x).
+            # an 8-row unpacked tile is mostly padding, and 128 packed rows
+            # win 1.8-4.9x (g16 q4 2.10 -> 1.41, g32 q2 3.68 -> 1.40,
+            # g64 q1 6.84 -> 1.41, g64 q2 6.98 -> 2.07, g64 q2 kv1024 d128
+            # 15.39 -> 4.36, g32 q4 3.78 -> 2.07), while nq 8 at 64 rows
+            # loses (g8 q8 0.91x) and at 128 rows is neutral (g16 q8 1.01x).
             and (
                 (
                     is_causal
@@ -1225,7 +1227,7 @@ class Attention(torch.autograd.Function):
                 or (
                     not is_causal
                     and q.shape[2] <= 4
-                    and q.shape[2] * group_size <= 64
+                    and q.shape[2] * group_size <= 128
                 )
             )
             and _env_int("FLAGGEMS_SPACEMIT_ATTN_PACK", 1) != 0
